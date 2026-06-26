@@ -8,7 +8,7 @@ Responsibilities:
 """
 import cv2
 import customtkinter as ctk
-from PIL import Image, ImageTk
+from PIL import Image
 
 from core.roi import ROICrop
 
@@ -25,6 +25,8 @@ class ViewerWindow(ctk.CTk):
 
         self._roi = ROICrop()
         self._cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not self._cap.isOpened():
+            raise RuntimeError(f"Cannot open camera at index {CAMERA_INDEX}")
         self._after_id: str | None = None
 
         self._label = ctk.CTkLabel(self, text="")
@@ -39,10 +41,9 @@ class ViewerWindow(ctk.CTk):
             frame = self._roi.crop(frame)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(frame_rgb)
-            img = img.resize((1280, 720), Image.BILINEAR)
-            photo = ImageTk.PhotoImage(img)
-            self._label.configure(image=photo)
-            self._label.image = photo  # keep reference alive
+            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(1280, 720))
+            self._label.configure(image=ctk_img)
+            self._label.image = ctk_img  # keep reference alive
         self._after_id = self.after(POLL_MS, self._poll)
 
     def _on_close(self) -> None:
