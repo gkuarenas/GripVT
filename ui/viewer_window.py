@@ -1,8 +1,7 @@
 """Main window for the GripVT viewer app.
 
 Responsibilities:
-  - Open camera (16:9, raw, no undistortion)
-  - Display live feed with marker overlay
+  - Open camera, undistort, ROI crop, display live feed with marker overlay
   - Capture Baseline button — initialises Kalman states for all detected markers
   - Start/Stop Session — records marker displacement CSV + overlay PNG to output/sessions/
 """
@@ -10,6 +9,7 @@ import cv2
 import customtkinter as ctk
 from PIL import Image
 
+from core.calibration import CameraCalibration
 from core.roi import ROICrop
 
 CAMERA_INDEX = 1
@@ -23,6 +23,7 @@ class ViewerWindow(ctk.CTk):
         self.geometry("1280x720")
         self.resizable(False, False)
 
+        self._cal = CameraCalibration()
         self._roi = ROICrop()
         self._cap = cv2.VideoCapture(CAMERA_INDEX)
         if not self._cap.isOpened():
@@ -38,6 +39,7 @@ class ViewerWindow(ctk.CTk):
     def _poll(self) -> None:
         ret, frame = self._cap.read()
         if ret:
+            frame = self._cal.undistort(frame)
             frame = self._roi.crop(frame)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(frame_rgb)
