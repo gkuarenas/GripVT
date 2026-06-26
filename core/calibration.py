@@ -24,8 +24,10 @@ class CameraCalibration:
         K = np.array(raw["K"], dtype=np.float64)
         D = np.array(raw["D"], dtype=np.float64)
         w, h = raw["image_size"]
+        # alpha=1.0 retains all source pixels — no edge cropping
+        K_new, _ = cv2.getOptimalNewCameraMatrix(K, D, (w, h), alpha=1.0)
         self._map1, self._map2 = cv2.initUndistortRectifyMap(
-            K, D, None, K, (w, h), cv2.CV_16SC2
+            K, D, None, K_new, (w, h), cv2.CV_16SC2
         )
 
     def undistort(self, frame: np.ndarray) -> np.ndarray:
