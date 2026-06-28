@@ -9,12 +9,14 @@ __pycache__/
 output/sessions/
 camera_calibration/results/
 
+
 # specific folders and files
 docs/
+.claude/
 
-# Calibration and ROI (machine-specific, not committed)
+# Calibration (machine-specific, not committed)
 calibration.json
-roi.json
+.json
 
 # IDE / OS
 .vscode/
