@@ -15,8 +15,7 @@ docs/
 .claude/
 
 # Calibration (machine-specific, not committed)
-calibration.json
-.json
+*.json
 
 # IDE / OS
 .vscode/
