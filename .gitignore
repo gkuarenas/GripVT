@@ -17,6 +17,7 @@ docs/
 # Calibration (machine-specific, not committed)
 *.json
 *.jpg
+*.png
 
 # IDE / OS
 .vscode/
