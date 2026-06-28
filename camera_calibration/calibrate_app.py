@@ -27,7 +27,8 @@ MIN_IMAGES: int   = 15      # minimum accepted captures to enable calibration
 # ── Paths ─────────────────────────────────────────────────────────────────────
 _HERE             = Path(__file__).parent
 RESULTS_ROOT      = _HERE / "results"
-CHECKERBOARD_PATH = _HERE / "checkerboard_9x6_25mm_A4.png"
+CHECKERBOARD_PATH       = _HERE / "checkerboard_9x6_25mm_A4.png"
+CHECKERBOARD_SMALL_PATH = _HERE / "checkerboard_9x6_5mm_A4.png"
 
 
 # ── Checkerboard generator ────────────────────────────────────────────────────
@@ -39,6 +40,33 @@ def _generate_checkerboard() -> np.ndarray:
     canvas_w  = round(297 / MM_PER_IN * DPI)   # 3508 px
     canvas_h  = round(210 / MM_PER_IN * DPI)   # 2480 px
     sq_px     = round(SQUARE_MM / MM_PER_IN * DPI)
+
+    n_cols_sq = INNER_COLS + 1
+    n_rows_sq = INNER_ROWS + 1
+    board_w   = n_cols_sq * sq_px
+    board_h   = n_rows_sq * sq_px
+    margin_x  = (canvas_w - board_w) // 2
+    margin_y  = (canvas_h - board_h) // 2
+
+    img = np.full((canvas_h, canvas_w), 255, dtype=np.uint8)
+    for row in range(n_rows_sq):
+        for col in range(n_cols_sq):
+            if (row + col) % 2 == 0:
+                x1 = margin_x + col * sq_px
+                y1 = margin_y + row * sq_px
+                img[y1:y1 + sq_px, x1:x1 + sq_px] = 0
+    return img
+
+
+def _generate_checkerboard_small() -> np.ndarray:
+    """Render a 10×7 checkerboard with 5 mm squares at 300 DPI on A4 portrait.
+    Use this board when calibrating at close working distances (~44 mm)."""
+    DPI       = 300
+    MM_PER_IN = 25.4
+    # A4 portrait: 210 × 297 mm
+    canvas_w  = round(210 / MM_PER_IN * DPI)   # 2480 px
+    canvas_h  = round(297 / MM_PER_IN * DPI)   # 3508 px
+    sq_px     = round(5.0 / MM_PER_IN * DPI)   # ~59 px
 
     n_cols_sq = INNER_COLS + 1
     n_rows_sq = INNER_ROWS + 1
@@ -94,9 +122,15 @@ class CalibrationApp(ctk.CTk):
 
         self._current_ctk_image: ctk.CTkImage | None = None  # holds PIL reference
 
+        # undistortion state (populated from loaded calibration)
+        self._undist_map1: np.ndarray | None = None
+        self._undist_map2: np.ndarray | None = None
+        self._show_undistorted: bool = False
+
         self._build_ui()
         self.bind("<space>", self._on_space)
         self.bind("<Escape>", lambda _: self.destroy())
+        self.after(0, self._load_latest_calibration)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -135,7 +169,14 @@ class CalibrationApp(ctk.CTk):
         self._open_btn = ctk.CTkButton(
             ctrl, text="Open Camera", command=self._toggle_camera
         )
-        self._open_btn.pack(fill="x", padx=16, pady=(0, 12))
+        self._open_btn.pack(fill="x", padx=16, pady=(0, 8))
+
+        self._undist_btn = ctk.CTkButton(
+            ctrl, text="Show Undistorted: OFF",
+            command=self._toggle_undistort, state="disabled",
+            fg_color="gray30", hover_color="gray40",
+        )
+        self._undist_btn.pack(fill="x", padx=16, pady=(0, 12))
 
         ctk.CTkLabel(ctrl, text="─" * 42, text_color="gray50").pack(pady=(0, 10))
 
@@ -159,6 +200,21 @@ class CalibrationApp(ctk.CTk):
         ctk.CTkLabel(ctrl, text="Status", anchor="w").pack(padx=16, fill="x")
         self._log = ctk.CTkTextbox(ctrl, wrap="word", state="disabled")
         self._log.pack(fill="both", expand=True, padx=16, pady=(4, 16))
+
+    # ── undistort toggle ──────────────────────────────────────────────────────
+
+    def _toggle_undistort(self) -> None:
+        self._show_undistorted = not self._show_undistorted
+        if self._show_undistorted:
+            self._undist_btn.configure(
+                text="Show Undistorted: ON",
+                fg_color=["#2a7fd4", "#1a6bbf"], hover_color=["#1a6bbf", "#155a9e"],
+            )
+        else:
+            self._undist_btn.configure(
+                text="Show Undistorted: OFF",
+                fg_color="gray30", hover_color="gray40",
+            )
 
     # ── camera ────────────────────────────────────────────────────────────────
 
@@ -184,10 +240,15 @@ class CalibrationApp(ctk.CTk):
             self._log_msg(f"Could not open camera {idx}.")
             return
 
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
         self._cap = cap
         self._running = True
         self._open_btn.configure(text="Close Camera")
-        self._log_msg(f"Camera {idx} opened.")
+        self._log_msg(f"Camera {idx} opened at {actual_w}×{actual_h}.")
         self._update_feed()
 
     def _update_feed(self) -> None:
@@ -202,7 +263,12 @@ class CalibrationApp(ctk.CTk):
                 if self._img_size is None:
                     h, w = frame.shape[:2]
                     self._img_size = (w, h)
-                self._show_frame(frame)
+                display = (
+                    cv2.remap(frame, self._undist_map1, self._undist_map2, cv2.INTER_LINEAR)
+                    if self._show_undistorted and self._undist_map1 is not None
+                    else frame
+                )
+                self._show_frame(display)
 
         self.after(33, self._update_feed)   # ~30 fps
 
@@ -343,6 +409,65 @@ class CalibrationApp(ctk.CTk):
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
+    def _load_latest_calibration(self) -> None:
+        if not RESULTS_ROOT.exists():
+            self._log_msg("No results folder found yet.")
+            return
+
+        sessions = sorted(
+            [d for d in RESULTS_ROOT.iterdir()
+             if d.is_dir() and d.name.endswith("_calibration")],
+            key=lambda d: d.name,
+            reverse=True,
+        )
+        if not sessions:
+            self._log_msg("No previous calibration found.")
+            return
+
+        calib_path = sessions[0] / "calibration.json"
+        if not calib_path.exists():
+            self._log_msg(f"Latest session has no calibration.json: {sessions[0].name}")
+            return
+
+        with open(calib_path) as f:
+            data = json.load(f)
+
+        K      = data["K"]
+        D      = np.array(data["D"]).flatten().tolist()
+        rms    = data.get("rms_px", float("nan"))
+        n      = data.get("n_images", "?")
+        w, h   = data.get("image_size", ["?", "?"])
+        fx, fy = K[0][0], K[1][1]
+        cx, cy = K[0][2], K[1][2]
+
+        quality = (
+            "Excellent" if rms < 0.5 else
+            "Acceptable" if rms < 1.0 else
+            "Poor"
+        )
+
+        # build remap maps so the live feed can optionally show undistorted output
+        # alpha=0: new camera matrix is scaled so the remapped image has no black
+        # borders — the FOV shrinks slightly but the full frame is valid pixels.
+        K_arr    = np.array(data["K"], dtype=float)
+        D_arr    = np.array(data["D"], dtype=float)
+        img_size = tuple(data["image_size"])   # (width, height)
+        K_new, _ = cv2.getOptimalNewCameraMatrix(K_arr, D_arr, img_size, alpha=0)
+        self._undist_map1, self._undist_map2 = cv2.initUndistortRectifyMap(
+            K_arr, D_arr, None, K_new, img_size, cv2.CV_16SC2
+        )
+        self._undist_btn.configure(state="normal")
+
+        self._log_msg("── Last calibration ──────────────")
+        self._log_msg(f"Session : {sessions[0].name}")
+        self._log_msg(f"Images  : {n}    Resolution: {w}×{h} px")
+        self._log_msg(f"RMS     : {rms:.4f} px  ({quality})")
+        self._log_msg(f"fx={fx:.2f}  fy={fy:.2f}  cx={cx:.2f}  cy={cy:.2f}")
+        self._log_msg("D (k1 k2 p1 p2 k3):")
+        self._log_msg("  " + "  ".join(f"{v:+.6f}" for v in D))
+        self._log_msg("Undistort preview: ready")
+        self._log_msg("──────────────────────────────────")
+
     def _log_msg(self, msg: str) -> None:
         self._log.configure(state="normal")
         self._log.insert("end", msg + "\n")
@@ -362,6 +487,12 @@ def main() -> None:
         pil = Image.fromarray(img)
         pil.save(str(CHECKERBOARD_PATH), dpi=(300, 300))
         print(f"Checkerboard saved → {CHECKERBOARD_PATH}")
+
+    if not CHECKERBOARD_SMALL_PATH.exists():
+        img = _generate_checkerboard_small()
+        pil = Image.fromarray(img)
+        pil.save(str(CHECKERBOARD_SMALL_PATH), dpi=(300, 300))
+        print(f"Small checkerboard saved → {CHECKERBOARD_SMALL_PATH}")
 
     ctk.set_appearance_mode("dark")
     ctk.set_default_color_theme("blue")
