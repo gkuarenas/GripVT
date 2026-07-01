@@ -111,13 +111,10 @@ class CalibrationApp(ctk.CTk):
         self._obj_pts:    list[np.ndarray] = []
         self._img_pts:    list[np.ndarray] = []
 
-        # 3-D object-point template (same for every captured image)
-        self._objp = np.zeros((INNER_ROWS * INNER_COLS, 3), np.float32)
-        self._objp[:, :2] = (
+        # 3-D object-point template — shape (1, N, 3) required by cv2.fisheye
+        self._objp = np.zeros((1, INNER_ROWS * INNER_COLS, 3), np.float32)
+        self._objp[0, :, :2] = (
             np.mgrid[0:INNER_COLS, 0:INNER_ROWS].T.reshape(-1, 2) * SQUARE_MM
-        )
-        self._sub_criteria = (
-            cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.001
         )
 
         self._current_ctk_image: ctk.CTkImage | None = None  # holds PIL reference
@@ -180,9 +177,7 @@ class CalibrationApp(ctk.CTk):
 
         ctk.CTkLabel(ctrl, text="─" * 42, text_color="gray50").pack(pady=(0, 10))
 
-        self._count_label = ctk.CTkLabel(
-            ctrl, text=f"Accepted: 0  (need {MIN_IMAGES}+)"
-        )
+        self._count_label = ctk.CTkLabel(ctrl, text="Accepted: 0")
         self._count_label.pack()
 
         ctk.CTkLabel(
@@ -294,26 +289,21 @@ class CalibrationApp(ctk.CTk):
             return
 
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        found, corners = cv2.findChessboardCorners(
-            gray, (INNER_COLS, INNER_ROWS), None
-        )
+        found, corners = cv2.findChessboardCornersSB(gray, (INNER_COLS, INNER_ROWS))
         if not found:
             self._log_msg("No corners detected — frame discarded.")
             return
 
-        corners_sub = cv2.cornerSubPix(
-            gray, corners, (11, 11), (-1, -1), self._sub_criteria
-        )
-
         self._raw_frames.append(frame.copy())
         self._obj_pts.append(self._objp.copy())
-        self._img_pts.append(corners_sub)
+        # fisheye expects imagePoints as (1, N, 2)
+        self._img_pts.append(corners.reshape(1, -1, 2))
 
         n = len(self._raw_frames)
         self._count_label.configure(text=f"Accepted: {n}")
 
         vis = frame.copy()
-        cv2.drawChessboardCorners(vis, (INNER_COLS, INNER_ROWS), corners_sub, True)
+        cv2.drawChessboardCorners(vis, (INNER_COLS, INNER_ROWS), corners, True)
         self._frozen_frame = vis
         self._freeze_until = time.time() + self._FREEZE_S
         self._log_msg(f"Captured #{n}")
@@ -349,21 +339,31 @@ class CalibrationApp(ctk.CTk):
         for i, frame in enumerate(self._raw_frames):
             cv2.imwrite(str(raw_dir / f"raw_{i + 1:03d}.png"), frame)
 
-        rms, K, dist, rvecs, tvecs = cv2.calibrateCamera(
-            self._obj_pts, self._img_pts, self._img_size, None, None
+        n_im  = len(self._raw_frames)
+        K     = np.zeros((3, 3))
+        D     = np.zeros((4, 1))
+        rvecs = [np.zeros((1, 1, 3), dtype=np.float64) for _ in range(n_im)]
+        tvecs = [np.zeros((1, 1, 3), dtype=np.float64) for _ in range(n_im)]
+        rms, K, D, rvecs, tvecs = cv2.fisheye.calibrate(
+            self._obj_pts, self._img_pts, self._img_size,
+            K, D, rvecs, tvecs,
+            cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC + cv2.fisheye.CALIB_FIX_SKEW,
         )
 
         per_rms: list[float] = []
-        for objp, imgp, rvec, tvec in zip(
-            self._obj_pts, self._img_pts, rvecs, tvecs
-        ):
-            proj, _ = cv2.projectPoints(objp, rvec, tvec, K, dist)
-            err = float(np.linalg.norm(imgp - proj, axis=2).mean())
+        for objp, imgp, rvec, tvec in zip(self._obj_pts, self._img_pts, rvecs, tvecs):
+            proj, _ = cv2.fisheye.projectPoints(
+                objp.reshape(-1, 1, 3), rvec.reshape(1, 3), tvec.reshape(1, 3), K, D
+            )
+            err = float(np.linalg.norm(
+                imgp.reshape(-1, 2) - proj.reshape(-1, 2), axis=1
+            ).mean())
             per_rms.append(err)
 
         calib = {
+            "model": "fisheye",
             "K": K.tolist(),
-            "D": dist.tolist(),
+            "D": D.tolist(),
             "image_size": list(self._img_size),
             "rms_px": round(float(rms), 6),
             "square_mm": SQUARE_MM,
@@ -381,8 +381,11 @@ class CalibrationApp(ctk.CTk):
         ws.append(["OVERALL", round(float(rms), 6)])
         wb.save(session_dir / "reprojection_errors.xlsx")
 
-        map1, map2 = cv2.initUndistortRectifyMap(
-            K, dist, None, K, self._img_size, cv2.CV_16SC2
+        K_new = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+            K, D, self._img_size, np.eye(3), balance=0
+        )
+        map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+            K, D, np.eye(3), K_new, self._img_size, cv2.CV_16SC2
         )
         for i, frame in enumerate(self._raw_frames):
             undist = cv2.remap(frame, map1, map2, cv2.INTER_LINEAR)
@@ -451,9 +454,11 @@ class CalibrationApp(ctk.CTk):
         K_arr    = np.array(data["K"], dtype=float)
         D_arr    = np.array(data["D"], dtype=float)
         img_size = tuple(data["image_size"])   # (width, height)
-        K_new, _ = cv2.getOptimalNewCameraMatrix(K_arr, D_arr, img_size, alpha=0)
-        self._undist_map1, self._undist_map2 = cv2.initUndistortRectifyMap(
-            K_arr, D_arr, None, K_new, img_size, cv2.CV_16SC2
+        K_new = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+            K_arr, D_arr, img_size, np.eye(3), balance=0
+        )
+        self._undist_map1, self._undist_map2 = cv2.fisheye.initUndistortRectifyMap(
+            K_arr, D_arr, np.eye(3), K_new, img_size, cv2.CV_16SC2
         )
         self._undist_btn.configure(state="normal")
 
@@ -462,7 +467,7 @@ class CalibrationApp(ctk.CTk):
         self._log_msg(f"Images  : {n}    Resolution: {w}×{h} px")
         self._log_msg(f"RMS     : {rms:.4f} px  ({quality})")
         self._log_msg(f"fx={fx:.2f}  fy={fy:.2f}  cx={cx:.2f}  cy={cy:.2f}")
-        self._log_msg("D (k1 k2 p1 p2 k3):")
+        self._log_msg("D (k1 k2 k3 k4):")
         self._log_msg("  " + "  ".join(f"{v:+.6f}" for v in D))
         self._log_msg("Undistort preview: ready")
         self._log_msg("──────────────────────────────────")
