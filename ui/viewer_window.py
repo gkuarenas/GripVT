@@ -14,8 +14,9 @@ from core.roi import ROICrop
 
 CAMERA_INDEX = 1
 POLL_MS = 33  # ~30 fps
-VIDEO_W = 1280
-VIDEO_H = 720
+# Matches the camera's native capture resolution (4:3) — do not stretch to 16:9.
+VIDEO_W = 1024
+VIDEO_H = 768
 
 
 class ViewerWindow(ctk.CTk):
