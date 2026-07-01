@@ -31,6 +31,11 @@ class ViewerWindow(ctk.CTk):
         self._cap = cv2.VideoCapture(CAMERA_INDEX)
         if not self._cap.isOpened():
             raise RuntimeError(f"Cannot open camera at index {CAMERA_INDEX}")
+        # Capture resolution must match the calibration's image_size, or the
+        # undistort maps (built for that resolution) misalign with the frame.
+        cal_w, cal_h = self._cal.image_size
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, cal_w)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cal_h)
         self._after_id: str | None = None
 
         self._label = ctk.CTkLabel(self, text="")

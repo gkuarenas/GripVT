@@ -30,6 +30,7 @@ class CameraCalibration:
         K = np.array(raw["K"], dtype=np.float64)
         D = np.array(raw["D"], dtype=np.float64)
         w, h = raw["image_size"]
+        self.image_size = (w, h)
         model = raw.get("model", "standard")
 
         if model == "fisheye":
