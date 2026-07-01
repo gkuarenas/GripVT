@@ -240,8 +240,8 @@ class CalibrationApp(ctk.CTk):
             self._log_msg(f"Could not open camera {idx}.")
             return
 
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1024)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 768)
         actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
