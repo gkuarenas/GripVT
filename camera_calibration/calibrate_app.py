@@ -191,7 +191,7 @@ class CalibrationApp(ctk.CTk):
 
         self._calib_btn = ctk.CTkButton(
             ctrl, text="Run Calibration",
-            command=self._start_calibration, state="disabled",
+            command=self._start_calibration,
         )
         self._calib_btn.pack(fill="x", padx=16, pady=(0, 12))
 
@@ -310,11 +310,7 @@ class CalibrationApp(ctk.CTk):
         self._img_pts.append(corners_sub)
 
         n = len(self._raw_frames)
-        if n < MIN_IMAGES:
-            self._count_label.configure(text=f"Accepted: {n}  (need {MIN_IMAGES}+)")
-        else:
-            self._count_label.configure(text=f"Accepted: {n}")
-            self._calib_btn.configure(state="normal")
+        self._count_label.configure(text=f"Accepted: {n}")
 
         vis = frame.copy()
         cv2.drawChessboardCorners(vis, (INNER_COLS, INNER_ROWS), corners_sub, True)
@@ -325,6 +321,9 @@ class CalibrationApp(ctk.CTk):
     # ── calibration ───────────────────────────────────────────────────────────
 
     def _start_calibration(self) -> None:
+        if not self._raw_frames:
+            self._log_msg("No captured frames — press SPACE to capture first.")
+            return
         self._calib_btn.configure(state="disabled", text="Calibrating…")
         self._log_msg("Running calibration…")
         threading.Thread(target=self._calibrate_thread, daemon=True).start()
