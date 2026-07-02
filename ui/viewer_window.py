@@ -10,7 +10,7 @@ import customtkinter as ctk
 from PIL import Image
 
 from core.calibration import CameraCalibration
-from core.roi import ROICrop
+from core.roi import DEFAULT_ALPHA, ROICrop
 
 CAMERA_INDEX = 1
 POLL_MS = 33  # ~30 fps
@@ -26,9 +26,12 @@ class ViewerWindow(ctk.CTk):
         self.geometry(f"{VIDEO_W}x{VIDEO_H + 48}")
         self.resizable(False, False)
 
-        self._alpha = 1.0
-        self._cal = CameraCalibration(alpha=self._alpha)
         self._roi = ROICrop()
+        # Undistort with whatever alpha the ROI was selected under (see
+        # tools/select_roi.py) -- a mismatch here remaps pixel positions and
+        # misaligns the crop with the marker grid.
+        self._alpha = self._roi.config.alpha if self._roi.is_set else DEFAULT_ALPHA
+        self._cal = CameraCalibration(alpha=self._alpha)
         self._cap = cv2.VideoCapture(CAMERA_INDEX)
         if not self._cap.isOpened():
             raise RuntimeError(f"Cannot open camera at index {CAMERA_INDEX}")
@@ -37,6 +40,8 @@ class ViewerWindow(ctk.CTk):
         cal_w, cal_h = self._cal.image_size
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, cal_w)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cal_h)
+        self._cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0) 
+        self._cap.set(cv2.CAP_PROP_EXPOSURE, 1)
         self._after_id: str | None = None
 
         self._label = ctk.CTkLabel(self, text="")
@@ -58,12 +63,18 @@ class ViewerWindow(ctk.CTk):
             values=["0  (crop)", "1  (full)"],
             command=self._on_alpha_change,
         )
-        self._alpha_seg.set("1  (full)")
+        self._alpha_seg.set("0  (crop)" if self._alpha == 0.0 else "1  (full)")
         self._alpha_seg.pack(side="left", pady=8)
 
     def _on_alpha_change(self, value: str) -> None:
         self._alpha = 0.0 if value.startswith("0") else 1.0
         self._cal = CameraCalibration(alpha=self._alpha)
+        if self._roi.is_set and self._alpha != self._roi.config.alpha:
+            print(
+                f"Warning: viewer alpha={self._alpha} no longer matches "
+                f"roi.json alpha={self._roi.config.alpha} -- the ROI crop will "
+                "be misaligned until you re-run select_roi.py at this alpha."
+            )
 
     def _poll(self) -> None:
         ret, frame = self._cap.read()

@@ -5,6 +5,13 @@ If roi.json is absent, crop() returns the frame unchanged.
 Note: all pixel coordinates produced by the MDM pipeline are relative
 to the ROI origin. Add (roi.x, roi.y) back before any back-projection
 to 3D cylinder coordinates.
+
+The ROI box was drawn on a frame undistorted with a specific alpha
+(see tools/select_roi.py). Undistorting with a different alpha remaps
+pixel positions, so the saved box only lines up with the marker grid
+when consumers undistort with the same alpha it was selected under —
+hence alpha travels with x/y/w/h instead of being chosen independently
+downstream.
 """
 import json
 from dataclasses import dataclass
@@ -14,6 +21,7 @@ from typing import Optional
 import numpy as np
 
 _ROI_PATH = Path(__file__).parent.parent / "roi.json"
+DEFAULT_ALPHA = 1.0
 
 
 @dataclass
@@ -22,6 +30,7 @@ class ROIConfig:
     y: int
     w: int
     h: int
+    alpha: float = DEFAULT_ALPHA
 
 
 class ROICrop:
@@ -29,7 +38,10 @@ class ROICrop:
         self._config: Optional[ROIConfig] = None
         if roi_path.exists():
             raw = json.loads(roi_path.read_text())
-            self._config = ROIConfig(**{k: int(v) for k, v in raw.items()})
+            self._config = ROIConfig(
+                x=int(raw["x"]), y=int(raw["y"]), w=int(raw["w"]), h=int(raw["h"]),
+                alpha=float(raw.get("alpha", DEFAULT_ALPHA)),
+            )
 
     @property
     def is_set(self) -> bool:
