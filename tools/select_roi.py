@@ -8,6 +8,12 @@ read that alpha back and undistort with it before cropping, so the
 box always lines up with the frame it's applied to — undistorting
 with a different alpha remaps pixel positions and misaligns the crop.
 
+After the rectangle, optionally trace a polygon around the sensor's
+actual (curved) outline within that crop — this is what lets detection
+exclude the dark margins a bounding rectangle can't avoid on a
+cylindrical sensor. Skipping it (ENTER with no points) keeps the old
+rectangle-only behavior.
+
 Usage:
     python tools/select_roi.py
     python tools/select_roi.py --camera 1   # if camera index is not 0
@@ -19,6 +25,7 @@ import sys
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 ROOT = Path(__file__).parent.parent
 ROI_PATH = ROOT / "roi.json"
@@ -26,6 +33,53 @@ ROI_PATH = ROOT / "roi.json"
 sys.path.insert(0, str(ROOT))
 from core.calibration import CameraCalibration  # noqa: E402
 from core.roi import DEFAULT_ALPHA  # noqa: E402
+
+MASK_WINDOW_NAME = "Trace sensor outline (optional)"
+
+
+def _select_mask_polygon(cropped: np.ndarray) -> list[tuple[int, int]]:
+    """Click points around the sensor outline; ENTER to finish, BACKSPACE to
+    undo the last point, 's' to skip masking entirely. Returns [] if skipped
+    or fewer than 3 points were placed (not enough to form a polygon)."""
+    points: list[tuple[int, int]] = []
+
+    def on_mouse(event: int, x: int, y: int, _flags: int, _param: None) -> None:
+        if event == cv2.EVENT_LBUTTONDOWN:
+            points.append((x, y))
+
+    cv2.namedWindow(MASK_WINDOW_NAME)
+    cv2.setMouseCallback(MASK_WINDOW_NAME, on_mouse)
+
+    print("Trace the sensor outline (optional):")
+    print("  left-click  — add a point")
+    print("  BACKSPACE   — undo last point")
+    print("  ENTER       — finish (needs >= 3 points)")
+    print("  s           — skip, keep rectangle-only crop")
+
+    while True:
+        display = cropped.copy()
+        for pt in points:
+            cv2.circle(display, pt, 3, (0, 255, 0), -1)
+        if len(points) >= 2:
+            cv2.polylines(display, [np.array(points, dtype=np.int32)], False, (0, 255, 0), 1)
+        cv2.imshow(MASK_WINDOW_NAME, display)
+
+        key = cv2.waitKey(20) & 0xFF
+        if key == 13:  # ENTER
+            break
+        elif key == ord("s"):
+            points = []
+            break
+        elif key == 8:  # BACKSPACE
+            if points:
+                points.pop()
+
+    cv2.destroyWindow(MASK_WINDOW_NAME)
+    if len(points) < 3:
+        if points:
+            print("Fewer than 3 points placed — skipping mask.")
+        return []
+    return points
 
 
 def select_roi(camera_index: int, alpha: float) -> None:
@@ -64,15 +118,24 @@ def select_roi(camera_index: int, alpha: float) -> None:
         return
 
     x, y, w, h = (int(v) for v in roi)
-    config = {"x": x, "y": y, "w": w, "h": h, "alpha": alpha}
+    cropped = frame[y : y + h, x : x + w]
+
+    mask_points = _select_mask_polygon(cropped)
+
+    config: dict = {"x": x, "y": y, "w": w, "h": h, "alpha": alpha}
+    if mask_points:
+        config["mask_points"] = [list(p) for p in mask_points]
 
     with open(ROI_PATH, "w") as f:
         json.dump(config, f, indent=2)
 
     print(f"ROI saved to {ROI_PATH}")
     print(f"  x={x}, y={y}, w={w}, h={h}, alpha={alpha}")
+    print(f"  mask_points={'none (rectangle only)' if not mask_points else len(mask_points)}")
 
-    preview = frame[y : y + h, x : x + w]
+    preview = cropped.copy()
+    if mask_points:
+        cv2.polylines(preview, [np.array(mask_points, dtype=np.int32)], True, (0, 255, 0), 1)
     cv2.imshow("ROI preview — press any key to close", preview)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
