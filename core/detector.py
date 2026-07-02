@@ -1,6 +1,10 @@
+import json
+from pathlib import Path
+
 import cv2
 import numpy as np
-from scipy.ndimage import maximum_filter
+
+_PARAMS_PATH = Path(__file__).parent.parent / "detector_params.json"
 
 
 def default_params() -> dict:
@@ -9,13 +13,72 @@ def default_params() -> dict:
         "erode": True,
         "open": True,
         "dilate": True,
-        "log_ksize": 55,
-        "log_sigma": 17.0,
+        "min_area": 5.0,
+        "max_area": 3000.0,
+        "clahe": False,
+        "clahe_clip": 3.0,
+        "clahe_grid": 8,
+        "adaptive": False,
+        "adaptive_block": 51,
+        "adaptive_C": -10,
+        "tophat": False,
+        "tophat_ksize": 15,
     }
 
 
-def preprocess(frame_gray: np.ndarray, params: dict) -> np.ndarray:
-    _, img = cv2.threshold(frame_gray, params["thresh"], 255, cv2.THRESH_BINARY)
+def load_params() -> dict:
+    """default_params(), overlaid with a previously-saved calibration (see
+    calibrate_detector.py's 's' key) if one exists. Merges onto the current
+    schema's defaults rather than trusting the file wholesale, so a saved
+    file predating a params-schema change (missing/extra keys) can't crash
+    anything -- missing keys keep today's default, extra stale keys are
+    carried along harmlessly."""
+    params = default_params()
+    if _PARAMS_PATH.exists():
+        saved = json.loads(_PARAMS_PATH.read_text())
+        params.update(saved.get("params", {}))
+    return params
+
+
+def flatten_illumination(frame_gray: np.ndarray, params: dict) -> np.ndarray:
+    """CLAHE + white top-hat stage of preprocess(), split out so a caller
+    sweeping many threshold/adaptive candidates against the same illumination
+    settings (e.g. calibrate_detector's search) can reuse one flattened image
+    instead of repeating the expensive top-hat morphology per candidate."""
+    img_gray = frame_gray
+    if params.get("clahe", False):
+        clahe = cv2.createCLAHE(
+            clipLimit=params.get("clahe_clip", 3.0),
+            tileGridSize=(params.get("clahe_grid", 8), params.get("clahe_grid", 8)),
+        )
+        img_gray = clahe.apply(img_gray)
+
+    if params.get("tophat", False):
+        # White top-hat = image - opening(image): erases bright features
+        # smaller than the structuring element (the markers) and keeps the
+        # smooth background, so subtracting it flattens uneven illumination
+        # (dim edge markers vs bright centre) before thresholding. The SE
+        # must be a bit LARGER than a marker -- too small and the marker
+        # itself gets erased away by the opening and vanishes here too.
+        k = params.get("tophat_ksize", 15) | 1
+        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        img_gray = cv2.morphologyEx(img_gray, cv2.MORPH_TOPHAT, se)
+
+    return img_gray
+
+
+def binarize(flattened_gray: np.ndarray, params: dict) -> np.ndarray:
+    """Threshold + cleanup morphology stage of preprocess(), operating on an
+    already illumination-flattened image (see flatten_illumination())."""
+    if params.get("adaptive", False):
+        block = params.get("adaptive_block", 51) | 1  # must be odd
+        img = cv2.adaptiveThreshold(
+            flattened_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY,
+            block, params.get("adaptive_C", -10),
+        )
+    else:
+        _, img = cv2.threshold(flattened_gray, params["thresh"], 255, cv2.THRESH_BINARY)
+
     kernel = np.ones((3, 3), dtype=np.uint8)
     if params["erode"]:
         img = cv2.erode(img, kernel, iterations=1)
@@ -26,80 +89,71 @@ def preprocess(frame_gray: np.ndarray, params: dict) -> np.ndarray:
     return img
 
 
-def build_log_kernel(ksize: int, sigma: float) -> np.ndarray:
-    assert ksize % 2 == 1, "ksize must be odd"
-    ax = np.linspace(-(ksize // 2), ksize // 2, ksize)
-    xx, yy = np.meshgrid(ax, ax)
-    r2 = xx ** 2 + yy ** 2
-    # Positive centre: responds maximally at centres of BRIGHT blobs
-    kernel = (1.0 - r2 / (2.0 * sigma ** 2)) * np.exp(-r2 / (2.0 * sigma ** 2))
-    total = np.abs(kernel).sum()
-    if total > 0:
-        kernel /= total
-    return kernel
+def preprocess(frame_gray: np.ndarray, params: dict) -> np.ndarray:
+    return binarize(flatten_illumination(frame_gray, params), params)
 
 
-def _nms_size(sigma: float) -> int:
-    return int(2 * sigma + 1) | 1
+def _labeled_components(preprocessed: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Connected-component pass shared by detect(), detection_labels(), and
+    count_oversized_components() so each caller doesn't repeat the analysis."""
+    _, labels, stats, centroids = cv2.connectedComponentsWithStats(preprocessed, connectivity=8)
+    return labels, stats, centroids
+
+
+def _area_accept(stats: np.ndarray, params: dict) -> np.ndarray:
+    min_area = params.get("min_area", 5.0)
+    max_area = params.get("max_area", 3000.0)
+    areas = stats[:, cv2.CC_STAT_AREA].astype(float)
+    accept = (areas >= min_area) & (areas <= max_area)
+    accept[0] = False  # label 0 is background
+    return accept
 
 
 def detection_labels(
-    gray: np.ndarray,
+    _gray: np.ndarray,
     preprocessed: np.ndarray,
     params: dict,
 ) -> tuple[np.ndarray, set[int]]:
-    ksize = params["log_ksize"]
-    sigma = params["log_sigma"]
-    kernel = build_log_kernel(ksize, sigma)
-    response = cv2.filter2D(gray.astype(np.float32), -1, kernel)
-    local_max = response == maximum_filter(response, size=_nms_size(sigma))
-    threshold = response.mean() + response.std()
-    local_max &= response > threshold
-    local_max &= preprocessed > 0
-    ys, xs = np.where(local_max)
-    _, labels, _, _ = cv2.connectedComponentsWithStats(preprocessed, connectivity=8)
-    h, w = gray.shape[:2]
-    accepted: set[int] = set()
-    for x, y in zip(xs.tolist(), ys.tolist()):
-        if 0 <= x < w and 0 <= y < h:
-            label = int(labels[y, x])
-            if label != 0:
-                accepted.add(label)
+    labels, stats, _ = _labeled_components(preprocessed)
+    accept = _area_accept(stats, params)
+    accepted = {label for label in range(1, stats.shape[0]) if accept[label]}
     return labels, accepted
 
 
 def detect(
-    gray: np.ndarray,
+    _gray: np.ndarray,
     preprocessed: np.ndarray,
     params: dict,
 ) -> list[tuple[float, float, float]]:
-    ksize = params["log_ksize"]
-    sigma = params["log_sigma"]
+    _, stats, centroids = _labeled_components(preprocessed)
+    accept = _area_accept(stats, params)
 
-    kernel = build_log_kernel(ksize, sigma)
-    # Apply to grayscale so the intensity gradient at blob centres is visible
-    response = cv2.filter2D(gray.astype(np.float32), -1, kernel)
-
-    local_max = response == maximum_filter(response, size=_nms_size(sigma))
-    threshold = response.mean() + response.std()
-    local_max &= response > threshold
-    # Restrict to pixels inside white (marker) regions of the binary mask
-    local_max &= preprocessed > 0
-
-    ys, xs = np.where(local_max)
-
-    _, labels, stats, _ = cv2.connectedComponentsWithStats(preprocessed, connectivity=8)
-
-    h, w = gray.shape[:2]
-    seen_labels: set[int] = set()
     detections: list[tuple[float, float, float]] = []
-    for x, y in zip(xs.tolist(), ys.tolist()):
-        if 0 <= x < w and 0 <= y < h:
-            label = int(labels[y, x])
-            if label == 0 or label in seen_labels:
-                continue
-            seen_labels.add(label)
-            area = float(stats[label, cv2.CC_STAT_AREA])
-            detections.append((float(x), float(y), area))
+    for label in range(1, stats.shape[0]):
+        if not accept[label]:
+            continue
+        # Connected-component centroid is shape-agnostic and stays stable
+        # even when the marker is squished/elliptical near the curved edges.
+        cx, cy = centroids[label]
+        detections.append((float(cx), float(cy), float(stats[label, cv2.CC_STAT_AREA])))
 
     return detections
+
+
+def count_oversized_components(
+    _gray: np.ndarray,
+    preprocessed: np.ndarray,
+    params: dict,
+    oversize_factor: float = 1.8,
+) -> int:
+    """Diagnostic: components whose area exceeds oversize_factor times the
+    median accepted area -- a canary for markers whose blobs have merged."""
+    _, stats, _ = _labeled_components(preprocessed)
+    accept = _area_accept(stats, params)
+    areas = stats[accept, cv2.CC_STAT_AREA].astype(float)
+    if areas.size == 0:
+        return 0
+    median_area = float(np.median(areas))
+    if median_area <= 0:
+        return 0
+    return int(np.sum(areas > oversize_factor * median_area))

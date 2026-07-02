@@ -4,10 +4,61 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from core.detector import default_params, preprocess, detect, detection_labels
+from core.detector import load_params, preprocess, detect, detection_labels
 from core.kalman import KalmanManager
 from core.hungarian import assign
+from core.roi import ROICrop
 from core import zdisplacement
+
+TARGET_MARKER_COUNT = 121
+BASELINE_FRAMES = 15
+# A cluster must be seen in at least this fraction of sampled baseline
+# frames to be locked -- a detection appearing in only one or two frames is
+# more likely a transient false positive than a real marker.
+BASELINE_PRESENCE_FRACTION = 0.6
+# Max distance between detections across frames to count as the same
+# marker. The sensor doesn't move during baseline capture, so this only
+# needs to absorb centroid jitter -- well under half the ~60-90px marker
+# pitch, so adjacent markers can't get merged into one cluster.
+BASELINE_CLUSTER_RADIUS_PX = 15.0
+BASELINE_COUNT_TOLERANCE = 5
+
+
+def _cluster_across_frames(
+    per_frame_dets: list[list[tuple[float, float, float]]],
+    radius_px: float,
+) -> list[tuple[list[float], list[float], list[float]]]:
+    """Associate detections across frames into per-marker clusters by
+    nearest-neighbour proximity -- reuses the same gated Hungarian
+    assignment as frame-to-frame tracking, since a static sensor needs no
+    motion model. Returns, per cluster, the x/y/area samples collected
+    across the frames it was seen in."""
+    cluster_centroids: dict[int, np.ndarray] = {}
+    cluster_samples: dict[int, tuple[list[float], list[float], list[float]]] = {}
+    next_id = 0
+
+    for dets in per_frame_dets:
+        if not dets:
+            continue
+        matches, _unmatched = assign(cluster_centroids, dets, radius_px)
+        matched_det_indices = set(matches.values())
+
+        for cluster_id, det_idx in matches.items():
+            x, y, area = dets[det_idx]
+            xs, ys, areas = cluster_samples[cluster_id]
+            xs.append(x)
+            ys.append(y)
+            areas.append(area)
+            cluster_centroids[cluster_id] = np.array([np.mean(xs), np.mean(ys)])
+
+        for det_idx, (x, y, area) in enumerate(dets):
+            if det_idx in matched_det_indices:
+                continue
+            cluster_samples[next_id] = ([x], [y], [area])
+            cluster_centroids[next_id] = np.array([x, y], dtype=float)
+            next_id += 1
+
+    return list(cluster_samples.values())
 
 
 @dataclass
@@ -48,9 +99,29 @@ class Tracker:
         self._calib_w: int = w
         self._calib_h: int = h
 
+        # NOTE: this undistort path is independent of core/calibration.py's
+        # CameraCalibration (which viewer_window.py and calibrate_detector.py
+        # use, and which tools/select_roi.py draws the ROI against with a
+        # chosen alpha/balance). This class builds its own map directly from
+        # K/D with no balance parameter, so roi.json's saved alpha may not
+        # correspond to pixel positions here -- the crop below assumes it
+        # does. Flagged, not fixed: reconciling the two calibration paths is
+        # a separate change from detector reliability and isn't verifiable
+        # without the real rig.
+        self._roi = ROICrop()
+
         self.kalman = KalmanManager()
-        self.gate_px: float = 280.0
-        self.params: dict = default_params()
+        # gate_px bounds how far a single-frame detection may sit from a
+        # state's Kalman-predicted position (~33ms of motion at 30fps) to
+        # still be treated as the same marker -- it is NOT a limit on total
+        # baseline-relative displacement, which is unbounded over a session.
+        # 280px let a stray detection anywhere in roughly a third of the
+        # frame capture a state; with ROI+mask now removing border false
+        # positives at the source, CLAUDE.md's documented default (100px,
+        # never below 80px) is the safer gate -- real per-frame motion at
+        # 30fps is far under this for any physically plausible press/release.
+        self.gate_px: float = 100.0
+        self.params: dict = load_params()
         self.baseline_set: bool = False
         self.baseline_positions_mm: dict[int, tuple[float, float]] = {}
         self.frame_index: int = 0
@@ -73,17 +144,61 @@ class Tracker:
     def _undistort(self, frame: np.ndarray) -> np.ndarray:
         return self.undistort(frame)
 
-    def capture_baseline(self, raw_frame: np.ndarray) -> int:
-        undistorted = self._undistort(raw_frame)
-        gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
-        self._last_baseline_gray = gray.copy()
-        proc = preprocess(gray, self.params)
+    def _detect_full_frame(
+        self, gray_full: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, list[tuple[float, float, float]]]:
+        """Crop to the ROI and gate to the sensor-outline mask (if authored)
+        before detecting, so stray blobs in the dark curved margins can't
+        become detections at all. Detected coordinates are translated back
+        to full-frame pixel space before returning -- Kalman state
+        positions, the mm conversion (_cx/_cy), and overlay drawing (on
+        last_undistorted) all operate in full-frame space. Returns
+        (cropped_gray, masked_binary, full_frame_detections)."""
+        cropped_gray = self._roi.crop(gray_full)
+        proc = preprocess(cropped_gray, self.params)
+        mask = self._roi.sensor_mask(proc.shape)
+        if mask is not None:
+            proc = cv2.bitwise_and(proc, mask)
+        dets_cropped = detect(cropped_gray, proc, self.params)
+        dets = [(*self._roi.to_full_frame(x, y), area) for x, y, area in dets_cropped]
+        return cropped_gray, proc, dets
+
+    def capture_baseline(self, raw_frames: list[np.ndarray]) -> int:
+        """Locks the 121 Kalman states from a burst of frames (the sensor
+        must be at rest) rather than a single grab -- since these states are
+        never re-created for the rest of the session, a baseline captured
+        from one noisy/jittery frame permanently poisons every displacement
+        computed against it. Each marker's locked position is the per-frame
+        median across every frame it was detected in, which is far less
+        sensitive to a single bad frame than either a single-frame read or a
+        running mean."""
+        if not raw_frames:
+            raise ValueError("capture_baseline() requires at least one frame")
+
+        per_frame_dets: list[list[tuple[float, float, float]]] = []
+        cropped_gray = proc = None
+        for raw_frame in raw_frames:
+            undistorted = self._undistort(raw_frame)
+            gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
+            cropped_gray, proc, dets = self._detect_full_frame(gray)
+            per_frame_dets.append(dets)
+
+        # Diagnostic view reflects the most recently sampled frame.
+        assert cropped_gray is not None and proc is not None
+        self._last_baseline_gray = cropped_gray.copy()
         self._last_baseline_binary = proc.copy()
-        dets = detect(gray, proc, self.params)
-        dets.sort(key=lambda d: (d[1], d[0]))  # deterministic: top→bottom, left→right
+
+        clusters = _cluster_across_frames(per_frame_dets, BASELINE_CLUSTER_RADIUS_PX)
+        min_presence = max(1, int(round(len(raw_frames) * BASELINE_PRESENCE_FRACTION)))
+        locked = [
+            (float(np.median(xs)), float(np.median(ys)), float(np.median(areas)))
+            for xs, ys, areas in clusters
+            if len(xs) >= min_presence
+        ]
+        locked.sort(key=lambda d: (d[1], d[0]))  # deterministic: top→bottom, left→right
 
         self.kalman.states.clear()
-        for i, (x, y, area) in enumerate(dets):
+        for i, (x, y, area) in enumerate(locked):
             self.kalman.init_state(i, x, y, area)
 
         # Baseline positions converted to mm, ASSUMING the camera principal
@@ -101,9 +216,12 @@ class Tracker:
         }
 
         self.baseline_set = True
-        count = len(dets)
-        if count < 100:
-            print(f"Warning: only {count} markers detected at baseline (expected ~154)")
+        count = len(locked)
+        if abs(count - TARGET_MARKER_COUNT) > BASELINE_COUNT_TOLERANCE:
+            print(
+                f"Warning: baseline locked {count} markers (target {TARGET_MARKER_COUNT}) "
+                f"-- consider retrying capture_baseline()."
+            )
         return count
 
     def build_detection_diagnostic(self) -> np.ndarray | None:
@@ -127,8 +245,7 @@ class Tracker:
         undistorted = self._undistort(raw_frame)
         self._last_undistorted = undistorted
         gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
-        proc = preprocess(gray, self.params)
-        dets = detect(gray, proc, self.params)
+        _, _, dets = self._detect_full_frame(gray)
 
         priors = self.kalman.predict_all()
         matches, unmatched = assign(priors, dets, self.gate_px)
