@@ -7,7 +7,7 @@ Two apps (both in this repo):
 - `viewer.py` — live feed + baseline capture + session recording. **Current priority.**
 - `test_app.py` — structured test suite with a main menu (not yet implemented).
 
-The pipeline (LoG detection → Kalman tracking → Hungarian assignment) was ported from `mdm-kalman` (phantom slab testing). Core logic is the same; geometry and camera differ.
+The pipeline (threshold + connected-component detection → Kalman tracking → Hungarian assignment) was ported from `mdm-kalman` (phantom slab testing). Core logic is the same; geometry and camera differ.
 
 ## Stack
 - **Language:** Python 3.10+
@@ -25,7 +25,7 @@ When calibration is eventually added, it goes in `core/calibration.py`, precompu
 ## Marker geometry
 11×11 grid = **121 markers** on a curved cylindrical forearm surface.
 
-**Important:** `GATE_PX` (default 100 px) and the LoG blob size parameters in `detector.py` were tuned for a fisheye phantom camera and **must be retuned** once real GripVT footage is available. Expect the first session to need parameter adjustment.
+**Important:** `GATE_PX` (default 100 px) and the marker blob area bounds (`min_area`/`max_area`) in `detector.py` were tuned for a fisheye phantom camera and **must be retuned** once real GripVT footage is available. Expect the first session to need parameter adjustment.
 
 `zdisplacement.py` is present but its curved-surface geometry adaptation is **pending**. The flat-plane formula from the phantom is a placeholder.
 
@@ -36,7 +36,7 @@ GripVT/
   test_app.py             # Test app entry point (future)
   requirements.txt
   core/
-    detector.py           # LoG kernel + local maxima detection
+    detector.py           # Threshold + connected-component marker detection
     kalman.py             # Kalman state management (predict / correct)
     hungarian.py          # Assignment via scipy.optimize.linear_sum_assignment
     tracker.py            # Orchestrates predict -> assign -> correct per frame
@@ -86,7 +86,7 @@ pip install -r requirements.txt
 |---|---|
 | Spawn new Kalman states mid-session | Initialise all states at Capture Baseline only |
 | Compute undistortion per frame | Wait for `core/calibration.py`; precompute once at startup |
-| Use optical flow for tracking | LoG + local maxima + Hungarian assignment only |
+| Use optical flow for tracking | Threshold + connected-component centroid + Hungarian assignment only |
 | Set `GATE_PX` below 80 px | Default 100 px; retune for GripVT footage but keep ≥ 80 |
 | Write output to project root | Write to `output/sessions/<timestamp>/` always |
 | Add test writers before test app is being built | Keep `output/` minimal during viewer phase |
