@@ -172,6 +172,9 @@ class CalibratorApp:
         if not ok:
             return None
         frame = self._cal.undistort(frame)
+        # Rotate before cropping to match the viewer/select_roi.py pipeline --
+        # roi.json's box is defined in the rotated coordinate space.
+        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
         frame = self._roi.crop(frame)
         return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
