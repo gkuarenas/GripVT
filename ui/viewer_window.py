@@ -78,7 +78,7 @@ class ViewerWindow(ctk.CTk):
         self._alpha_seg.pack(side="left", pady=8)
 
     def _on_alpha_change(self, value: str) -> None:
-        self._alpha = 1.0 if value.startswith("0") else 0.0
+        self._alpha = 0.0 if value.startswith("0") else 1.0
         self._cal = CameraCalibration(alpha=self._alpha)
         if self._roi.is_set and self._alpha != self._roi.config.alpha:
             print(
