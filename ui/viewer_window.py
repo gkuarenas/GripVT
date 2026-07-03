@@ -25,7 +25,8 @@ class ViewerWindow(ctk.CTk):
         super().__init__()
         self.title("GripVT Viewer")
         self.geometry(f"{VIDEO_W}x{VIDEO_H + 48}")
-        self.resizable(False, False)
+        self.resizable(True, True)
+        self._display_size = (VIDEO_W, VIDEO_H)
 
         self._roi = ROICrop()
         # Undistort with whatever alpha the ROI was selected under (see
@@ -47,6 +48,7 @@ class ViewerWindow(ctk.CTk):
 
         self._label = ctk.CTkLabel(self, text="")
         self._label.pack(fill="both", expand=True)
+        self._label.bind("<Configure>", self._on_label_resize)
 
         self._build_controls()
 
@@ -77,6 +79,21 @@ class ViewerWindow(ctk.CTk):
                 "be misaligned until you re-run select_roi.py at this alpha."
             )
 
+    def _on_label_resize(self, event) -> None:
+        # Fit the 3:4 feed inside the label's current box without stretching it —
+        # the box itself isn't locked to 3:4 since the control bar eats a fixed
+        # 48px, so whichever dimension is the tighter constraint wins.
+        w, h = event.width, event.height
+        if w <= 0 or h <= 0:
+            return
+        if w / h > VIDEO_W / VIDEO_H:
+            new_h = h
+            new_w = int(h * VIDEO_W / VIDEO_H)
+        else:
+            new_w = w
+            new_h = int(w * VIDEO_H / VIDEO_W)
+        self._display_size = (max(new_w, 1), max(new_h, 1))
+
     def _poll(self) -> None:
         ret, frame = self._cap.read()
         if ret:
@@ -85,7 +102,7 @@ class ViewerWindow(ctk.CTk):
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(frame_rgb)
-            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(VIDEO_W, VIDEO_H))
+            ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=self._display_size)
             self._label.configure(image=ctk_img)
             self._label.image = ctk_img  # keep reference alive
         self._after_id = self.after(POLL_MS, self._poll)
