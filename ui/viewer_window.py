@@ -26,6 +26,10 @@ class ViewerWindow(ctk.CTk):
         self.title("GripVT Viewer")
         self.geometry(f"{VIDEO_W}x{VIDEO_H + 48}")
         self.resizable(True, True)
+        # Without this, the label's requested size (driven by the displayed
+        # image) grows the window, which fires another <Configure> event with
+        # a bigger box, which grows the image again -- runaway feedback loop.
+        self.pack_propagate(False)
         self._display_size = (VIDEO_W, VIDEO_H)
 
         self._roi = ROICrop()
