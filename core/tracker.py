@@ -1,9 +1,9 @@
-import json
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
+from core.calibration import CameraCalibration
 from core.detector import load_params, preprocess, detect, detection_labels
 from core.kalman import KalmanManager
 from core.hungarian import assign
@@ -81,34 +81,29 @@ class MarkerRecord:
 
 
 class Tracker:
-    def __init__(self, calib_path: str = "calibration.json") -> None:
-        with open(calib_path, "r") as f:
-            data = json.load(f)
+    def __init__(self, calibration: CameraCalibration, roi: ROICrop | None = None) -> None:
+        # Undistorts through the same CameraCalibration + alpha/balance path
+        # roi.json was authored against (see tools/select_roi.py), so the ROI
+        # crop below lands on the marker grid correctly. All downstream
+        # px<->mm math uses calibration's K_new-derived intrinsics, since
+        # that's the matrix pixel coordinates are expressed in after remap.
+        self._calibration = calibration
+        calib_w, calib_h = calibration.image_size
+        # undistort() rotates 90 degrees clockwise after remapping (see
+        # below), so detections -- and the px<->mm math in capture_baseline
+        # and zdisplacement.compute -- operate in the ROTATED frame. fx/fy
+        # swap (the new horizontal axis was the old vertical one) and cx/cy
+        # remap through the same point transform cv2.ROTATE_90_CLOCKWISE
+        # applies to pixel coordinates: (x, y) -> (calib_h - y, x).
+        self._fx: float = calibration.fy
+        self._fy: float = calibration.fx
+        self._cx: float = calib_h - calibration.cy
+        self._cy: float = calibration.cx
+        # calib_w/calib_h stay un-rotated -- they gate the resize below,
+        # which runs on the raw (pre-undistort, pre-rotate) capture frame.
+        self._calib_w, self._calib_h = calib_w, calib_h
 
-        K = np.array(data["K"], dtype=float)
-        D = np.array(data["D"], dtype=float)    # shape (4,1) — already correct for cv2.fisheye
-        w, h = data["image_size"]               # [width, height] — width is index 0
-        self._fx: float = float(K[0, 0])
-        self._fy: float = float(K[1, 1])
-        self._cx: float = float(K[0, 2])
-        self._cy: float = float(K[1, 2])
-
-        self.map1, self.map2 = cv2.fisheye.initUndistortRectifyMap(
-            K, D, np.eye(3), K, (w, h), cv2.CV_16SC2
-        )
-        self._calib_w: int = w
-        self._calib_h: int = h
-
-        # NOTE: this undistort path is independent of core/calibration.py's
-        # CameraCalibration (which viewer_window.py and calibrate_detector.py
-        # use, and which tools/select_roi.py draws the ROI against with a
-        # chosen alpha/balance). This class builds its own map directly from
-        # K/D with no balance parameter, so roi.json's saved alpha may not
-        # correspond to pixel positions here -- the crop below assumes it
-        # does. Flagged, not fixed: reconciling the two calibration paths is
-        # a separate change from detector reliability and isn't verifiable
-        # without the real rig.
-        self._roi = ROICrop()
+        self._roi = roi if roi is not None else ROICrop()
 
         self.kalman = KalmanManager()
         # gate_px bounds how far a single-frame detection may sit from a
@@ -139,7 +134,11 @@ class Tracker:
         h, w = frame.shape[:2]
         if w != self._calib_w or h != self._calib_h:
             frame = cv2.resize(frame, (self._calib_w, self._calib_h), interpolation=cv2.INTER_LINEAR)
-        return cv2.remap(frame, self.map1, self.map2, cv2.INTER_LINEAR)
+        undistorted = self._calibration.undistort(frame)
+        # Rotate to match the viewer's display orientation -- roi.json's box
+        # (see tools/select_roi.py) is defined in this rotated coordinate
+        # space, so cropping must happen after this, not before.
+        return cv2.rotate(undistorted, cv2.ROTATE_90_CLOCKWISE)
 
     def _undistort(self, frame: np.ndarray) -> np.ndarray:
         return self.undistort(frame)

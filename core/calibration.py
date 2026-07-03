@@ -47,5 +47,14 @@ class CameraCalibration:
                 K, D, None, K_new, (w, h), cv2.CV_16SC2
             )
 
+        # K_new is the intrinsic matrix pixel coordinates are expressed in
+        # after undistort() remaps them -- downstream px<->mm conversions on
+        # an undistorted frame must use these, not the raw K above.
+        self.K_new: np.ndarray = np.array(K_new, dtype=np.float64)
+        self.fx: float = float(self.K_new[0, 0])
+        self.fy: float = float(self.K_new[1, 1])
+        self.cx: float = float(self.K_new[0, 2])
+        self.cy: float = float(self.K_new[1, 2])
+
     def undistort(self, frame: np.ndarray) -> np.ndarray:
         return cv2.remap(frame, self._map1, self._map2, cv2.INTER_LINEAR)
