@@ -81,6 +81,7 @@ class ViewerWindow(ctk.CTk):
         if ret:
             frame = self._cal.undistort(frame)
             frame = self._roi.crop(frame)
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(frame_rgb)
             ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=(VIDEO_W, VIDEO_H))
