@@ -23,7 +23,7 @@ The pipeline (threshold + connected-component detection → Kalman tracking → 
 When calibration is eventually added, it goes in `core/calibration.py`, precomputed once at startup — never inside the frame loop.
 
 ## Marker geometry
-11×11 grid = **121 markers** on a curved cylindrical forearm surface.
+9×11 grid = **99 markers** on a curved cylindrical forearm surface.
 
 **Important:** `GATE_PX` (default 100 px) and the marker blob area bounds (`min_area`/`max_area`) in `detector.py` were tuned for a fisheye phantom camera and **must be retuned** once real GripVT footage is available. Expect the first session to need parameter adjustment.
 
