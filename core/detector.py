@@ -23,6 +23,9 @@ def default_params() -> dict:
         "adaptive_C": -10,
         "tophat": False,
         "tophat_ksize": 15,
+        "blur": "none",
+        "blur_ksize": 3,
+        "blur_sigma": 0.0,
     }
 
 
@@ -38,6 +41,26 @@ def load_params() -> dict:
         saved = json.loads(_PARAMS_PATH.read_text())
         params.update(saved.get("params", {}))
     return params
+
+
+def denoise(frame_gray: np.ndarray, params: dict) -> np.ndarray:
+    """First stage of preprocess(), run on the raw grey before illumination
+    flattening. detect()'s centroid is a binary centroid (mean of
+    above-threshold pixel coordinates, not intensity-weighted), so sensor
+    noise flickering boundary pixels in/out of threshold wobbles it every
+    frame, even at rest -- smoothing here, before CLAHE would amplify that
+    same noise and before threshold locks the flicker in, stabilizes which
+    pixels clear the cutoff. Gaussian suits Gaussian sensor noise; median
+    kills salt-and-pepper speckle without smearing blob edges (the usual
+    pick for centroid stability) at the cost of eroding thin structure if
+    the kernel is too large relative to the blob."""
+    mode = params.get("blur", "none")
+    k = params.get("blur_ksize", 3) | 1
+    if mode == "gaussian":
+        return cv2.GaussianBlur(frame_gray, (k, k), params.get("blur_sigma", 0.0))
+    if mode == "median":
+        return cv2.medianBlur(frame_gray, k)
+    return frame_gray
 
 
 def flatten_illumination(frame_gray: np.ndarray, params: dict) -> np.ndarray:
@@ -90,7 +113,7 @@ def binarize(flattened_gray: np.ndarray, params: dict) -> np.ndarray:
 
 
 def preprocess(frame_gray: np.ndarray, params: dict) -> np.ndarray:
-    return binarize(flatten_illumination(frame_gray, params), params)
+    return binarize(flatten_illumination(denoise(frame_gray, params), params), params)
 
 
 def _labeled_components(preprocessed: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:

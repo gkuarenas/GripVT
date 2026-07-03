@@ -5,6 +5,7 @@ trackbars against the known curved 11x11 marker grid, then save the winning
 parameters with 's'.
 """
 import json
+import time
 from datetime import datetime
 
 import cv2
@@ -18,6 +19,29 @@ CAMERA_INDEX = 1
 WINDOW_NAME = "GripVT Detector Calibration"
 CONTROLS_WINDOW_NAME = "Detector Controls"
 OUTPUT_PATH = _PARAMS_PATH
+
+# WIN32UI trackbars emit no hover events, so a literal tooltip is impossible --
+# nudging a slider surfaces its description on the HUD instead, fading out
+# after HINT_FADE_SECONDS so it doesn't permanently occupy the frame.
+HINT_FADE_SECONDS = 2.0
+PARAM_DESCRIPTIONS: dict[str, str] = {
+    "thresh": "Global binary cutoff -- pixels above this become foreground. "
+              "Lower catches dim markers, higher rejects noise.",
+    "min_area": "Smallest blob area (px) kept as a marker -- filters tiny noise specks.",
+    "max_area": "Largest blob area (px) kept as a marker -- filters merged/oversized blobs.",
+    "erode": "Shrinks foreground blobs by 1px -- strips thin noise, may erode small markers.",
+    "open": "Erode then dilate -- removes small noise specks without shrinking real blobs.",
+    "dilate": "Grows foreground blobs by 1px -- fills small gaps, may merge close markers.",
+    "clahe": "Local contrast boost (tiled histogram eq.) -- lifts dim edge markers, can amplify noise.",
+    "clahe_clip": "CLAHE contrast-amplification limit -- higher lifts dim areas more but adds noise.",
+    "adaptive": "Per-pixel local threshold instead of global thresh -- beats uneven lighting, but noisier cutoff.",
+    "adaptive_C": "Adaptive threshold strictness -- more negative requires a pixel to stand out more from its neighborhood.",
+    "tophat": "Subtracts a smoothed background estimate -- flattens uneven illumination before thresholding.",
+    "tophat_ksize": "Top-hat structuring element size -- must be larger than a marker or the marker vanishes too.",
+    "blur": "Smooths raw grey before thresholding (none/gaussian/median) -- reduces centroid jitter from pixel noise.",
+    "blur_ksize": "Blur kernel size (odd) -- larger smooths more but can erode small/thin blob detail.",
+    "blur_sigma": "Gaussian blur sigma -- 0 lets OpenCV derive it from kernel size; higher = stronger smoothing.",
+}
 
 # Live view docks left, trackbars dock right in their own window, both sized
 # to fit the screen -- 11+ trackbars stacked above the video used to run off
@@ -36,6 +60,8 @@ def _get_screen_size() -> tuple[int, int]:
     except Exception:
         return 1920, 1080
 
+
+_BLUR_MODES = ["none", "gaussian", "median"]
 
 GRID_ROWS = 11      # circumferential (around the forearm) -- edges may curl away
 ROW_ALLOWANCE = 2   # circumferential rows allowed to be missing at the curved edges
@@ -85,9 +111,15 @@ class CalibratorApp:
         self.frozen_gray: np.ndarray | None = None
         self.last_oversized_count: int | None = None
         self.live: bool = True
+        self._last_touched: str | None = None
+        self._last_touched_at: float = 0.0
 
         self._build_windows()
         self._build_trackbars()
+
+    def _touch(self, name: str) -> None:
+        self._last_touched = name
+        self._last_touched_at = time.monotonic()
 
     def _build_windows(self) -> None:
         screen_w, screen_h = _get_screen_size()
@@ -128,42 +160,70 @@ class CalibratorApp:
         cv2.createTrackbar("adaptive_C +20", CONTROLS_WINDOW_NAME, self.params["adaptive_C"] + 20, 40, self._on_adaptive_c)
         cv2.createTrackbar("tophat", CONTROLS_WINDOW_NAME, int(self.params["tophat"]), 1, self._on_tophat)
         cv2.createTrackbar("tophat_ksize", CONTROLS_WINDOW_NAME, self.params["tophat_ksize"], 101, self._on_tophat_ksize)
+        blur_index = _BLUR_MODES.index(self.params["blur"]) if self.params["blur"] in _BLUR_MODES else 0
+        cv2.createTrackbar("blur", CONTROLS_WINDOW_NAME, blur_index, len(_BLUR_MODES) - 1, self._on_blur)
+        cv2.createTrackbar("blur_ksize", CONTROLS_WINDOW_NAME, self.params["blur_ksize"], 15, self._on_blur_ksize)
+        cv2.createTrackbar("blur_sigma x10", CONTROLS_WINDOW_NAME, int(self.params["blur_sigma"] * 10), 50, self._on_blur_sigma)
 
     def _on_thresh(self, value: int) -> None:
         self.params["thresh"] = value
+        self._touch("thresh")
 
     def _on_min_area(self, value: int) -> None:
         self.params["min_area"] = float(value)
+        self._touch("min_area")
 
     def _on_max_area(self, value: int) -> None:
         self.params["max_area"] = float(max(value, 1))
+        self._touch("max_area")
 
     def _on_erode(self, value: int) -> None:
         self.params["erode"] = bool(value)
+        self._touch("erode")
 
     def _on_open(self, value: int) -> None:
         self.params["open"] = bool(value)
+        self._touch("open")
 
     def _on_dilate(self, value: int) -> None:
         self.params["dilate"] = bool(value)
+        self._touch("dilate")
 
     def _on_clahe(self, value: int) -> None:
         self.params["clahe"] = bool(value)
+        self._touch("clahe")
 
     def _on_clahe_clip(self, value: int) -> None:
         self.params["clahe_clip"] = max(0.1, value / 10.0)
+        self._touch("clahe_clip")
 
     def _on_adaptive(self, value: int) -> None:
         self.params["adaptive"] = bool(value)
+        self._touch("adaptive")
 
     def _on_adaptive_c(self, value: int) -> None:
         self.params["adaptive_C"] = value - 20
+        self._touch("adaptive_C")
 
     def _on_tophat(self, value: int) -> None:
         self.params["tophat"] = bool(value)
+        self._touch("tophat")
 
     def _on_tophat_ksize(self, value: int) -> None:
         self.params["tophat_ksize"] = max(3, value | 1)
+        self._touch("tophat_ksize")
+
+    def _on_blur(self, value: int) -> None:
+        self.params["blur"] = _BLUR_MODES[value]
+        self._touch("blur")
+
+    def _on_blur_ksize(self, value: int) -> None:
+        self.params["blur_ksize"] = max(3, value | 1)
+        self._touch("blur_ksize")
+
+    def _on_blur_sigma(self, value: int) -> None:
+        self.params["blur_sigma"] = value / 10.0
+        self._touch("blur_sigma")
 
     def _read_processed_gray(self) -> np.ndarray | None:
         if not self.live:
@@ -231,7 +291,10 @@ class CalibratorApp:
 
             proc, dets = self._detect(gray)
             display = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-            _draw_overlay(display, dets, self.live, self.last_oversized_count)
+            hint = self._last_touched
+            if hint is not None and time.monotonic() - self._last_touched_at > HINT_FADE_SECONDS:
+                hint = None
+            _draw_overlay(display, dets, self.live, self.last_oversized_count, hint)
             cv2.imshow(WINDOW_NAME, display)
 
             key = cv2.waitKey(1) & 0xFF
@@ -251,11 +314,29 @@ class CalibratorApp:
         cv2.destroyAllWindows()
 
 
+def _wrap_text(text: str, font: int, scale: float, thickness: int, max_width: int) -> list[str]:
+    words = text.split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        (width, _), _ = cv2.getTextSize(candidate, font, scale, thickness)
+        if width > max_width and current:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        lines.append(current)
+    return lines
+
+
 def _draw_overlay(
     display: np.ndarray,
     dets: list[tuple[float, float, float]],
     live: bool,
     oversized_count: int | None,
+    hint: str | None,
 ) -> None:
     height = display.shape[0]
     counts = band_counts(dets, height)
@@ -270,6 +351,13 @@ def _draw_overlay(
         f"top:{counts['top']} mid:{counts['middle']} bot:{counts['bottom']}  oversized:{oversized_str}",
         (8, 20), cv2.FONT_HERSHEY_PLAIN, 1.2, (0, 255, 255), 1,
     )
+    if hint is not None:
+        font = cv2.FONT_HERSHEY_PLAIN
+        scale = 1.0
+        max_width = max(display.shape[1] - 16, 50)
+        text = f"{hint}: {PARAM_DESCRIPTIONS.get(hint, '')}"
+        for i, line in enumerate(_wrap_text(text, font, scale, 1, max_width)):
+            cv2.putText(display, line, (8, 40 + i * 16), font, scale, (255, 255, 255), 1)
 
 
 def _print_band_counts(dets: list[tuple[float, float, float]], height: int, oversized_count: int) -> None:
