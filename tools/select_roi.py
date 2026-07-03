@@ -1,12 +1,13 @@
 """Interactive ROI selector — run once after mounting the camera.
 
-Captures a single frame from the camera, undistorts it using the latest
-camera calibration, lets you draw a rectangle around the elastomer
-surface, and saves the box to roi.json at the project root alongside
-the alpha it was drawn under. Consumers (viewer, calibrate_detector)
-read that alpha back and undistort with it before cropping, so the
-box always lines up with the frame it's applied to — undistorting
-with a different alpha remaps pixel positions and misaligns the crop.
+Captures a single frame from the camera, undistorts and rotates it to match
+the viewer's display orientation, lets you draw a rectangle around the
+elastomer surface, and saves the box to roi.json at the project root
+alongside the alpha it was drawn under. Consumers (viewer, calibrate_detector)
+read that alpha back and undistort+rotate with it before cropping, so the
+box always lines up with the frame it's applied to — undistorting with a
+different alpha, or cropping before rotating, remaps pixel positions and
+misaligns the crop.
 
 After the rectangle, optionally trace a polygon around the sensor's
 actual (curved) outline within that crop — this is what lets detection
@@ -105,6 +106,11 @@ def select_roi(camera_index: int, alpha: float) -> None:
         raise RuntimeError("Failed to capture frame from camera")
 
     frame = cal.undistort(frame)
+    # Rotate to match the viewer's display orientation before drawing the box,
+    # so the saved x/y/w/h are in the same (rotated) coordinate space the
+    # viewer crops from -- otherwise margins tight on one edge here end up
+    # tight on a different edge once the viewer rotates the frame.
+    frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
 
     print("Draw a rectangle around the elastomer surface.")
     print("  ENTER or SPACE — confirm selection")
