@@ -121,13 +121,27 @@ class CalibratorApp:
         self._last_touched = name
         self._last_touched_at = time.monotonic()
 
+    def _display_size(self) -> tuple[int, int]:
+        """Width/height of the frame actually handed to cv2.imshow() --
+        after undistort (size unchanged), the 90-degree rotate in
+        _read_processed_gray() (which swaps width and height), and the ROI
+        crop, if one is authored. The raw pre-rotation calibration size is
+        NOT this shape -- using it to size the window stretches the
+        (correctly-cropped) image to a mismatched window aspect."""
+        cal_w, cal_h = self._cal.image_size
+        rotated_w, rotated_h = cal_h, cal_w
+        roi_config = self._roi.config
+        if roi_config is not None:
+            return roi_config.w, roi_config.h
+        return rotated_w, rotated_h
+
     def _build_windows(self) -> None:
         screen_w, screen_h = _get_screen_size()
         usable_h = max(240, screen_h - TASKBAR_ALLOWANCE)
         avail_video_w = max(320, screen_w - CONTROLS_WIDTH - WINDOW_GAP - 2 * WINDOW_MARGIN)
 
-        cal_w, cal_h = self._cal.image_size
-        aspect = cal_w / cal_h if cal_h else 16 / 9
+        display_w, display_h = self._display_size()
+        aspect = display_w / display_h if display_h else 3 / 4
         video_h = usable_h
         video_w = int(video_h * aspect)
         if video_w > avail_video_w:
@@ -138,7 +152,7 @@ class CalibratorApp:
         controls_pos = (WINDOW_MARGIN + video_w + WINDOW_GAP, WINDOW_MARGIN)
 
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.imshow(WINDOW_NAME, np.zeros((cal_h, cal_w, 3), dtype=np.uint8))
+        cv2.imshow(WINDOW_NAME, np.zeros((display_h, display_w, 3), dtype=np.uint8))
         cv2.resizeWindow(WINDOW_NAME, video_w, video_h)
         cv2.moveWindow(WINDOW_NAME, *video_pos)
 
