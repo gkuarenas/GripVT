@@ -14,9 +14,10 @@ from core.roi import DEFAULT_ALPHA, ROICrop
 
 CAMERA_INDEX = 1
 POLL_MS = 33  # ~30 fps
-# Matches the camera's native capture resolution (4:3) — do not stretch to 16:9.
-VIDEO_W = 1024
-VIDEO_H = 768
+# Camera captures natively at 4:3 (1024x768); the live feed is rotated 90 degrees
+# clockwise for display, so the displayed window is 3:4 portrait — swapped, not stretched.
+VIDEO_W = 768
+VIDEO_H = 1024
 
 
 class ViewerWindow(ctk.CTk):
