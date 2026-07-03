@@ -27,3 +27,10 @@ Thumbs.db
 
 # Mypy
 .mypy_cache/
+
+# Track only the latest calibration.json (intrinsics travel with the code)
+!camera_calibration/results/
+camera_calibration/results/*
+!camera_calibration/results/20260701_180005_calibration/
+camera_calibration/results/20260701_180005_calibration/*
+!camera_calibration/results/20260701_180005_calibration/calibration.json

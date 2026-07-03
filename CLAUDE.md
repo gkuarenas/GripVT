@@ -19,7 +19,8 @@ The pipeline (threshold + connected-component detection → Kalman tracking → 
 - **Deploy target:** Local desktop (Windows / macOS / Linux)
 
 ## Camera
-16:9 aspect ratio camera. **No fisheye undistortion.** Camera is loaded raw via `cv2.VideoCapture`.
+4:3 aspect ratio camera, native 1024×768 (GXIVISION S8M01, fixed-focus M12 lens). Camera is loaded raw via `cv2.VideoCapture`.
+Intrinsics are calibrated (fisheye model, near-rectilinear `D`) at the sensor's working distance; see `camera_calibration/results/<timestamp>/calibration.json`.
 When calibration is eventually added, it goes in `core/calibration.py`, precomputed once at startup — never inside the frame loop.
 
 ## Marker geometry
