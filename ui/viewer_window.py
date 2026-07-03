@@ -41,7 +41,7 @@ class ViewerWindow(ctk.CTk):
         self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, cal_w)
         self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cal_h)
         self._cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0) 
-        self._cap.set(cv2.CAP_PROP_EXPOSURE, 1)
+        self._cap.set(cv2.CAP_PROP_EXPOSURE, -6)
         self._after_id: str | None = None
 
         self._label = ctk.CTkLabel(self, text="")
