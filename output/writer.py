@@ -12,6 +12,7 @@ COLUMNS = [
     "frame", "timestamp_ms", "marker_id",
     "x", "y", "area", "dx", "dy", "dA",
     "magnitude", "dx_mm", "dy_mm", "delta_z_mm", "magnitude_mm",
+    "size_moments",
     "predicted_x", "predicted_y", "autofilled",
     "rep", "force_n", "indenter_z_mm", "window_type",
 ]
@@ -57,6 +58,7 @@ class CSVWriter:
                     "dy_mm": round(r.dy_mm, 4),
                     "delta_z_mm": round(r.delta_z_mm, 4),
                     "magnitude_mm": round(r.magnitude_mm, 4),
+                    "size_moments": round(r.size_moments, 3),
                     "predicted_x": round(r.predicted_x, 3),
                     "predicted_y": round(r.predicted_y, 3),
                     "autofilled": r.autofilled,

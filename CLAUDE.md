@@ -21,7 +21,7 @@ The pipeline (threshold + connected-component detection → Kalman tracking → 
 ## Camera
 4:3 aspect ratio camera, native 1024×768 (GXIVISION S8M01, fixed-focus M12 lens). Camera is loaded raw via `cv2.VideoCapture`.
 Intrinsics are calibrated (fisheye model, near-rectilinear `D`) at the sensor's working distance; see `camera_calibration/results/<timestamp>/calibration.json`.
-When calibration is eventually added, it goes in `core/calibration.py`, precomputed once at startup — never inside the frame loop.
+Undistortion maps are precomputed **once at startup** in `core/calibration.py` from `K, D` — never inside the frame loop. See the undistortion policy under Conventions.
 
 ## Marker geometry
 9×11 grid = **99 markers** on a curved cylindrical forearm surface.
@@ -75,7 +75,7 @@ pip install -r requirements.txt
 ## Conventions
 - **Displacement is always baseline-relative.** `dx = x_current - x_baseline`. Never frame[k] − frame[k-1].
 - **Kalman states are initialised once at Capture Baseline and never added or removed during a session.** Markers are fixed on the sensor.
-- **No undistortion.** Camera loads raw. Do not add `initUndistortRectifyMap` anywhere in the pipeline until a calibration module is explicitly introduced.
+- **Undistortion = points for math, remap for display only.** Camera loads raw. Undistort the ~99 marker centroids per frame with `cv2.fisheye.undistortPoints` (cheap, points only) for all measurement/geometry math. Full-frame `remap` is for the **live display only** — never in the detection/tracking math path. Maps are precomputed once from `K, D` in `core/calibration.py`; never recompute them inside the frame loop.
 - **All session output goes to `output/sessions/<timestamp>/`.** Never write CSV or PNG to the project root.
 
 ## Do
@@ -86,7 +86,7 @@ pip install -r requirements.txt
 | Anti-pattern | Do this instead |
 |---|---|
 | Spawn new Kalman states mid-session | Initialise all states at Capture Baseline only |
-| Compute undistortion per frame | Wait for `core/calibration.py`; precompute once at startup |
+| Full-frame `remap` in the math path, or recomputing maps per frame | Undistort **points** (`cv2.fisheye.undistortPoints`) per frame for math; `remap` for display only; precompute maps once at startup |
 | Use optical flow for tracking | Threshold + connected-component centroid + Hungarian assignment only |
 | Set `GATE_PX` below 80 px | Default 100 px; retune for GripVT footage but keep ≥ 80 |
 | Write output to project root | Write to `output/sessions/<timestamp>/` always |

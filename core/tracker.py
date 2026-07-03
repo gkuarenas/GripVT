@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 from core.calibration import CameraCalibration
-from core.detector import load_params, preprocess, detect, detection_labels
+from core.detector import load_params, preprocess, denoise, detect, detection_labels
 from core.kalman import KalmanManager
 from core.hungarian import assign
 from core.roi import ROICrop
@@ -78,6 +78,7 @@ class MarkerRecord:
     predicted_x: float
     predicted_y: float
     autofilled: bool
+    size_moments: float
 
 
 class Tracker:
@@ -145,22 +146,31 @@ class Tracker:
 
     def _detect_full_frame(
         self, gray_full: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, list[tuple[float, float, float]]]:
+    ) -> tuple[np.ndarray, np.ndarray, list[tuple[float, float, float]], list[float] | None]:
         """Crop to the ROI and gate to the sensor-outline mask (if authored)
         before detecting, so stray blobs in the dark curved margins can't
         become detections at all. Detected coordinates are translated back
         to full-frame pixel space before returning -- Kalman state
         positions, the mm conversion (_cx/_cy), and overlay drawing (on
         last_undistorted) all operate in full-frame space. Returns
-        (cropped_gray, masked_binary, full_frame_detections)."""
+        (cropped_gray, masked_binary, full_frame_detections, size_moments).
+        size_moments is None unless params['log_size_crosscheck'] is set (kept
+        off by default so callers not asking for the cross-check pay zero
+        extra cost); when present it's aligned 1:1 with full_frame_detections."""
         cropped_gray = self._roi.crop(gray_full)
         proc = preprocess(cropped_gray, self.params)
         mask = self._roi.sensor_mask(proc.shape)
         if mask is not None:
             proc = cv2.bitwise_and(proc, mask)
-        dets_cropped = detect(cropped_gray, proc, self.params)
+        # Gaussian fitting needs the photometric profile intact -- CLAHE/
+        # top-hat (inside preprocess()) are nonlinear and would distort it,
+        # so the fit runs against denoise()'s output, not the fully
+        # preprocessed one. proc still supplies blob location/labels.
+        denoised = denoise(cropped_gray, self.params)
+        moments_out: list[float] | None = [] if self.params.get("log_size_crosscheck", False) else None
+        dets_cropped = detect(denoised, proc, self.params, moments_out=moments_out)
         dets = [(*self._roi.to_full_frame(x, y), area) for x, y, area in dets_cropped]
-        return cropped_gray, proc, dets
+        return cropped_gray, proc, dets, moments_out
 
     def capture_baseline(self, raw_frames: list[np.ndarray]) -> int:
         """Locks the 121 Kalman states from a burst of frames (the sensor
@@ -179,7 +189,7 @@ class Tracker:
         for raw_frame in raw_frames:
             undistorted = self._undistort(raw_frame)
             gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
-            cropped_gray, proc, dets = self._detect_full_frame(gray)
+            cropped_gray, proc, dets, _moments = self._detect_full_frame(gray)
             per_frame_dets.append(dets)
 
         # Diagnostic view reflects the most recently sampled frame.
@@ -235,6 +245,26 @@ class Tracker:
                 continue
             mask = labels == lbl
             vis[mask] = (0, 255, 0) if lbl in accepted else (0, 0, 255)
+
+        if self.params.get("size_method", "gaussian") == "gaussian":
+            # Overlay both estimators on the same accepted blobs so drift
+            # between the CC centroid and the Gaussian fit is visible while
+            # tuning -- cc_params forces the "cc" path on an otherwise
+            # identical params dict, so the only difference between the two
+            # detect() calls is the estimator itself.
+            cc_params = dict(self.params, size_method="cc")
+            denoised = denoise(self._last_baseline_gray, self.params)
+            cc_dets = detect(self._last_baseline_gray, self._last_baseline_binary, cc_params)
+            gaussian_dets = detect(denoised, self._last_baseline_binary, self.params)
+            for (cx, cy, _cc_area), (gx, gy, _g_size) in zip(cc_dets, gaussian_dets):
+                cv2.drawMarker(
+                    vis, (int(round(cx)), int(round(cy))), (0, 0, 255),
+                    markerType=cv2.MARKER_CROSS, markerSize=6, thickness=1,
+                )
+                cv2.drawMarker(
+                    vis, (int(round(gx)), int(round(gy))), (255, 255, 0),
+                    markerType=cv2.MARKER_TILTED_CROSS, markerSize=6, thickness=1,
+                )
         return vis
 
     def process_frame(self, raw_frame: np.ndarray) -> list[MarkerRecord]:
@@ -244,7 +274,7 @@ class Tracker:
         undistorted = self._undistort(raw_frame)
         self._last_undistorted = undistorted
         gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
-        _, _, dets = self._detect_full_frame(gray)
+        _, _, dets, moments = self._detect_full_frame(gray)
 
         priors = self.kalman.predict_all()
         matches, unmatched = assign(priors, dets, self.gate_px)
@@ -254,12 +284,15 @@ class Tracker:
             predicted_xy = priors[sid]
 
             if sid in matches:
-                det = dets[matches[sid]]
+                det_idx = matches[sid]
+                det = dets[det_idx]
                 self.kalman.correct(sid, np.array([det[0], det[1]], dtype=float))
                 x, y, area = det[0], det[1], det[2]
+                size_moments = moments[det_idx] if moments is not None else float("nan")
             else:
                 self.kalman.mark_autofilled(sid)
                 x, y, area = float(s.x[0]), float(s.x[1]), s.baseline_area
+                size_moments = float("nan")
 
             bx, by = s.baseline_pos
             dx_px = x - bx
@@ -280,6 +313,7 @@ class Tracker:
                 dy_mm=dy_mm,
                 delta_z_mm=delta_z_mm,
                 magnitude_mm=float(np.sqrt(dx_mm**2 + dy_mm**2 + delta_z_mm**2)),
+                size_moments=size_moments,
                 predicted_x=float(predicted_xy[0]),
                 predicted_y=float(predicted_xy[1]),
                 autofilled=s.autofilled,

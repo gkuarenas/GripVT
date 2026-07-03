@@ -4,6 +4,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from core.blobfit import estimate_background, fit_gaussian_logparabola, fit_moments
+
 _PARAMS_PATH = Path(__file__).parent.parent / "detector_params.json"
 
 
@@ -26,6 +28,9 @@ def default_params() -> dict:
         "blur": "none",
         "blur_ksize": 3,
         "blur_sigma": 0.0,
+        "size_method": "gaussian",
+        "blob_margin_px": 4,
+        "log_size_crosscheck": False,
     }
 
 
@@ -143,22 +148,91 @@ def detection_labels(
     return labels, accepted
 
 
+def _blob_window(
+    gray: np.ndarray,
+    labels: np.ndarray,
+    label: int,
+    stats_row: np.ndarray,
+    margin: int,
+) -> tuple[np.ndarray, np.ndarray, int, int]:
+    """CC bounding box dilated by margin (clipped to image bounds), plus a
+    mask excluding pixels claimed by a DIFFERENT component's label -- pixels
+    below threshold (label 0, the halo the Gaussian fit needs) stay
+    included; only a neighboring marker's own labeled footprint is masked
+    out, guarding against bleed if two blobs ever get close enough to share
+    a dilated window."""
+    h, w = gray.shape
+    left = int(stats_row[cv2.CC_STAT_LEFT])
+    top = int(stats_row[cv2.CC_STAT_TOP])
+    width = int(stats_row[cv2.CC_STAT_WIDTH])
+    height = int(stats_row[cv2.CC_STAT_HEIGHT])
+
+    x0 = max(0, left - margin)
+    y0 = max(0, top - margin)
+    x1 = min(w, left + width + margin)
+    y1 = min(h, top + height + margin)
+
+    window = gray[y0:y1, x0:x1].astype(float)
+    label_window = labels[y0:y1, x0:x1]
+    neighbor_mask = (label_window == 0) | (label_window == label)
+    return window, neighbor_mask, x0, y0
+
+
 def detect(
-    _gray: np.ndarray,
+    gray: np.ndarray,
     preprocessed: np.ndarray,
     params: dict,
+    *,
+    fallback_count: list[int] | None = None,
+    moments_out: list[float] | None = None,
 ) -> list[tuple[float, float, float]]:
-    _, stats, centroids = _labeled_components(preprocessed)
+    """moments_out, when passed as an (initially empty) list, is appended
+    with one intensity-weighted-moments size estimate per returned
+    detection (NaN on a degenerate window) -- a free cross-check against
+    whichever size_method actually drives the returned (x, y, size). Left
+    None by default so callers not asking for it pay zero extra cost."""
+    labels, stats, centroids = _labeled_components(preprocessed)
     accept = _area_accept(stats, params)
+    size_method = params.get("size_method", "gaussian")
+    margin = int(params.get("blob_margin_px", 4))
+    need_window = size_method == "gaussian" or moments_out is not None
 
     detections: list[tuple[float, float, float]] = []
     for label in range(1, stats.shape[0]):
         if not accept[label]:
             continue
-        # Connected-component centroid is shape-agnostic and stays stable
-        # even when the marker is squished/elliptical near the curved edges.
+        # Connected-component centroid/area is the shape-agnostic fallback --
+        # stays stable even when the marker is squished/elliptical near the
+        # curved edges, and is used directly when size_method == "cc" or
+        # whenever the Gaussian fit is invalid for this blob.
         cx, cy = centroids[label]
-        detections.append((float(cx), float(cy), float(stats[label, cv2.CC_STAT_AREA])))
+        cc_area = float(stats[label, cv2.CC_STAT_AREA])
+
+        window: np.ndarray | None = None
+        neighbor_mask: np.ndarray | None = None
+        wx0 = wy0 = 0
+        background = 0.0
+        if need_window:
+            window, neighbor_mask, wx0, wy0 = _blob_window(gray, labels, label, stats[label], margin)
+            background = estimate_background(window)
+
+        if moments_out is not None:
+            assert window is not None and neighbor_mask is not None
+            moments = fit_moments(window, background, mask=neighbor_mask)
+            moments_out.append(moments.size if moments is not None else float("nan"))
+
+        if size_method != "gaussian":
+            detections.append((float(cx), float(cy), cc_area))
+            continue
+
+        assert window is not None and neighbor_mask is not None
+        fit = fit_gaussian_logparabola(window, background, mask=neighbor_mask)
+        if fit is None:
+            if fallback_count is not None:
+                fallback_count.append(1)
+            detections.append((float(cx), float(cy), cc_area))
+        else:
+            detections.append((fit.x0 + wx0, fit.y0 + wy0, fit.size))
 
     return detections
 

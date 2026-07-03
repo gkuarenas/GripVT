@@ -12,7 +12,14 @@ import cv2
 import numpy as np
 
 from core.calibration import CameraCalibration
-from core.detector import _PARAMS_PATH, count_oversized_components, detect, load_params, preprocess
+from core.detector import (
+    _PARAMS_PATH,
+    count_oversized_components,
+    denoise,
+    detect,
+    load_params,
+    preprocess,
+)
 from core.roi import DEFAULT_ALPHA, ROICrop
 
 CAMERA_INDEX = 1
@@ -41,6 +48,8 @@ PARAM_DESCRIPTIONS: dict[str, str] = {
     "blur": "Smooths raw grey before thresholding (none/gaussian/median) -- reduces centroid jitter from pixel noise.",
     "blur_ksize": "Blur kernel size (odd) -- larger smooths more but can erode small/thin blob detail.",
     "blur_sigma": "Gaussian blur sigma -- 0 lets OpenCV derive it from kernel size; higher = stronger smoothing.",
+    "size_method": "Per-marker size/centroid: gaussian (sub-pixel log-parabola fit, threshold-free) "
+                   "or cc (binary centroid + pixel area, legacy) -- toggle to A/B compare.",
 }
 
 # Live view docks left, trackbars dock right in their own window, both sized
@@ -62,6 +71,7 @@ def _get_screen_size() -> tuple[int, int]:
 
 
 _BLUR_MODES = ["none", "gaussian", "median"]
+_SIZE_METHODS = ["gaussian", "cc"]
 
 GRID_ROWS = 11      # circumferential (around the forearm) -- edges may curl away
 ROW_ALLOWANCE = 2   # circumferential rows allowed to be missing at the curved edges
@@ -178,6 +188,14 @@ class CalibratorApp:
         cv2.createTrackbar("blur", CONTROLS_WINDOW_NAME, blur_index, len(_BLUR_MODES) - 1, self._on_blur)
         cv2.createTrackbar("blur_ksize", CONTROLS_WINDOW_NAME, self.params["blur_ksize"], 15, self._on_blur_ksize)
         cv2.createTrackbar("blur_sigma x10", CONTROLS_WINDOW_NAME, int(self.params["blur_sigma"] * 10), 50, self._on_blur_sigma)
+        size_method_index = (
+            _SIZE_METHODS.index(self.params["size_method"])
+            if self.params["size_method"] in _SIZE_METHODS else 0
+        )
+        cv2.createTrackbar(
+            "size_method", CONTROLS_WINDOW_NAME, size_method_index,
+            len(_SIZE_METHODS) - 1, self._on_size_method,
+        )
 
     def _on_thresh(self, value: int) -> None:
         self.params["thresh"] = value
@@ -239,6 +257,10 @@ class CalibratorApp:
         self.params["blur_sigma"] = value / 10.0
         self._touch("blur_sigma")
 
+    def _on_size_method(self, value: int) -> None:
+        self.params["size_method"] = _SIZE_METHODS[value]
+        self._touch("size_method")
+
     def _read_processed_gray(self) -> np.ndarray | None:
         if not self.live:
             return self.frozen_gray
@@ -257,7 +279,11 @@ class CalibratorApp:
         mask = self._roi.sensor_mask(proc.shape)
         if mask is not None:
             proc = cv2.bitwise_and(proc, mask)
-        return proc, detect(gray, proc, self.params)
+        # Same denoise-before-fit source as tracker.py's _detect_full_frame()
+        # -- must match so the calibrator preview and the runtime pipeline
+        # fit against the same intensity profile.
+        denoised = denoise(gray, self.params)
+        return proc, detect(denoised, proc, self.params)
 
     def _freeze(self) -> None:
         gray = self._read_processed_gray()
