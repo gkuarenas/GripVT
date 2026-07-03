@@ -50,11 +50,15 @@ class ViewerWindow(ctk.CTk):
         self._cap.set(cv2.CAP_PROP_EXPOSURE, -6)
         self._after_id: str | None = None
 
+        # Control bar must be packed before the label -- with pack_propagate
+        # disabled, the packer allocates a fixed cavity to slaves in pack
+        # order, and a fill="both"/expand=True slave packed first claims the
+        # entire cavity, leaving nothing for a fixed-height slave packed after.
+        self._build_controls()
+
         self._label = ctk.CTkLabel(self, text="")
         self._label.pack(fill="both", expand=True)
         self._label.bind("<Configure>", self._on_label_resize)
-
-        self._build_controls()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll()
@@ -102,8 +106,12 @@ class ViewerWindow(ctk.CTk):
         ret, frame = self._cap.read()
         if ret:
             frame = self._cal.undistort(frame)
-            frame = self._roi.crop(frame)
+            # Rotate before cropping so roi.json's box is defined in the same
+            # (final, rotated) coordinate space tools/select_roi.py draws it
+            # in -- rotating after crop would apply pre-rotation margins to a
+            # post-rotation frame and misalign the crop with the sensor.
             frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            frame = self._roi.crop(frame)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(frame_rgb)
             ctk_img = ctk.CTkImage(light_image=img, dark_image=img, size=self._display_size)
