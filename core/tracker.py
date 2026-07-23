@@ -8,7 +8,6 @@ from core.detector import load_params, preprocess, denoise, detect, detection_la
 from core.kalman import KalmanManager
 from core.hungarian import assign
 from core.roi import ROICrop
-from core import zdisplacement
 
 TARGET_MARKER_COUNT = 121
 BASELINE_FRAMES = 15
@@ -71,10 +70,6 @@ class MarkerRecord:
     dy: float
     dA: float
     magnitude: float
-    dx_mm: float
-    dy_mm: float
-    delta_z_mm: float
-    magnitude_mm: float
     predicted_x: float
     predicted_y: float
     autofilled: bool
@@ -85,21 +80,9 @@ class Tracker:
     def __init__(self, calibration: CameraCalibration, roi: ROICrop | None = None) -> None:
         # Undistorts through the same CameraCalibration + alpha/balance path
         # roi.json was authored against (see tools/select_roi.py), so the ROI
-        # crop below lands on the marker grid correctly. All downstream
-        # px<->mm math uses calibration's K_new-derived intrinsics, since
-        # that's the matrix pixel coordinates are expressed in after remap.
+        # crop below lands on the marker grid correctly.
         self._calibration = calibration
         calib_w, calib_h = calibration.image_size
-        # undistort() rotates 90 degrees clockwise after remapping (see
-        # below), so detections -- and the px<->mm math in capture_baseline
-        # and zdisplacement.compute -- operate in the ROTATED frame. fx/fy
-        # swap (the new horizontal axis was the old vertical one) and cx/cy
-        # remap through the same point transform cv2.ROTATE_90_CLOCKWISE
-        # applies to pixel coordinates: (x, y) -> (calib_h - y, x).
-        self._fx: float = calibration.fy
-        self._fy: float = calibration.fx
-        self._cx: float = calib_h - calibration.cy
-        self._cy: float = calibration.cx
         # calib_w/calib_h stay un-rotated -- they gate the resize below,
         # which runs on the raw (pre-undistort, pre-rotate) capture frame.
         self._calib_w, self._calib_h = calib_w, calib_h
@@ -119,7 +102,6 @@ class Tracker:
         self.gate_px: float = 100.0
         self.params: dict = load_params()
         self.baseline_set: bool = False
-        self.baseline_positions_mm: dict[int, tuple[float, float]] = {}
         self.frame_index: int = 0
         self._last_baseline_gray: np.ndarray | None = None
         self._last_baseline_binary: np.ndarray | None = None
@@ -151,8 +133,8 @@ class Tracker:
         before detecting, so stray blobs in the dark curved margins can't
         become detections at all. Detected coordinates are translated back
         to full-frame pixel space before returning -- Kalman state
-        positions, the mm conversion (_cx/_cy), and overlay drawing (on
-        last_undistorted) all operate in full-frame space. Returns
+        positions and overlay drawing (on last_undistorted) all operate in
+        full-frame space. Returns
         (cropped_gray, masked_binary, full_frame_detections, size_moments).
         size_moments is None unless params['log_size_crosscheck'] is set (kept
         off by default so callers not asking for the cross-check pay zero
@@ -209,20 +191,6 @@ class Tracker:
         self.kalman.states.clear()
         for i, (x, y, area) in enumerate(locked):
             self.kalman.init_state(i, x, y, area)
-
-        # Baseline positions converted to mm, ASSUMING the camera principal
-        # point (cx, cy) coincides with the G92 machine origin (X0 Y0) — both
-        # are physically the slab centre by design. Uses the same per-axis
-        # px->mm scale factor (H_MM / f) the pipeline already applies to
-        # deltas (see core/zdisplacement.compute). The X term is negated:
-        # empirically confirmed via sensitivity_analysis.ipynb's spatial
-        # cross-check that the camera's pixel-X axis is mirrored relative to
-        # the G92 machine X-axis (Y is not mirrored).
-        self.baseline_positions_mm = {
-            sid: (-(s.baseline_pos[0] - self._cx) * (zdisplacement.H_MM / self._fx),
-                   (s.baseline_pos[1] - self._cy) * (zdisplacement.H_MM / self._fy))
-            for sid, s in self.kalman.states.items()
-        }
 
         self.baseline_set = True
         count = len(locked)
@@ -297,9 +265,6 @@ class Tracker:
             bx, by = s.baseline_pos
             dx_px = x - bx
             dy_px = y - by
-            dx_mm, dy_mm, delta_z_mm = zdisplacement.compute(
-                dx_px, dy_px, s.baseline_area, area, self._fx, self._fy
-            )
             records.append(MarkerRecord(
                 marker_id=sid,
                 x=x,
@@ -309,10 +274,6 @@ class Tracker:
                 dy=dy_px,
                 dA=area - s.baseline_area,
                 magnitude=float(np.hypot(dx_px, dy_px)),
-                dx_mm=dx_mm,
-                dy_mm=dy_mm,
-                delta_z_mm=delta_z_mm,
-                magnitude_mm=float(np.sqrt(dx_mm**2 + dy_mm**2 + delta_z_mm**2)),
                 size_moments=size_moments,
                 predicted_x=float(predicted_xy[0]),
                 predicted_y=float(predicted_xy[1]),

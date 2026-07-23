@@ -26,13 +26,15 @@ def draw_overlay(
                 ex = int(bx + r.dx * scale)
                 ey = int(by + r.dy * scale)
                 tip_len = min(0.4, 10.0 / max(mag * scale, 1.0))
-                mag_mm = r.magnitude_mm
-                if mag_mm < 1.5:
-                    color = (255, 80, 0)    # blue   — small   (< 1.5 mm)
-                elif mag_mm < 4.0:
-                    color = (0, 140, 255)   # orange — medium  (1.5–4.0 mm)
+                # Visual buckets only (px, not physical units) -- approximate
+                # the sensor's old 1.5mm/4.0mm bands at its calibrated
+                # ~0.0485 mm/px scale (H_MM/fx ~= 24.6/507.5).
+                if mag < 30.0:
+                    color = (255, 80, 0)    # blue   — small   (< ~30 px)
+                elif mag < 80.0:
+                    color = (0, 140, 255)   # orange — medium  (~30–80 px)
                 else:
-                    color = (0, 0, 255)     # red    — large   (>= 4.0 mm)
+                    color = (0, 0, 255)     # red    — large   (>= ~80 px)
                 cv2.arrowedLine(out, (bx, by), (ex, ey), color, 2, tipLength=tip_len)
             dot_color = (0, 200, 255) if r.autofilled else (200, 200, 200)
             cv2.circle(out, (cx, cy), 3, dot_color, 2)

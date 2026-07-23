@@ -166,7 +166,7 @@ class ViewerWindow(ctk.CTk):
     def _stop_session(self) -> None:
         writer = self._session_writer
         assert writer is not None
-        writer.write_window(rep=0, force_n=0.0, window_type="session")
+        writer.write_window()
         if self._last_overlay_frame is not None:
             cv2.imwrite(writer.png_path, self._last_overlay_frame)
         writer.close()
