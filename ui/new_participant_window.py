@@ -18,10 +18,14 @@ from output.participants import ParticipantRecord
 from ui import theme
 
 WINDOW_W = 800
-WINDOW_H = 500
+WINDOW_H = 560
 
 # Error banner fill: design's color-mix(accent 10%, bg) pre-composited (no tk alpha).
 _BANNER_BG = "#f2dfdc"
+_BANNER_TIMEOUT_MS = 5000  # visible before it starts to fade
+_FADE_STEPS = 8            # tk has no widget opacity, so fade by interpolating colours
+_FADE_INTERVAL_MS = 50     # 8 x 50ms ~= the design's 0.4s opacity transition
+_MEASURE_LABEL_H = 30      # design min-height for measurement labels -> inputs share one row
 
 ACTIVITY_LEVELS = [
     ("Sedentary", "Little to no exercise, desk-based"),
@@ -60,6 +64,7 @@ class NewParticipantWindow(tk.Toplevel):
         self._dots: dict[str, tk.Canvas] = {}
         self._ph_state: dict[tk.Entry, dict] = {}
         self._field_errors: dict[tk.Entry, tk.Label] = {}
+        self._banner_after: str | None = None
 
         self._init_fonts()
         self._build_body()
@@ -88,6 +93,7 @@ class NewParticipantWindow(tk.Toplevel):
         self._build_footer(body)   # packed bottom first so activity can flex
         self._build_header(body)
         self._build_activity(body)  # fills the space between header and footer
+        self._build_banner(body)    # top-right toast overlay, built last so it stacks on top
 
     def _build_header(self, parent: tk.Frame) -> None:
         head = tk.Frame(parent, bg=theme.BG)
@@ -118,9 +124,11 @@ class NewParticipantWindow(tk.Toplevel):
         self._measures: list[tk.Entry] = []
         for col, (label, placeholder, numeric) in enumerate(MEASUREMENTS):
             grid.columnconfigure(col, weight=1, uniform="m")
-            field = self._build_field(grid, label, placeholder, numeric)
+            field = self._build_field(grid, label, placeholder, numeric, label_h=_MEASURE_LABEL_H)
+            # sticky="new" (top-anchored): a "Required." line under one field grows that
+            # cell downward without re-centering its neighbours, so inputs stay on one row.
             field.master.grid(
-                row=0, column=col, sticky="ew",
+                row=0, column=col, sticky="new",
                 padx=(0, 14) if col < len(MEASUREMENTS) - 1 else 0,
             )
             self._measures.append(field)
@@ -140,23 +148,28 @@ class NewParticipantWindow(tk.Toplevel):
             options.columnconfigure(col, weight=1, uniform="a")
             self._build_radio(options, col, value, desc)
 
+    def _build_banner(self, parent: tk.Frame) -> None:
+        # Top-right toast: placed (not packed) on demand so it overlays the content
+        # without taking layout space -- the inputs never shift. Fades out after a delay.
+        self._banner_parent = parent
+        self._error_banner = tk.Frame(
+            parent, bg=_BANNER_BG, highlightthickness=1,
+            highlightbackground=theme.ACCENT, highlightcolor=theme.ACCENT,
+        )
+        self._banner_inner = tk.Frame(self._error_banner, bg=_BANNER_BG)
+        self._banner_inner.pack(padx=10, pady=6)
+        self._alert_icon(self._banner_inner, _BANNER_BG).pack(side="left", padx=(0, 6))
+        self._banner_label = tk.Label(
+            self._banner_inner, text="Please complete all required fields.",
+            bg=_BANNER_BG, fg=theme.ACCENT_700, font=self._f_desc,
+            wraplength=210, justify="left",
+        )
+        self._banner_label.pack(side="left")
+
     def _build_footer(self, parent: tk.Frame) -> None:
         footer = tk.Frame(parent, bg=theme.BG)
         footer.pack(side="bottom", fill="x")
-        self._error_banner = tk.Frame(
-            footer, bg=_BANNER_BG, highlightthickness=1,
-            highlightbackground=theme.ACCENT, highlightcolor=theme.ACCENT,
-        )
-        banner_inner = tk.Frame(self._error_banner, bg=_BANNER_BG)
-        banner_inner.pack(fill="x", padx=10, pady=5)
-        self._alert_icon(banner_inner, _BANNER_BG).pack(side="left", padx=(0, 7))
-        tk.Label(
-            banner_inner, text="Please complete all required fields.",
-            bg=_BANNER_BG, fg=theme.ACCENT_700, font=self._f_desc,
-        ).pack(side="left")
-
-        self._divider = tk.Frame(footer, bg=theme.DIVIDER, height=2)
-        self._divider.pack(fill="x", pady=(0, 14))
+        tk.Frame(footer, bg=theme.DIVIDER, height=2).pack(fill="x", pady=(0, 14))
 
         row = tk.Frame(footer, bg=theme.BG)
         row.pack(fill="x")
@@ -220,13 +233,49 @@ class NewParticipantWindow(tk.Toplevel):
                 err.pack(fill="x", anchor="w", pady=(4, 0))
             else:
                 err.pack_forget()
-        self._error_banner.pack(fill="x", pady=(0, 10), before=self._divider)
+        if self._banner_after is not None:
+            self.after_cancel(self._banner_after)
+        self._reset_banner_colors()
+        self._error_banner.place(in_=self._banner_parent, relx=1.0, x=0, y=0, anchor="ne")
+        self._error_banner.lift()
+        self._banner_after = self.after(_BANNER_TIMEOUT_MS, lambda: self._fade_step(1))
+
+    def _fade_step(self, i: int) -> None:
+        t = i / _FADE_STEPS
+        bg = _lerp(_BANNER_BG, theme.BG, t)
+        edge = _lerp(theme.ACCENT, theme.BG, t)
+        fg = _lerp(theme.ACCENT_700, theme.BG, t)
+        self._error_banner.configure(bg=bg, highlightbackground=edge, highlightcolor=edge)
+        self._banner_inner.configure(bg=bg)
+        self._banner_label.configure(bg=bg, fg=fg)
+        self._banner_icon.configure(bg=bg)
+        self._draw_alert(fg)
+        if i < _FADE_STEPS:
+            self._banner_after = self.after(_FADE_INTERVAL_MS, lambda: self._fade_step(i + 1))
+        else:
+            self._hide_banner()
+
+    def _hide_banner(self) -> None:
+        if self._banner_after is not None:
+            self.after_cancel(self._banner_after)
+            self._banner_after = None
+        self._error_banner.place_forget()
+        self._reset_banner_colors()
+
+    def _reset_banner_colors(self) -> None:
+        self._error_banner.configure(
+            bg=_BANNER_BG, highlightbackground=theme.ACCENT, highlightcolor=theme.ACCENT,
+        )
+        self._banner_inner.configure(bg=_BANNER_BG)
+        self._banner_label.configure(bg=_BANNER_BG, fg=theme.ACCENT_700)
+        self._banner_icon.configure(bg=_BANNER_BG)
+        self._draw_alert(theme.ACCENT_700)
 
     def _clear_field_errors(self) -> None:
         for _label, entry in self._labeled_entries():
             entry.configure(highlightbackground=theme.DIVIDER)
             self._field_errors[entry].pack_forget()
-        self._error_banner.pack_forget()
+        self._hide_banner()
 
     def _clear_one(self, entry: tk.Entry) -> None:
         """Clear a single field's error once it holds input, matching the design."""
@@ -236,27 +285,39 @@ class NewParticipantWindow(tk.Toplevel):
         entry.configure(highlightbackground=theme.DIVIDER)
         err.pack_forget()
         if not any(e.winfo_manager() == "pack" for e in self._field_errors.values()):
-            self._error_banner.pack_forget()
+            self._hide_banner()
 
     def _alert_icon(self, parent: tk.Misc, bg: str) -> tk.Canvas:
-        c = tk.Canvas(parent, width=13, height=13, bg=bg, highlightthickness=0)
+        self._banner_icon = tk.Canvas(parent, width=13, height=13, bg=bg, highlightthickness=0)
+        self._draw_alert(theme.ACCENT_700)
+        return self._banner_icon
+
+    def _draw_alert(self, color: str) -> None:
+        c = self._banner_icon
+        c.delete("all")
         s = 13 / 24
-        col = theme.ACCENT_700
-        c.create_oval(*(v * s for v in (2, 2, 22, 22)), outline=col, width=1)
-        c.create_line(*(v * s for v in (12, 7, 12, 13)), fill=col, width=1)
-        c.create_line(*(v * s for v in (12, 16, 12, 16.6)), fill=col, width=1)
-        return c
+        c.create_oval(*(v * s for v in (2, 2, 22, 22)), outline=color, width=1)
+        c.create_line(*(v * s for v in (12, 7, 12, 13)), fill=color, width=1)
+        c.create_line(*(v * s for v in (12, 16, 12, 16.6)), fill=color, width=1)
 
     # ── fields ──────────────────────────────────────────────────────────────
     def _build_field(
-        self, parent: tk.Misc, label: str, placeholder: str, numeric: str | None = None
+        self, parent: tk.Misc, label: str, placeholder: str,
+        numeric: str | None = None, label_h: int | None = None,
     ) -> tk.Entry:
         field = tk.Frame(parent, bg=theme.BG)
 
         head = tk.Frame(field, bg=theme.BG)
+        if label_h is not None:
+            # Fixed-height label box, text bottom-aligned: labels of different lengths
+            # share the same baseline so every input starts at the same y (one row).
+            head.configure(height=label_h)
+            head.pack_propagate(False)
         head.pack(fill="x", pady=(0, 5))
-        tk.Label(head, text=label, bg=theme.BG, fg=theme.INK_70, font=self._f_label).pack(side="left")
-        tk.Label(head, text=" *", bg=theme.BG, fg=theme.ACCENT_700, font=self._f_label).pack(side="left")
+        row = tk.Frame(head, bg=theme.BG)
+        row.pack(side="bottom", fill="x")
+        tk.Label(row, text=label, bg=theme.BG, fg=theme.INK_70, font=self._f_label).pack(side="left")
+        tk.Label(row, text=" *", bg=theme.BG, fg=theme.ACCENT_700, font=self._f_label).pack(side="left")
 
         entry = tk.Entry(
             field, bg=theme.SURFACE, fg=theme.INK, font=self._f_input,
@@ -397,6 +458,13 @@ class NewParticipantWindow(tk.Toplevel):
             w.bind("<ButtonPress-1>", on_press)
             w.bind("<ButtonRelease-1>", on_release)
             w.configure(cursor="hand2")
+
+
+def _lerp(from_hex: str, to_hex: str, t: float) -> str:
+    """Interpolate between two #rrggbb colours (t in 0..1) to fake an opacity fade."""
+    a = tuple(int(from_hex[i : i + 2], 16) for i in (1, 3, 5))
+    b = tuple(int(to_hex[i : i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
 def _is_number(proposed: str, allow_decimal: bool) -> bool:
