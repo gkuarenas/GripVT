@@ -7,6 +7,7 @@ __pycache__/
 
 # Output data
 output/sessions/
+recordings/
 camera_calibration/results/
 
 

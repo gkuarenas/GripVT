@@ -5,16 +5,23 @@ participant's anthropometrics and activity level before a session. Visual
 design ported from the Modernist design system (Claude Design: "GripVT New
 Participant") -- flat, 0px radius, Archivo type, single hot red-orange accent.
 
-This module builds the UI only; reading and persisting the entered data is
-wired later. The Save & Continue / Back handlers default to print stubs.
+On Save & Continue the entered data is validated and persisted: a de-identified
+``participant.json`` is written under ``recordings/participantNNN_<ts>/`` and the
+name is routed to an external key file (see ``output/participants.py``). The
+resulting ``ParticipantRecord`` is handed to ``on_save`` to open the session.
 """
 import tkinter as tk
 from typing import Callable
 
+from output import participants
+from output.participants import ParticipantRecord
 from ui import theme
 
 WINDOW_W = 800
 WINDOW_H = 500
+
+# Error banner fill: design's color-mix(accent 10%, bg) pre-composited (no tk alpha).
+_BANNER_BG = "#f2dfdc"
 
 ACTIVITY_LEVELS = [
     ("Sedentary", "Little to no exercise, desk-based"),
@@ -37,11 +44,11 @@ class NewParticipantWindow(tk.Toplevel):
     def __init__(
         self,
         master: tk.Misc,
-        on_save: Callable[[], None] | None = None,
+        on_save: Callable[[ParticipantRecord], None] | None = None,
         on_back: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(master)
-        self._on_save = on_save or (lambda: print("Save & Continue clicked"))
+        self._on_save = on_save or (lambda record: print(f"Saved {record.participant_id}"))
         self._on_back = on_back or (lambda: print("Back clicked"))
 
         self.title("GripVT — New Participant")
@@ -51,6 +58,8 @@ class NewParticipantWindow(tk.Toplevel):
 
         self._activity = tk.StringVar(value=ACTIVITY_LEVELS[0][0])
         self._dots: dict[str, tk.Canvas] = {}
+        self._ph_state: dict[tk.Entry, dict] = {}
+        self._field_errors: dict[tk.Entry, tk.Label] = {}
 
         self._init_fonts()
         self._build_body()
@@ -134,12 +143,109 @@ class NewParticipantWindow(tk.Toplevel):
     def _build_footer(self, parent: tk.Frame) -> None:
         footer = tk.Frame(parent, bg=theme.BG)
         footer.pack(side="bottom", fill="x")
-        tk.Frame(footer, bg=theme.DIVIDER, height=2).pack(fill="x", pady=(0, 14))
+        self._error_banner = tk.Frame(
+            footer, bg=_BANNER_BG, highlightthickness=1,
+            highlightbackground=theme.ACCENT, highlightcolor=theme.ACCENT,
+        )
+        banner_inner = tk.Frame(self._error_banner, bg=_BANNER_BG)
+        banner_inner.pack(fill="x", padx=10, pady=5)
+        self._alert_icon(banner_inner, _BANNER_BG).pack(side="left", padx=(0, 7))
+        tk.Label(
+            banner_inner, text="Please complete all required fields.",
+            bg=_BANNER_BG, fg=theme.ACCENT_700, font=self._f_desc,
+        ).pack(side="left")
+
+        self._divider = tk.Frame(footer, bg=theme.DIVIDER, height=2)
+        self._divider.pack(fill="x", pady=(0, 14))
 
         row = tk.Frame(footer, bg=theme.BG)
         row.pack(fill="x")
         self._build_button(row, "Back", "secondary", "left", self._on_back).pack(side="left")
-        self._build_button(row, "Save & Continue", "primary", "right", self._on_save).pack(side="right")
+        self._build_button(row, "Save & Continue", "primary", "right", self._handle_save).pack(side="right")
+
+    # ── collect + validate + persist ────────────────────────────────────────
+    def _labeled_entries(self) -> list[tuple[str, tk.Entry]]:
+        return [("Full Name", self._name)] + [
+            (label, entry) for (label, _p, _n), entry in zip(MEASUREMENTS, self._measures)
+        ]
+
+    def _field_value(self, entry: tk.Entry) -> str:
+        state = self._ph_state.get(entry)
+        if state is not None and state["placeholder"]:
+            return ""
+        return entry.get().strip()
+
+    def _collect(self) -> tuple[dict | None, list[str]]:
+        missing: list[str] = []
+        name = self._field_value(self._name)
+        if not name:
+            missing.append("Full Name")
+
+        values: dict = {}
+        keys = ["age", "weight_kg", "height_cm", "forearm_circ_cm", "mvc_kg"]
+        for (label, _ph, numeric), entry, key in zip(MEASUREMENTS, self._measures, keys):
+            raw = self._field_value(entry)
+            parsed = None
+            if raw not in ("", "."):
+                try:
+                    parsed = int(raw) if numeric == "int" else float(raw)
+                except ValueError:
+                    parsed = None
+            if parsed is None:
+                missing.append(label)
+            else:
+                values[key] = parsed
+
+        if missing:
+            return None, missing
+        values["name"] = name
+        values["activity_level"] = self._activity.get()
+        return values, []
+
+    def _handle_save(self) -> None:
+        values, missing = self._collect()
+        if values is None:
+            self._show_field_errors(missing)
+            return
+        self._clear_field_errors()
+        record = participants.create_participant(**values)
+        self._on_save(record)
+
+    def _show_field_errors(self, missing: list[str]) -> None:
+        for label, entry in self._labeled_entries():
+            bad = label in missing
+            entry.configure(highlightbackground=theme.ACCENT if bad else theme.DIVIDER)
+            err = self._field_errors[entry]
+            if bad:
+                err.pack(fill="x", anchor="w", pady=(4, 0))
+            else:
+                err.pack_forget()
+        self._error_banner.pack(fill="x", pady=(0, 10), before=self._divider)
+
+    def _clear_field_errors(self) -> None:
+        for _label, entry in self._labeled_entries():
+            entry.configure(highlightbackground=theme.DIVIDER)
+            self._field_errors[entry].pack_forget()
+        self._error_banner.pack_forget()
+
+    def _clear_one(self, entry: tk.Entry) -> None:
+        """Clear a single field's error once it holds input, matching the design."""
+        err = self._field_errors[entry]
+        if err.winfo_manager() != "pack" or not self._field_value(entry):
+            return
+        entry.configure(highlightbackground=theme.DIVIDER)
+        err.pack_forget()
+        if not any(e.winfo_manager() == "pack" for e in self._field_errors.values()):
+            self._error_banner.pack_forget()
+
+    def _alert_icon(self, parent: tk.Misc, bg: str) -> tk.Canvas:
+        c = tk.Canvas(parent, width=13, height=13, bg=bg, highlightthickness=0)
+        s = 13 / 24
+        col = theme.ACCENT_700
+        c.create_oval(*(v * s for v in (2, 2, 22, 22)), outline=col, width=1)
+        c.create_line(*(v * s for v in (12, 7, 12, 13)), fill=col, width=1)
+        c.create_line(*(v * s for v in (12, 16, 12, 16.6)), fill=col, width=1)
+        return c
 
     # ── fields ──────────────────────────────────────────────────────────────
     def _build_field(
@@ -163,7 +269,13 @@ class NewParticipantWindow(tk.Toplevel):
             vcmd = (entry.register(lambda P, d=allow_decimal: _is_number(P, d)), "%P")
             entry.configure(validate="key", validatecommand=vcmd)
         entry.pack(fill="x", ipady=6)
-        _add_placeholder(entry, placeholder)
+        self._ph_state[entry] = _add_placeholder(entry, placeholder)
+
+        msg = "Full name is required." if label == "Full Name" else "Required."
+        self._field_errors[entry] = tk.Label(
+            field, text=msg, bg=theme.BG, fg=theme.ACCENT_700, font=self._f_desc, anchor="w",
+        )
+        entry.bind("<KeyRelease>", lambda _e, en=entry: self._clear_one(en), add="+")
         return entry
 
     # ── radios (custom flat dot, matching .radio) ───────────────────────────
@@ -301,8 +413,12 @@ def _is_number(proposed: str, allow_decimal: bool) -> bool:
     return proposed.count(".") <= 1
 
 
-def _add_placeholder(entry: tk.Entry, text: str) -> None:
-    """Grey placeholder that clears on focus and restores while empty."""
+def _add_placeholder(entry: tk.Entry, text: str) -> dict:
+    """Grey placeholder that clears on focus and restores while empty.
+
+    Returns the mutable state dict so callers can tell whether the field is
+    still showing placeholder text (i.e. effectively empty) rather than input.
+    """
     state = {"placeholder": True}
 
     def show() -> None:
@@ -329,3 +445,4 @@ def _add_placeholder(entry: tk.Entry, text: str) -> None:
     show()
     entry.bind("<FocusIn>", on_focus_in)
     entry.bind("<FocusOut>", on_focus_out)
+    return state

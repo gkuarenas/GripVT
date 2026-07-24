@@ -42,8 +42,15 @@ GripVT/
     overlay.py            # Frame annotation drawing
   output/
     writer.py             # Base CSV writer
-    sessions/             # Timestamped session folders (CSV + overlay PNG)
+    participants.py       # De-identified participant persistence + external name key
+  recordings/             # Per-participant data tree (gitignored)
+    participantNNN_<ts>/
+      participant.json    # De-identified: coded ID + anthropometrics + metadata (NO name)
+      sessionN_<ts>/      # Session CSV + overlay PNG (wired in the session pass)
 ```
+Participant names live only in an external key file outside the repo:
+`C:\Users\Guillaume\Documents\DLSU\THESIS\GripVT_keys\participant_key.json`
+(`participantNNN -> {name, created_at}`), per URERB Form 6A.
 
 ## Commands
 ```bash
@@ -58,7 +65,8 @@ pip install -r requirements.txt
 - **Displacement is always baseline-relative.** `dx = x_current - x_baseline`. Never frame[k] − frame[k-1].
 - **Kalman states are initialised once at Capture Baseline and never added or removed during a session.** Markers are fixed on the sensor.
 - **Undistortion = points for math, remap for display only.** Camera loads raw. Undistort the ~99 marker centroids per frame with `cv2.fisheye.undistortPoints` (cheap, points only) for all measurement/geometry math. Full-frame `remap` is for the **live display only** — never in the detection/tracking math path. Maps are precomputed once from `K, D` in `core/calibration.py`; never recompute them inside the frame loop.
-- **All session output goes to `output/sessions/<timestamp>/`.** Never write CSV or PNG to the project root.
+- **All participant/session output goes to `recordings/participantNNN_<ts>/sessionN_<ts>/`.** Never write to the project root. (`output/sessions/` is retired; `output/writer.make_session_dir` still points there and is retargeted in the session recording pass.)
+- **De-identify at the source.** Never write a participant's name into `recordings/`; it belongs only in the external key file. See `output/participants.py`.
 
 ## Do
 - State "Guillaume" during the beginning of every response, may be varied but always answer with my name during the start of every response.
@@ -71,4 +79,5 @@ pip install -r requirements.txt
 | Full-frame `remap` in the math path, or recomputing maps per frame | Undistort **points** (`cv2.fisheye.undistortPoints`) per frame for math; `remap` for display only; precompute maps once at startup |
 | Use optical flow for tracking | Threshold + connected-component centroid + Hungarian assignment only |
 | Set `GATE_PX` below 80 px | Default 100 px; retune for GripVT footage but keep ≥ 80 |
-| Write output to project root | Write to `output/sessions/<timestamp>/` always |
+| Write output to project root | Write to `recordings/participantNNN_<ts>/…` always |
+| Store a participant's name alongside their data | Name → external key file only; `recordings/` stays de-identified |

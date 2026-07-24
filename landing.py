@@ -7,8 +7,9 @@ from ui.session_window import SessionWindow
 def main():
     holder = {}
 
-    def open_session(np_win):
+    def open_session(np_win, record):
         app = holder["app"]
+        holder["participant"] = record  # consumed by the session recording pass
         np_win.withdraw()
 
         def restore_np():
@@ -32,7 +33,7 @@ def main():
             app.deiconify()
 
         # Back returns to landing; the titlebar X quits the whole program.
-        win = NewParticipantWindow(app, on_back=restore, on_save=lambda: open_session(win))
+        win = NewParticipantWindow(app, on_back=restore, on_save=lambda rec: open_session(win, rec))
         win.protocol("WM_DELETE_WINDOW", app.destroy)
 
     app = LandingWindow(on_new_participant=open_new_participant)
