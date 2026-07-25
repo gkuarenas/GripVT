@@ -12,9 +12,15 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
+import cv2
+import numpy as np
+
+from core.detector_search import MIN_ACCEPTABLE, TARGET_MARKERS, SearchResult
+
 RECORDINGS_DIR = "recordings"
 KEY_PATH = Path(r"C:\Users\Guillaume\Documents\DLSU\THESIS\GripVT_keys\participant_key.json")
 SCHEMA_VERSION = 1
+CALIBRATION_SCHEMA_VERSION = 1
 
 _FOLDER_RE = re.compile(r"participant(\d+)_")
 
@@ -79,6 +85,52 @@ def create_participant(
 
     _append_key(pid, name, created_at)
     return record
+
+
+def save_calibration(
+    record: ParticipantRecord,
+    result: SearchResult,
+    pose_frames: dict[str, np.ndarray],
+    *,
+    overridden: bool = False,
+    roi: dict | None = None,
+    calibration_image_size: list[int] | None = None,
+) -> str:
+    """Persist one wear's calibration into the participant's folder, de-identified.
+
+    The three median pose frames go alongside the JSON so the search can be
+    re-run offline without the rig -- the per-pose diagnostics are the study's
+    calibration-evaluation record, so they have to stay reproducible.
+    """
+    now = datetime.now()
+    ts = now.strftime("%Y%m%d_%H%M%S")
+    payload = {
+        "schema_version": CALIBRATION_SCHEMA_VERSION,
+        "participant_id": record.participant_id,
+        "timestamp": now.isoformat(timespec="seconds"),
+        "passed": result.passed,
+        "overridden": overridden,
+        "target_markers": TARGET_MARKERS,
+        "min_acceptable": MIN_ACCEPTABLE,
+        "params": result.params,
+        "search_bounds": result.bounds,
+        "grid_shape": {"x_lines": result.grid_shape[0], "y_lines": result.grid_shape[1]},
+        "geometry": asdict(result.geometry),
+        "reference_bands": result.reference_bands,
+        "reference_corners": result.reference_corners,
+        "poses": {key: asdict(diag) for key, diag in result.poses.items()},
+        "worst_pose": result.worst_pose,
+        "worst_count": result.worst_count,
+        "roi": roi,
+        "calibration_image_size": calibration_image_size,
+    }
+
+    path = os.path.join(record.folder, f"calibration_{ts}.json")
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    for key, frame in pose_frames.items():
+        cv2.imwrite(os.path.join(record.folder, f"pose_{key}_{ts}.png"), frame)
+    return path
 
 
 def _append_key(pid: str, name: str, created_at: str) -> None:

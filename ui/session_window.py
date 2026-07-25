@@ -38,6 +38,7 @@ class SessionWindow(tk.Toplevel):
         self,
         master: tk.Misc,
         on_back: Callable[[], None] | None = None,
+        detector_params: dict | None = None,
     ) -> None:
         super().__init__(master)
         self._on_back = on_back or (lambda: print("Back clicked"))
@@ -62,6 +63,8 @@ class SessionWindow(tk.Toplevel):
         self._alpha = roi_config.alpha if roi_config is not None else DEFAULT_ALPHA
         self._cal = CameraCalibration(alpha=self._alpha)
         self._tracker = Tracker(self._cal, self._roi)
+        if detector_params is not None:
+            self._tracker.params = detector_params
 
         cap = cv2.VideoCapture(CAMERA_INDEX)
         if cap.isOpened():
