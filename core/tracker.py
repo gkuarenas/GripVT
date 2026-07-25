@@ -9,7 +9,7 @@ from core.kalman import KalmanManager
 from core.hungarian import assign
 from core.roi import ROICrop
 
-TARGET_MARKER_COUNT = 121
+TARGET_MARKER_COUNT = 99
 BASELINE_FRAMES = 15
 # A cluster must be seen in at least this fraction of sampled baseline
 # frames to be locked -- a detection appearing in only one or two frames is
@@ -155,7 +155,7 @@ class Tracker:
         return cropped_gray, proc, dets, moments_out
 
     def capture_baseline(self, raw_frames: list[np.ndarray]) -> int:
-        """Locks the 121 Kalman states from a burst of frames (the sensor
+        """Locks the 99 Kalman states from a burst of frames (the sensor
         must be at rest) rather than a single grab -- since these states are
         never re-created for the rest of the session, a baseline captured
         from one noisy/jittery frame permanently poisons every displacement
