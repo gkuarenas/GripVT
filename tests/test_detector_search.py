@@ -11,6 +11,7 @@ from core.detector_search import (
     POSE_KEYS,
     TARGET_MARKERS,
     AnchorError,
+    _group_by_lines,
     geometry_from,
     grid_lines,
     pose_cost,
@@ -77,7 +78,25 @@ def test_grid_lines_degenerate_inputs():
     assert grid_lines(np.array([7.0])) == [7.0]
 
 
-# ── region counts, both orientations ───────────────────────────────────────
+def curved_grid_points(bow_px=20.0, theta_span_deg=55.0, radius=250.0):
+    """A cylindrical sensor's grid: rows bow in x, and row pitch compresses toward
+    the top/bottom edges. bow_px=20 against a ~28px compressed edge pitch is the
+    real geometry that made a global y-projection collapse 11 rows into 9."""
+    thetas = np.radians(np.linspace(-theta_span_deg, theta_span_deg, ROWS))
+    xs = np.linspace(0, PITCH_X * (COLS - 1), COLS)
+    half = (xs[-1] - xs[0]) / 2
+    return [
+        (
+            float(MARGIN + x),
+            float(400 + radius * np.sin(th) + bow_px * ((x - half) / half) ** 2),
+            30.0,
+        )
+        for th in thetas
+        for x in xs
+    ]
+
+
+# ── region counts, both orientations and on a curved surface ───────────────
 @pytest.mark.parametrize("transpose", [False, True])
 def test_region_counts_is_orientation_agnostic(transpose):
     points = grid_points()
@@ -91,15 +110,47 @@ def test_region_counts_is_orientation_agnostic(transpose):
     assert sorted((geom.x_lines, geom.y_lines)) == sorted(GRID_SHAPE)
 
 
-def test_boundaries_clear_every_marker_by_a_third_of_a_pitch():
-    points = grid_points()
+@pytest.mark.parametrize("bow", [0.0, 10.0, 20.0, 30.0])
+def test_geometry_survives_a_bowed_compressed_grid(bow):
+    """Regression: a global y-projection merged the two tightest row gaps here,
+    reporting 9x9 for a 9x11 grid and aborting calibration on the real rig."""
+    points = curved_grid_points(bow_px=bow)
     geom = geometry_from(points)
-    xs = sorted({p[0] for p in points})
-    ys = sorted({p[1] for p in points})
-    for bound in geom.x_corner:
-        assert min(abs(bound - v) for v in xs) >= PITCH_X / 3
-    for bound in list(geom.y_corner) + list(geom.y_band):
-        assert min(abs(bound - v) for v in ys) >= PITCH_Y / 3
+
+    assert (geom.x_lines, geom.y_lines) == (COLS, ROWS)
+    counts = region_counts(points, geom)
+    assert sum(counts["bands"].values()) == TARGET_MARKERS
+    assert all(v == CORNER_LINES**2 for v in counts["corners"].values()), counts["corners"]
+
+
+def test_bowed_grid_still_localises_a_lost_corner():
+    points = curved_grid_points(bow_px=20.0)
+    geom = geometry_from(points)
+    full = region_counts(points, geom)["corners"]
+    without = region_counts(points[:-1], geom)["corners"]
+    assert without["br"] == full["br"] - 1, (full, without)
+
+
+def test_global_projection_would_have_failed_on_the_bowed_grid():
+    """Pins the diagnosis: clustering y globally really does lose two rows, so
+    the per-line geometry is doing the work, not an incidental change."""
+    points = curved_grid_points(bow_px=20.0)
+    assert len(grid_lines(np.array([p[0] for p in points]))) == COLS
+    assert len(grid_lines(np.array([p[1] for p in points]))) == 9
+
+
+@pytest.mark.parametrize(
+    "label,points", [("flat", grid_points()), ("curved", curved_grid_points(20.0))]
+)
+def test_boundaries_clear_every_marker_by_a_third_of_a_pitch(label, points):
+    geom = geometry_from(points)
+    _lines, groups = _group_by_lines(points, geom.axis)
+    for i, group in enumerate(groups):
+        vals = sorted(group)
+        local_pitch = float(min(np.diff(vals)))
+        for bound in (*geom.corner[i], *geom.band[i]):
+            clearance = min(abs(bound - v) for v in vals)
+            assert clearance >= local_pitch / 3, (label, i, bound, clearance, local_pitch)
 
 
 def test_losing_the_bottom_right_marker_shows_in_that_cell():

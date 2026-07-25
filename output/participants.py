@@ -133,6 +133,38 @@ def save_calibration(
     return path
 
 
+def save_calibration_failure(
+    record: ParticipantRecord,
+    pose_frames: dict[str, np.ndarray],
+    detections: dict[str, list],
+    message: str,
+) -> str:
+    """Dump the frames and detected centroids when calibration cannot even anchor.
+
+    Without this the operator sees only a toast and the geometry that defeated the
+    search is gone with the frames, so the failure cannot be reproduced off-rig.
+    """
+    now = datetime.now()
+    ts = now.strftime("%Y%m%d_%H%M%S")
+    payload = {
+        "schema_version": CALIBRATION_SCHEMA_VERSION,
+        "participant_id": record.participant_id,
+        "timestamp": now.isoformat(timespec="seconds"),
+        "failed": True,
+        "message": message,
+        "detections": {
+            key: [[round(x, 2), round(y, 2), round(size, 2)] for x, y, size in dets]
+            for key, dets in detections.items()
+        },
+    }
+    path = os.path.join(record.folder, f"calibration_failed_{ts}.json")
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    for key, frame in pose_frames.items():
+        cv2.imwrite(os.path.join(record.folder, f"failed_{key}_{ts}.png"), frame)
+    return path
+
+
 def _append_key(pid: str, name: str, created_at: str) -> None:
     KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
     data = {}

@@ -586,6 +586,9 @@ class CalibrationWindow(tk.Toplevel):
         error = holder.get("error")
         if error is not None:
             self._status = "idle"
+            participants.save_calibration_failure(
+                self._record, self._pose_frames, self._pose_dets, error
+            )
             self._show_toast(error)
             self._refresh()
             return

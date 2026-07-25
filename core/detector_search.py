@@ -46,11 +46,29 @@ class AnchorError(Exception):
 
 @dataclass(frozen=True)
 class Geometry:
-    x_lines: int
-    y_lines: int
-    x_corner: tuple[float, float]
-    y_corner: tuple[float, float]
-    y_band: tuple[float, float]
+    """Scoring cells anchored on the relaxed pose.
+
+    Markers are clustered into lines along ONE axis only (`axis`: 0 = lines run
+    along x, i.e. columns), then ranked within each line along the other. Cell
+    boundaries are therefore per-line, which is what makes them survive a curved
+    sensor: on a cylinder the rows bow and the row pitch compresses toward the
+    edges, so a single global y threshold merges the tightest row pairs, while a
+    per-column boundary simply follows the bow.
+    """
+    axis: int
+    lines: tuple[float, ...]
+    corner: tuple[tuple[float, float], ...]
+    band: tuple[tuple[float, float], ...]
+    n_lines: int
+    n_per_line: int
+
+    @property
+    def x_lines(self) -> int:
+        return self.n_lines if self.axis == 0 else self.n_per_line
+
+    @property
+    def y_lines(self) -> int:
+        return self.n_per_line if self.axis == 0 else self.n_lines
 
 
 @dataclass(frozen=True)
@@ -119,44 +137,98 @@ def _midpoints(lines: list[float], depth: int) -> tuple[float, float]:
     return lo, hi
 
 
+def _group_by_lines(
+    detections: list[Detection], axis: int
+) -> tuple[list[float], list[list[float]]]:
+    """Cluster along `axis`, returning the line centres plus each line's
+    coordinates on the other axis."""
+    lines = grid_lines(np.array([d[axis] for d in detections], dtype=float))
+    groups: list[list[float]] = [[] for _ in lines]
+    if lines:
+        centres = np.array(lines)
+        for det in detections:
+            groups[int(np.argmin(np.abs(centres - det[axis])))].append(det[1 - axis])
+    return lines, groups
+
+
+def _validates(lines: list[float], groups: list[list[float]]) -> bool:
+    if len(lines) not in GRID_SHAPE:
+        return False
+    expected = GRID_SHAPE[1] if len(lines) == GRID_SHAPE[0] else GRID_SHAPE[0]
+    sizes = [len(g) for g in groups]
+    if min(sizes) < 2 * CORNER_LINES + 1:
+        return False
+    return int(np.median(sizes)) == expected
+
+
 def geometry_from(detections: list[Detection]) -> Geometry:
-    xs = np.array([d[0] for d in detections], dtype=float)
-    ys = np.array([d[1] for d in detections], dtype=float)
-    x_lines = grid_lines(xs)
-    y_lines = grid_lines(ys)
-    if len(x_lines) <= CORNER_LINES or len(y_lines) <= CORNER_LINES:
-        raise AnchorError(
-            f"Detected only {len(x_lines)}x{len(y_lines)} grid lines — "
-            "check the ROI and lighting, then recapture."
-        )
-    return Geometry(
-        x_lines=len(x_lines),
-        y_lines=len(y_lines),
-        x_corner=_midpoints(x_lines, CORNER_LINES),
-        y_corner=_midpoints(y_lines, CORNER_LINES),
-        y_band=_midpoints(y_lines, BAND_LINES),
+    """Pick whichever axis clusters cleanly into the known grid and rank within it.
+
+    Trying both axes rather than assuming one keeps this correct whichever way the
+    11 circumferential rows fall in the cropped frame, and means the bowed axis
+    never has to be clustered at all.
+    """
+    seen = {}
+    for axis in (0, 1):
+        lines, groups = _group_by_lines(detections, axis)
+        seen[axis] = len(lines)
+        if _validates(lines, groups):
+            ordered = [sorted(g) for g in groups]
+            return Geometry(
+                axis=axis,
+                lines=tuple(lines),
+                corner=tuple(_midpoints(g, CORNER_LINES) for g in ordered),
+                band=tuple(_midpoints(g, BAND_LINES) for g in ordered),
+                n_lines=len(lines),
+                n_per_line=int(np.median([len(g) for g in groups])),
+            )
+    raise AnchorError(
+        f"Could not resolve a {GRID_SHAPE[0]}x{GRID_SHAPE[1]} grid from "
+        f"{len(detections)} markers (x clustered to {seen[0]} lines, y to {seen[1]}) — "
+        "check the ROI and lighting, then recapture."
     )
 
 
+def _side(index: int, count: int, depth: int) -> str | None:
+    if index < depth:
+        return "first"
+    if index >= count - depth:
+        return "last"
+    return None
+
+
 def region_counts(detections: list[Detection], geom: Geometry) -> dict[str, dict[str, int]]:
+    """Per-cell counts against the anchor geometry.
+
+    Band names are literal top/middle/bottom whenever the ranked axis is y (the
+    expected case, lines running along x); if the axis selection flips they denote
+    first/middle/last along whichever axis is ranked.
+    """
     bands = {"top": 0, "middle": 0, "bottom": 0}
     corners = {"tl": 0, "tr": 0, "bl": 0, "br": 0}
-    band_lo, band_hi = geom.y_band
-    x_lo, x_hi = geom.x_corner
-    y_lo, y_hi = geom.y_corner
+    centres = np.array(geom.lines)
 
-    for x, y, _size in detections:
-        if y < band_lo:
-            bands["top"] += 1
-        elif y > band_hi:
-            bands["bottom"] += 1
+    for det in detections:
+        i = int(np.argmin(np.abs(centres - det[geom.axis])))
+        value = det[1 - geom.axis]
+        line_corner = _side(i, geom.n_lines, CORNER_LINES)
+        line_band = _side(i, geom.n_lines, BAND_LINES)
+
+        corner_lo, corner_hi = geom.corner[i]
+        band_lo, band_hi = geom.band[i]
+        rank_corner = "first" if value < corner_lo else "last" if value > corner_hi else None
+        rank_band = "first" if value < band_lo else "last" if value > band_hi else None
+
+        if geom.axis == 0:
+            vertical_band, vertical, horizontal = rank_band, rank_corner, line_corner
         else:
-            bands["middle"] += 1
+            vertical_band, vertical, horizontal = line_band, line_corner, rank_corner
 
-        vertical = "t" if y < y_lo else "b" if y > y_hi else None
-        horizontal = "l" if x < x_lo else "r" if x > x_hi else None
+        bands["top" if vertical_band == "first" else
+              "bottom" if vertical_band == "last" else "middle"] += 1
         if vertical is not None and horizontal is not None:
-            corners[vertical + horizontal] += 1
+            corners[("t" if vertical == "first" else "b")
+                    + ("l" if horizontal == "first" else "r")] += 1
 
     return {"bands": bands, "corners": corners}
 
@@ -244,12 +316,6 @@ def search(
             "sensor or check lighting, then recapture."
         )
     geom = geometry_from(anchor_dets)
-    if sorted((geom.x_lines, geom.y_lines)) != sorted(GRID_SHAPE):
-        raise AnchorError(
-            f"Expected a 9x11 grid, detected {geom.x_lines}x{geom.y_lines} — "
-            "check the ROI and lighting, then recapture."
-        )
-
     reference = region_counts(anchor_dets, geom)
     ref_corners = reference["corners"]
 
