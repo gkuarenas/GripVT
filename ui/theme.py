@@ -24,9 +24,15 @@ INK_65 = "#6a6868"     # eyebrow
 INK_60 = "#747372"     # body subtitle
 INK_55 = "#7f7d7d"     # radio descriptions
 INK_45 = "#949392"     # input hover border
+INK_35 = "#a9a8a7"     # idle placeholder numeral
 DIVIDER = "#9f9d9d"    # 40% ink: hr + borders
 HOVER = "#e4e3e3"      # 7% ink: secondary button hover
 ACTIVE = "#d5d4d4"     # 14% ink: secondary button active
+
+# Accent over BG at design opacities (tk has no alpha)
+ACCENT_10 = "#f2dfdc"  # toast / alert fill
+ACCENT_08 = "#f2e2e0"  # selected list row
+ACCENT_06 = "#f3e6e5"  # list row hover
 
 _FONT_DIR = Path(__file__).resolve().parent / "fonts" / "Archivo"
 _fonts_registered = False

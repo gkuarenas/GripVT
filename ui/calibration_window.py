@@ -1,0 +1,883 @@
+"""Sensor Calibration window for the GripVT desktop app.
+
+Sits between New Participant and Session Recording as the per-wear calibration
+step: captures the sensor at three hand poses, searches thresh/min_area for one
+param set that keeps all 99 markers detectable at the worst pose, records the
+per-pose diagnostics into the participant's folder, and hands the winning params
+to the session. Visual design ported from the Modernist design system (Claude
+Design: "GripVT Sensor Calibration").
+
+Baseline capture stays a Session-window control -- this window only settles
+detector params.
+"""
+import threading
+import tkinter as tk
+from typing import Callable
+
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+
+from core.calibration import CameraCalibration
+from core.detector import denoise, detect, load_params, preprocess
+from core.detector_search import (
+    POSE_KEYS,
+    TARGET_MARKERS,
+    AnchorError,
+    SearchResult,
+    search,
+)
+from core.roi import DEFAULT_ALPHA, ROICrop
+from core.tracker import BASELINE_FRAMES, Tracker
+from output import participants
+from output.participants import ParticipantRecord
+from ui import theme
+
+WINDOW_W = 880
+WINDOW_H = 740
+FEED_W = 450
+FEED_H = 600
+
+CAMERA_INDEX = 1
+POLL_MS = 33
+# Live detection is visual feedback only, so it runs at ~10Hz -- illumination
+# flattening (CLAHE + a large top-hat) costs more than the 33ms frame budget.
+DETECT_EVERY = 3
+
+_TOAST_TIMEOUT_MS = 5000
+_FADE_STEPS = 8
+_FADE_INTERVAL_MS = 50
+
+_LETTERBOX_BG = tuple(int(theme.SURFACE.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4))
+_RING_BGR = tuple(int(theme.ACCENT.lstrip("#")[i : i + 2], 16) for i in (4, 2, 0))
+
+POSES: list[tuple[str, str, str]] = [
+    ("relaxed", "RELAXED", "Rest the forearm and let the hand hang naturally open, and hold "
+                           "still. Capture the session baseline from this same pose."),
+    ("full_open", "FULL OPEN", "Extend and spread the fingers as wide as comfortably "
+                               "possible, palm facing away, and hold."),
+    ("max_grip", "MAX GRIP", "Squeeze the dynamometer at maximum effort and hold until the "
+                             "burst completes."),
+]
+POSE_NAMES = {key: name for key, name, _instruction in POSES}
+POSE_SHORT = {"relaxed": "relaxed", "full_open": "open", "max_grip": "grip"}
+
+
+class CalibrationWindow(tk.Toplevel):
+    def __init__(
+        self,
+        master: tk.Misc,
+        record: ParticipantRecord,
+        on_back: Callable[[], None] | None = None,
+        on_continue: Callable[[dict], None] | None = None,
+    ) -> None:
+        super().__init__(master)
+        self._record = record
+        self._on_back = on_back or (lambda: print("Back clicked"))
+        self._on_continue = on_continue or (lambda params: print(f"Continue {params['thresh']}"))
+
+        self.title("GripVT — Sensor Calibration")
+        self.configure(bg=theme.BG)
+        self.resizable(False, False)
+        self._center(WINDOW_W, WINDOW_H)
+
+        self._pose_state: dict[str, str] = {key: "pending" for key in POSE_KEYS}
+        self._pose_counts: dict[str, int] = {}
+        self._pose_frames: dict[str, np.ndarray] = {}
+        self._pose_dets: dict[str, list] = {}
+        self._selected = POSE_KEYS[0]
+        self._review: str | None = None
+
+        self._status = "idle"
+        self._result: SearchResult | None = None
+        self._overridden = False
+
+        self._burst: list[np.ndarray] = []
+        self._capturing: str | None = None
+
+        self._params: dict = load_params()
+        self._live_dets: list = []
+        self._frame_tick = 0
+
+        self._current_img: ImageTk.PhotoImage | None = None
+        self._after_id: str | None = None
+        self._search_after: str | None = None
+        self._toast_after: str | None = None
+        self._cap: cv2.VideoCapture | None = None
+
+        self._init_fonts()
+        self._build_body()
+        theme.apply_dark_titlebar(self)
+
+        self._roi = ROICrop()
+        roi_config = self._roi.config
+        self._alpha = roi_config.alpha if roi_config is not None else DEFAULT_ALPHA
+        self._cal = CameraCalibration(alpha=self._alpha)
+        self._tracker = Tracker(self._cal, self._roi)
+
+        self._open_camera()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _center(self, w: int, h: int) -> None:
+        x = (self.winfo_screenwidth() - w) // 2
+        y = (self.winfo_screenheight() - h) // 3
+        self.geometry(f"{w}x{h}+{x}+{y}")
+
+    def _init_fonts(self) -> None:
+        self._f_eyebrow = theme.make_font(self, "semibold", 11)
+        self._f_chip = theme.make_font(self, "body", 11)
+        self._f_link = theme.make_font(self, "body", 11)
+        self._f_link.configure(underline=True)
+        self._f_badge = theme.make_font(self, "heading", 12)
+        self._f_pose_num = theme.make_font(self, "heading", 11)
+        self._f_pose = theme.make_font(self, "heading", 13)
+        self._f_count = theme.make_font(self, "body", 12)
+        self._f_instruction = theme.make_font(self, "body", 13)
+        self._f_kicker = theme.make_font(self, "body", 11)
+        self._f_burst = theme.make_font(self, "heading", 13)
+        self._f_big = theme.make_font(self, "heading", 64)
+        self._f_big_idle = theme.make_font(self, "heading", 56)
+        self._f_unit = theme.make_font(self, "heading", 24)
+        self._f_small = theme.make_font(self, "body", 12)
+        self._f_fail = theme.make_font(self, "semibold", 12)
+        self._f_button = theme.make_font(self, "heading", 14)
+        self._f_toast = theme.make_font(self, "body", 11)
+
+    # ── body ────────────────────────────────────────────────────────────────
+    def _build_body(self) -> None:
+        body = tk.Frame(self, bg=theme.BG)
+        body.pack(fill="both", expand=True, padx=32, pady=(22, 20))
+
+        self._build_topbar(body)
+
+        content = tk.Frame(body, bg=theme.BG)
+        content.pack(fill="both", expand=True, pady=(14, 0))
+        content.columnconfigure(1, weight=1)
+        content.rowconfigure(0, weight=1)
+
+        self._build_feed(content)
+        self._build_panel(content)
+        self._build_toast(body)
+
+    def _build_topbar(self, parent: tk.Frame) -> None:
+        bar = tk.Frame(parent, bg=theme.BG)
+        bar.pack(fill="x")
+        bar.columnconfigure(0, weight=1, uniform="t")
+        bar.columnconfigure(2, weight=1, uniform="t")
+
+        self._build_button(bar, "Back", "secondary", "arrow-left", self._handle_back).grid(
+            row=0, column=0, sticky="w"
+        )
+
+        eyebrow = tk.Frame(bar, bg=theme.BG)
+        eyebrow.grid(row=0, column=1)
+        tk.Frame(eyebrow, bg=theme.ACCENT, width=8, height=8).pack(side="left")
+        tk.Label(
+            eyebrow, text="GRIPVT", bg=theme.BG, fg=theme.INK_65, font=self._f_eyebrow
+        ).pack(side="left", padx=(8, 0))
+
+        chip_wrap = tk.Frame(bar, bg=theme.BG)
+        chip_wrap.grid(row=0, column=2, sticky="e")
+        chip = tk.Frame(
+            chip_wrap, bg=theme.BG, highlightthickness=1,
+            highlightbackground=theme.ACCENT, highlightcolor=theme.ACCENT,
+        )
+        chip.pack(side="right")
+        tk.Label(
+            chip, text=self._record.participant_id.replace("participant", "PARTICIPANT "),
+            bg=theme.BG, fg=theme.ACCENT, font=self._f_chip,
+        ).pack(padx=10, pady=3)
+
+    def _build_feed(self, parent: tk.Frame) -> None:
+        holder = tk.Frame(parent, bg=theme.BG, width=FEED_W, height=FEED_H)
+        holder.grid(row=0, column=0, sticky="n")
+        holder.grid_propagate(False)
+
+        self._slot = tk.Frame(
+            holder, bg=theme.BG, highlightthickness=2,
+            highlightbackground=theme.INK, highlightcolor=theme.INK,
+        )
+        self._slot.place(x=0, y=0, width=FEED_W, height=FEED_H)
+
+        self._feed_label = tk.Label(self._slot, bg=theme.SURFACE, text="")
+        self._feed_label.pack(fill="both", expand=True)
+
+        self._count_badge = tk.Frame(self._slot, bg=theme.INK)
+        badge_inner = tk.Frame(self._count_badge, bg=theme.INK)
+        badge_inner.pack(padx=12, pady=6)
+        tk.Frame(badge_inner, bg=theme.ACCENT, width=7, height=7).pack(side="left")
+        self._count_label = tk.Label(
+            badge_inner, text="", bg=theme.INK, fg=theme.BG, font=self._f_badge,
+        )
+        self._count_label.pack(side="left", padx=(8, 0))
+
+        self._view_stack = tk.Frame(self._slot, bg=theme.INK)
+        view_box = tk.Frame(self._view_stack, bg=theme.INK)
+        view_box.pack(anchor="e")
+        self._view_label = tk.Label(
+            view_box, text="LIVE", bg=theme.INK, fg=theme.BG, font=self._f_badge,
+        )
+        self._view_label.pack(padx=12, pady=6)
+        self._live_btn = tk.Label(
+            self._view_stack, text="BACK TO LIVE", bg=theme.INK, fg=theme.BG,
+            font=self._f_link, cursor="hand2",
+        )
+        self._live_btn.bind("<Button-1>", lambda _e: self._back_to_live())
+
+        self._unavailable = tk.Frame(self._slot, bg=theme.BG)
+        inner = tk.Frame(self._unavailable, bg=theme.BG)
+        inner.place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(
+            inner, text="CAMERA UNAVAILABLE", bg=theme.BG, fg=theme.INK,
+            font=theme.make_font(self, "heading", 14),
+        ).pack()
+        tk.Label(
+            inner, text="Check the USB sensor connection and try again.",
+            bg=theme.BG, fg=theme.INK_55, font=self._f_small, wraplength=300,
+        ).pack(pady=(10, 12))
+        self._build_button(inner, "Retry", "secondary", None, self.retry_camera).pack()
+
+    def _build_panel(self, parent: tk.Frame) -> None:
+        panel = tk.Frame(parent, bg=theme.BG)
+        panel.grid(row=0, column=1, sticky="nsew", padx=(28, 0))
+
+        self._pose_rows = tk.Frame(panel, bg=theme.BG)
+        self._pose_rows.pack(fill="x", pady=(0, 14))
+
+        self._instruction = tk.Label(
+            panel, text="", bg=theme.BG, fg=theme.INK_60, font=self._f_instruction,
+            wraplength=330, justify="left", anchor="w",
+        )
+        self._instruction.pack(fill="x", pady=(0, 14))
+
+        burst = tk.Frame(panel, bg=theme.BG)
+        burst.pack(fill="x", pady=(0, 14))
+        head = tk.Frame(burst, bg=theme.BG)
+        head.pack(fill="x", pady=(0, 6))
+        tk.Label(
+            head, text="BURST", bg=theme.BG, fg=theme.INK_60, font=self._f_kicker
+        ).pack(side="left")
+        self._burst_value = tk.Label(
+            head, text=f"0 / {BASELINE_FRAMES}", bg=theme.BG, fg=theme.INK, font=self._f_burst
+        )
+        self._burst_value.pack(side="right")
+        track = tk.Frame(burst, bg=theme.NEUTRAL_200, height=6)
+        track.pack(fill="x")
+        track.pack_propagate(False)
+        self._burst_fill = tk.Frame(track, bg=theme.ACCENT)
+        self._burst_fill.place(relx=0, rely=0, relwidth=0, relheight=1)
+
+        tk.Frame(panel, bg=theme.DIVIDER, height=2).pack(fill="x", pady=(0, 0))
+
+        self._result_box = tk.Frame(panel, bg=theme.BG)
+        self._result_box.pack(fill="both", expand=True, pady=12)
+
+        tk.Frame(panel, bg=theme.DIVIDER, height=2).pack(fill="x", pady=(0, 14))
+
+        self._actions = tk.Frame(panel, bg=theme.BG)
+        self._actions.pack(fill="x")
+
+        self._render_poses()
+        self._render_result()
+        self._render_actions()
+
+    def _build_toast(self, parent: tk.Frame) -> None:
+        self._toast_parent = parent
+        self._toast = tk.Frame(
+            parent, bg=theme.ACCENT_10, highlightthickness=1,
+            highlightbackground=theme.ACCENT, highlightcolor=theme.ACCENT,
+        )
+        self._toast_inner = tk.Frame(self._toast, bg=theme.ACCENT_10)
+        self._toast_inner.pack(padx=10, pady=7)
+        self._toast_label = tk.Label(
+            self._toast_inner, text="", bg=theme.ACCENT_10, fg=theme.ACCENT_700,
+            font=self._f_toast, wraplength=220, justify="left",
+        )
+        self._toast_label.pack()
+
+    # ── re-rendered regions ─────────────────────────────────────────────────
+    def _render_poses(self) -> None:
+        for child in self._pose_rows.winfo_children():
+            child.destroy()
+
+        active = self._review or self._selected
+        for key, name, _instruction in POSES:
+            state = self._pose_state[key]
+            selected = key == active
+            bg = theme.ACCENT_08 if selected else theme.BG
+            row = tk.Frame(self._pose_rows, bg=bg)
+            row.pack(fill="x")
+            inner = tk.Frame(row, bg=bg)
+            inner.pack(fill="x", padx=10, pady=9)
+
+            num = tk.Frame(
+                inner, bg=bg, highlightthickness=1,
+                highlightbackground=theme.INK, highlightcolor=theme.INK,
+            )
+            num.pack(side="left")
+            num_label = tk.Label(
+                num, text=str(POSE_KEYS.index(key) + 1), bg=bg, fg=theme.INK,
+                font=self._f_pose_num, width=2,
+            )
+            num_label.pack(pady=1)
+            name_label = tk.Label(inner, text=name, bg=bg, fg=theme.INK, font=self._f_pose)
+            name_label.pack(side="left", padx=(12, 0))
+
+            marker = tk.Canvas(inner, width=15, height=15, bg=bg, highlightthickness=0)
+            marker.pack(side="right")
+            self._draw_state_marker(marker, state)
+            count = tk.Label(
+                inner,
+                text=f"({self._pose_counts[key]})" if key in self._pose_counts else "",
+                bg=bg, fg=theme.INK_55, font=self._f_count,
+            )
+            count.pack(side="right", padx=(0, 10))
+
+            tk.Frame(row, bg=theme.NEUTRAL_200, height=1).pack(fill="x")
+
+            group = (row, inner, num, num_label, name_label, marker, count)
+
+            def paint(colour: str, widgets: tuple = group) -> None:
+                for w in widgets:
+                    w.configure(bg=colour)
+
+            for widget in group:
+                widget.bind("<Button-1>", lambda _e, k=key: self._select_pose(k))
+                if not selected:
+                    widget.bind("<Enter>", lambda _e, p=paint: p(theme.ACCENT_06))
+                    widget.bind("<Leave>", lambda _e, p=paint: p(theme.BG))
+                widget.configure(cursor="hand2")
+
+    def _draw_state_marker(self, canvas: tk.Canvas, state: str) -> None:
+        if state == "pending":
+            canvas.create_oval(1, 1, 14, 14, outline=theme.DIVIDER, width=2)
+        elif state == "capturing":
+            canvas.create_oval(1, 1, 14, 14, outline=theme.ACCENT, fill=theme.ACCENT)
+        else:
+            canvas.create_line(2, 8, 6, 12, fill=theme.INK, width=2, capstyle="round")
+            canvas.create_line(6, 12, 13, 3, fill=theme.INK, width=2, capstyle="round")
+
+    def _render_result(self) -> None:
+        for child in self._result_box.winfo_children():
+            child.destroy()
+
+        wrap = tk.Frame(self._result_box, bg=theme.BG)
+        wrap.place(relx=0.5, rely=0.5, anchor="center")
+        tk.Label(
+            wrap, text="WORST-POSE MARKERS", bg=theme.BG, fg=theme.INK_60, font=self._f_kicker
+        ).pack(pady=(0, 10))
+
+        if self._status == "running":
+            tk.Label(
+                wrap, text="Searching…", bg=theme.BG, fg=theme.INK, font=self._f_burst
+            ).pack()
+            tk.Label(
+                wrap, text=f"Scoring {TARGET_MARKERS} markers across three poses.",
+                bg=theme.BG, fg=theme.INK_55, font=self._f_small, wraplength=300,
+            ).pack(pady=(10, 0))
+            return
+
+        result = self._result
+        if result is None:
+            tk.Label(
+                wrap, text="—", bg=theme.BG, fg=theme.INK_35, font=self._f_big_idle
+            ).pack()
+            tk.Label(
+                wrap, text="Capture all three poses, then run calibration.",
+                bg=theme.BG, fg=theme.INK_55, font=self._f_small, wraplength=300,
+            ).pack(pady=(8, 0))
+            return
+
+        colour = theme.INK if result.passed else theme.ACCENT_700
+        row = tk.Frame(wrap, bg=theme.BG)
+        row.pack()
+        tk.Label(
+            row, text=str(result.worst_count), bg=theme.BG, fg=colour, font=self._f_big
+        ).pack(side="left")
+        tk.Label(
+            row, text=f"/ {TARGET_MARKERS}", bg=theme.BG, fg=colour, font=self._f_unit
+        ).pack(side="left", anchor="s", pady=(0, 10))
+        tk.Label(
+            wrap, text=self._subline(result), bg=theme.BG, fg=theme.INK_55,
+            font=self._f_small, wraplength=320,
+        ).pack(pady=(8, 0))
+        if not result.passed:
+            tk.Label(
+                wrap,
+                text=f"{POSE_NAMES[result.worst_pose]} below threshold "
+                     f"({result.worst_count} / {TARGET_MARKERS}). Recapture and try again.",
+                bg=theme.BG, fg=theme.ACCENT_700, font=self._f_fail,
+                wraplength=320, justify="center",
+            ).pack(pady=(8, 0))
+
+    def _subline(self, result: SearchResult) -> str:
+        counts = " · ".join(
+            f"{POSE_SHORT[key]} {result.poses[key].n_detected}" for key in POSE_KEYS
+        )
+        worst = result.poses[result.worst_pose]
+        extras = [
+            f"{cell} {worst.corners[cell]}/{result.reference_corners[cell]}"
+            for cell in sorted(result.reference_corners)
+            if worst.corners[cell] < result.reference_corners[cell]
+        ]
+        if worst.oversized:
+            extras.append(f"oversized {worst.oversized}")
+        return counts + ("  |  " + " · ".join(extras) if extras else "")
+
+    def _render_actions(self) -> None:
+        for child in self._actions.winfo_children():
+            child.destroy()
+
+        all_captured = all(self._pose_state[key] == "captured" for key in POSE_KEYS)
+        busy = self._status == "running"
+
+        if busy:
+            self._build_button(
+                self._actions, "Searching…", "primary", None, lambda: None, enabled=False
+            ).pack(fill="x", pady=(0, 10))
+        elif self._status == "fail":
+            row = tk.Frame(self._actions, bg=theme.BG)
+            row.pack(fill="x", pady=(0, 10))
+            row.columnconfigure(0, weight=1, uniform="a")
+            row.columnconfigure(1, weight=1, uniform="a")
+            self._build_button(row, "Recapture", "secondary", None, self._recapture).grid(
+                row=0, column=0, sticky="ew", padx=(0, 6)
+            )
+            self._build_button(row, "Run Calibration", "primary", None, self._run).grid(
+                row=0, column=1, sticky="ew", padx=(6, 0)
+            )
+        elif self._status == "pass":
+            self._build_button(
+                self._actions, "Recalibrate", "ghost", None, self._recapture
+            ).pack(fill="x", pady=(0, 10))
+        elif all_captured:
+            self._build_button(
+                self._actions, "Run Calibration", "primary", None, self._run
+            ).pack(fill="x", pady=(0, 10))
+        else:
+            pending = self._next_pending()
+            label = (
+                f"Capturing — {POSE_NAMES[self._capturing].title()}…"
+                if self._capturing
+                else f"Capture — {POSE_NAMES[pending].title()}" if pending else "Capture"
+            )
+            self._build_button(
+                self._actions, label, "primary", "dot", self._capture,
+                enabled=self._capturing is None and self._cap is not None,
+            ).pack(fill="x", pady=(0, 10))
+
+        if self._status == "fail":
+            self._build_button(
+                self._actions, "Continue anyway", "secondary", "arrow-right", self._continue
+            ).pack(fill="x")
+        else:
+            self._build_button(
+                self._actions, "Continue", "primary", "arrow-right", self._continue,
+                enabled=self._status == "pass",
+            ).pack(fill="x")
+
+    def _refresh(self) -> None:
+        self._render_poses()
+        self._render_result()
+        self._render_actions()
+        self._update_instruction()
+        self._update_burst()
+
+    def _update_instruction(self) -> None:
+        key = self._capturing or self._review or self._selected
+        text = next(i for k, _n, i in POSES if k == key)
+        self._instruction.configure(text=text)
+
+    def _update_burst(self) -> None:
+        if self._capturing is not None:
+            progress = min(len(self._burst), BASELINE_FRAMES)
+        else:
+            active = self._review or self._selected
+            progress = BASELINE_FRAMES if self._pose_state[active] == "captured" else 0
+        self._burst_value.configure(text=f"{progress} / {BASELINE_FRAMES}")
+        self._burst_fill.place_configure(relwidth=progress / BASELINE_FRAMES)
+
+    # ── actions ─────────────────────────────────────────────────────────────
+    def _next_pending(self) -> str | None:
+        if self._pose_state[self._selected] == "pending":
+            return self._selected
+        return next((k for k in POSE_KEYS if self._pose_state[k] == "pending"), None)
+
+    def _select_pose(self, key: str) -> None:
+        if self._capturing is not None:
+            return
+        self._selected = key
+        self._review = key if self._pose_state[key] == "captured" else None
+        self._refresh()
+        self._paint_review()
+
+    def _back_to_live(self) -> None:
+        self._review = None
+        # Done here rather than waiting on the next poll, so this still clears
+        # when the feed has stopped (camera lost after a capture).
+        self._live_btn.pack_forget()
+        self._view_label.configure(text="LIVE")
+        self._refresh()
+
+    def _capture(self) -> None:
+        if self._capturing is not None:
+            return
+        if self._cap is None:
+            self._show_toast("Camera unavailable — reconnect the sensor to capture.")
+            return
+        target = self._next_pending()
+        if target is None:
+            return
+        self._capturing = target
+        self._selected = target
+        self._review = None
+        self._burst = []
+        self._pose_state[target] = "capturing"
+        self._refresh()
+
+    def _finish_capture(self) -> None:
+        key = self._capturing
+        assert key is not None
+        median = np.median(np.stack(self._burst[:BASELINE_FRAMES]), axis=0).astype(np.uint8)
+        dets = self._detect(median)
+        self._pose_frames[key] = median
+        self._pose_dets[key] = dets
+        self._pose_counts[key] = len(dets)
+        self._pose_state[key] = "captured"
+        self._capturing = None
+        self._burst = []
+        self._result = None
+        self._status = "idle"
+        nxt = self._next_pending()
+        if nxt is not None:
+            self._selected = nxt
+        self._refresh()
+
+    def _run(self) -> None:
+        if self._status == "running":
+            return
+        if any(self._pose_state[k] != "captured" for k in POSE_KEYS):
+            return
+        self._status = "running"
+        self._result = None
+        self._review = None
+        self._refresh()
+
+        frames = dict(self._pose_frames)
+        base = load_params()
+        mask = self._roi.sensor_mask(frames["relaxed"].shape)
+        holder: dict = {}
+
+        def work() -> None:
+            try:
+                holder["result"] = search(frames, base, mask)
+            except (AnchorError, ValueError) as exc:
+                holder["error"] = str(exc)
+
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+        self._search_after = self.after(100, lambda: self._poll_search(thread, holder))
+
+    def _poll_search(self, thread: threading.Thread, holder: dict) -> None:
+        if thread.is_alive():
+            self._search_after = self.after(100, lambda: self._poll_search(thread, holder))
+            return
+        self._search_after = None
+        error = holder.get("error")
+        if error is not None:
+            self._status = "idle"
+            self._show_toast(error)
+            self._refresh()
+            return
+        result: SearchResult = holder["result"]
+        self._result = result
+        self._status = "pass" if result.passed else "fail"
+        self._params = result.params
+        self._pose_dets = dict(result.detections)
+        for key in POSE_KEYS:
+            self._pose_counts[key] = result.poses[key].n_detected
+        if not result.passed:
+            self._selected = result.worst_pose
+            self._review = result.worst_pose
+        self._refresh()
+        self._paint_review()
+
+    def _recapture(self) -> None:
+        self._pose_state = {key: "pending" for key in POSE_KEYS}
+        self._pose_counts = {}
+        self._pose_frames = {}
+        self._pose_dets = {}
+        self._selected = POSE_KEYS[0]
+        self._review = None
+        self._status = "idle"
+        self._result = None
+        self._overridden = False
+        self._burst = []
+        self._capturing = None
+        self._params = load_params()
+        self._refresh()
+
+    def _continue(self) -> None:
+        result = self._result
+        if result is None or self._status not in ("pass", "fail"):
+            return
+        self._overridden = not result.passed
+        roi_config = self._roi.config
+        participants.save_calibration(
+            self._record, result, self._pose_frames,
+            overridden=self._overridden,
+            roi=(
+                {"x": roi_config.x, "y": roi_config.y, "w": roi_config.w,
+                 "h": roi_config.h, "alpha": roi_config.alpha}
+                if roi_config is not None else None
+            ),
+            calibration_image_size=list(self._cal.image_size),
+        )
+        self._on_continue(result.params)
+
+    # ── toast ───────────────────────────────────────────────────────────────
+    def _show_toast(self, message: str) -> None:
+        if self._toast_after is not None:
+            self.after_cancel(self._toast_after)
+        self._toast_label.configure(text=message)
+        self._reset_toast_colors()
+        self._toast.place(in_=self._toast_parent, relx=1.0, x=0, y=0, anchor="ne")
+        self._toast.lift()
+        self._toast_after = self.after(_TOAST_TIMEOUT_MS, lambda: self._fade_toast(1))
+
+    def _fade_toast(self, step: int) -> None:
+        t = step / _FADE_STEPS
+        bg = _lerp(theme.ACCENT_10, theme.BG, t)
+        edge = _lerp(theme.ACCENT, theme.BG, t)
+        fg = _lerp(theme.ACCENT_700, theme.BG, t)
+        self._toast.configure(bg=bg, highlightbackground=edge, highlightcolor=edge)
+        self._toast_inner.configure(bg=bg)
+        self._toast_label.configure(bg=bg, fg=fg)
+        if step < _FADE_STEPS:
+            self._toast_after = self.after(_FADE_INTERVAL_MS, lambda: self._fade_toast(step + 1))
+        else:
+            self._toast_after = None
+            self._toast.place_forget()
+            self._reset_toast_colors()
+
+    def _reset_toast_colors(self) -> None:
+        self._toast.configure(
+            bg=theme.ACCENT_10, highlightbackground=theme.ACCENT, highlightcolor=theme.ACCENT
+        )
+        self._toast_inner.configure(bg=theme.ACCENT_10)
+        self._toast_label.configure(bg=theme.ACCENT_10, fg=theme.ACCENT_700)
+
+    # ── camera + detection ──────────────────────────────────────────────────
+    def _open_camera(self) -> None:
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened():
+            cap.release()
+            self._show_unavailable()
+            return
+        cal_w, cal_h = self._cal.image_size
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cal_w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cal_h)
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)
+        cap.set(cv2.CAP_PROP_EXPOSURE, -6)
+        self._cap = cap
+        self._unavailable.place_forget()
+        self._count_badge.place(x=12, y=12)
+        self._view_stack.place(relx=1.0, x=-12, y=12, anchor="ne")
+        # Capture is gated on a live camera and the actions were first rendered
+        # while _cap was still None, so they have to be rebuilt now.
+        self._render_actions()
+        self._poll()
+
+    def _show_unavailable(self) -> None:
+        self._cap = None
+        self._count_badge.place_forget()
+        self._view_stack.place_forget()
+        self._unavailable.place(x=0, y=0, relwidth=1, relheight=1)
+        self._unavailable.lift()
+        self._render_actions()
+
+    def retry_camera(self) -> None:
+        if self._cap is not None:
+            return
+        self._open_camera()
+        if self._cap is None:
+            self._show_toast("Camera still unavailable — check the USB connection.")
+        else:
+            self._render_actions()
+
+    def _processed_gray(self, frame: np.ndarray) -> np.ndarray:
+        undistorted = self._tracker.undistort(frame)
+        return cv2.cvtColor(self._roi.crop(undistorted), cv2.COLOR_BGR2GRAY)
+
+    def _detect(self, gray: np.ndarray) -> list:
+        params = dict(self._params, size_method="cc")
+        proc = preprocess(gray, params)
+        mask = self._roi.sensor_mask(proc.shape)
+        if mask is not None:
+            proc = cv2.bitwise_and(proc, mask)
+        return detect(denoise(gray, params), proc, params)
+
+    def _paint(self, gray: np.ndarray, dets: list, label: str, count: int) -> None:
+        display = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        for x, y, _size in dets:
+            cv2.circle(display, (int(round(x)), int(round(y))), 6, _RING_BGR, 2)
+        rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+        photo = ImageTk.PhotoImage(_fit_letterbox(Image.fromarray(rgb), FEED_W, FEED_H))
+        self._feed_label.configure(image=photo)
+        self._current_img = photo
+        self._count_label.configure(text=f"{count} / {TARGET_MARKERS} MARKERS")
+        self._view_label.configure(text=label)
+        if self._review is not None:
+            self._live_btn.pack(anchor="e", pady=(6, 0))
+        else:
+            self._live_btn.pack_forget()
+
+    def _paint_review(self) -> None:
+        key = self._review
+        if key is None or key not in self._pose_frames:
+            return
+        dets = self._pose_dets.get(key, [])
+        self._paint(self._pose_frames[key], dets, f"POSE {POSE_KEYS.index(key) + 1}", len(dets))
+
+    def _poll(self) -> None:
+        cap = self._cap
+        if cap is None:
+            return
+        ret, frame = cap.read()
+        if ret:
+            gray = self._processed_gray(frame)
+            self._live_gray = gray
+            if self._capturing is not None:
+                self._burst.append(gray)
+                self._update_burst()
+                if len(self._burst) >= BASELINE_FRAMES:
+                    self._finish_capture()
+            else:
+                self._frame_tick += 1
+                if self._frame_tick % DETECT_EVERY == 0:
+                    self._live_dets = self._detect(gray)
+            if self._review is None:
+                self._paint(gray, self._live_dets, "LIVE", len(self._live_dets))
+        self._after_id = self.after(POLL_MS, self._poll)
+
+    def release_camera(self) -> None:
+        for attr in ("_after_id", "_search_after", "_toast_after"):
+            pending = getattr(self, attr)
+            if pending is not None:
+                self.after_cancel(pending)
+                setattr(self, attr, None)
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+    def _handle_back(self) -> None:
+        self.release_camera()
+        self._on_back()
+
+    def _on_close(self) -> None:
+        self.release_camera()
+        self.destroy()
+
+    # ── button/icon idiom (copied from session_window so the windows stay
+    #    independent) ────────────────────────────────────────────────────────
+    def _build_button(
+        self, parent: tk.Misc, label: str, kind: str, icon: str | None,
+        command: Callable[[], None], enabled: bool = True,
+    ) -> tk.Frame:
+        if not enabled:
+            fill, fg, border = theme.BG, theme.INK_45, theme.INK_45
+        elif kind == "primary":
+            fill, fg, border = theme.ACCENT, theme.BG, theme.ACCENT
+        elif kind == "ghost":
+            fill, fg, border = theme.BG, theme.ACCENT, theme.BG
+        else:
+            fill, fg, border = theme.BG, theme.INK, theme.DIVIDER
+
+        btn = tk.Frame(
+            parent, bg=fill, highlightthickness=1,
+            highlightbackground=border, highlightcolor=border,
+        )
+        inner = tk.Frame(btn, bg=fill)
+        inner.pack(padx=14, pady=8)
+
+        widgets: list[tk.Widget] = [btn, inner]
+        if icon in ("arrow-left", "dot"):
+            ic = self._icon(inner, icon, fg, fill)
+            ic.pack(side="left", padx=(0, 6))
+            widgets.append(ic)
+        text = tk.Label(inner, text=label, bg=fill, fg=fg, font=self._f_button)
+        text.pack(side="left")
+        widgets.append(text)
+        if icon == "arrow-right":
+            ic = self._icon(inner, icon, fg, fill)
+            ic.pack(side="left", padx=(6, 0))
+            widgets.append(ic)
+
+        if enabled:
+            if kind == "primary":
+                hover, active = theme.ACCENT_600, theme.ACCENT_700
+            elif kind == "ghost":
+                hover, active = theme.ACCENT_10, theme.ACCENT_08
+            else:
+                hover, active = theme.HOVER, theme.ACTIVE
+            self._wire_button(btn, widgets, fill, hover, active, command)
+        return btn
+
+    def _icon(self, parent: tk.Misc, kind: str, color: str, bg: str) -> tk.Canvas:
+        c = tk.Canvas(parent, width=14, height=14, bg=bg, highlightthickness=0)
+        s = 14 / 24
+
+        def p(*coords: float) -> list[float]:
+            return [v * s for v in coords]
+
+        if kind == "arrow-right":
+            c.create_line(*p(5, 12, 19, 12), fill=color, width=2, capstyle="round")
+            c.create_line(*p(12, 5, 19, 12, 12, 19), fill=color, width=2,
+                          capstyle="round", joinstyle="round")
+        elif kind == "arrow-left":
+            c.create_line(*p(19, 12, 5, 12), fill=color, width=2, capstyle="round")
+            c.create_line(*p(12, 19, 5, 12, 12, 5), fill=color, width=2,
+                          capstyle="round", joinstyle="round")
+        elif kind == "dot":
+            c.create_oval(*p(4, 4, 20, 20), fill=color, outline=color)
+        return c
+
+    def _wire_button(
+        self, btn: tk.Frame, widgets: list[tk.Widget], base: str,
+        hover: str, active: str, command: Callable[[], None],
+    ) -> None:
+        def paint(colour: str) -> None:
+            for w in widgets:
+                w.configure(bg=colour)
+
+        def on_release(_e: object) -> None:
+            x, y = btn.winfo_pointerxy()
+            hovered = btn.winfo_containing(x, y)
+            if hovered is not None and (hovered is btn or str(hovered).startswith(str(btn))):
+                paint(hover)
+                command()
+            else:
+                paint(base)
+
+        for w in widgets:
+            w.bind("<Enter>", lambda _e: paint(hover))
+            w.bind("<Leave>", lambda _e: paint(base))
+            w.bind("<ButtonPress-1>", lambda _e: paint(active))
+            w.bind("<ButtonRelease-1>", on_release)
+            w.configure(cursor="hand2")
+
+
+def _lerp(from_hex: str, to_hex: str, t: float) -> str:
+    a = tuple(int(from_hex[i : i + 2], 16) for i in (1, 3, 5))
+    b = tuple(int(to_hex[i : i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
+
+
+def _fit_letterbox(img: Image.Image, box_w: int, box_h: int) -> Image.Image:
+    w, h = img.size
+    scale = min(box_w / w, box_h / h)
+    new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+    resized = img.resize((new_w, new_h), Image.BILINEAR)
+    canvas = Image.new("RGB", (box_w, box_h), _LETTERBOX_BG)
+    canvas.paste(resized, ((box_w - new_w) // 2, (box_h - new_h) // 2))
+    return canvas
