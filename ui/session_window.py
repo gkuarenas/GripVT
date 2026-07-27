@@ -550,8 +550,11 @@ class SessionWindow(tk.Toplevel):
             # D5: capture_baseline() returns only a count -- rebuild
             # (x, y, area) detections from the locked Kalman states to score
             # corner coverage against the calibration-relaxed geometry.
+            # Kalman states are full-frame (tracker._detect_full_frame maps
+            # them back); the geometry is ROI-relative, so undo the offset or
+            # every marker lands in the wrong cell.
             detections = [
-                (s.baseline_pos[0], s.baseline_pos[1], s.baseline_area)
+                (*self._roi.to_crop(*s.baseline_pos), s.baseline_area)
                 for s in self._tracker.kalman.states.values()
             ]
             counts = region_counts(detections, self._calibration_result.geometry)

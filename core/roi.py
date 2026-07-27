@@ -96,3 +96,9 @@ class ROICrop:
         if self._config is None:
             return x, y
         return x + self._config.x, y + self._config.y
+
+    def to_crop(self, x: float, y: float) -> tuple[float, float]:
+        """Inverse of to_full_frame -- full-frame coords to ROI-relative."""
+        if self._config is None:
+            return x, y
+        return x - self._config.x, y - self._config.y
