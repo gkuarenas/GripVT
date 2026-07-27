@@ -69,12 +69,14 @@ class CalibrationWindow(tk.Toplevel):
         master: tk.Misc,
         record: ParticipantRecord,
         on_back: Callable[[], None] | None = None,
-        on_continue: Callable[[dict], None] | None = None,
+        on_continue: Callable[[SearchResult], None] | None = None,
     ) -> None:
         super().__init__(master)
         self._record = record
         self._on_back = on_back or (lambda: print("Back clicked"))
-        self._on_continue = on_continue or (lambda params: print(f"Continue {params['thresh']}"))
+        self._on_continue = on_continue or (
+            lambda result: print(f"Continue {result.params['thresh']}")
+        )
 
         self.title("GripVT — Sensor Calibration")
         self.configure(bg=theme.BG)
@@ -636,7 +638,7 @@ class CalibrationWindow(tk.Toplevel):
             ),
             calibration_image_size=list(self._cal.image_size),
         )
-        self._on_continue(result.params)
+        self._on_continue(result)
 
     # ── toast ───────────────────────────────────────────────────────────────
     def _show_toast(self, message: str) -> None:

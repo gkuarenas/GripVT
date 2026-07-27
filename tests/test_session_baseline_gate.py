@@ -1,0 +1,138 @@
+"""Headless test for the Session window's Capture Baseline state machine.
+
+Drives SessionWindow's baseline state transitions directly, with no camera
+and no polling loop. The test controls the camera itself rather than
+assuming one is absent -- cv2.VideoCapture is monkeypatched inside
+ui.session_window to a stub whose isOpened() is always False, so __init__
+deterministically takes its _show_placeholder() branch and never schedules
+_poll(), on any machine (including a rig with a real camera at
+CAMERA_INDEX). Tracker.capture_baseline() is separately monkeypatched so the
+marker count is controlled directly rather than depending on real detection
+against synthetic frames.
+"""
+import tkinter as tk
+
+import pytest
+
+import ui.session_window as session_window_module
+from output.participants import ParticipantRecord
+from ui.session_window import SessionWindow
+
+
+class _StubCapture:
+    """Stands in for cv2.VideoCapture -- always closed, never blocks on
+    hardware enumeration."""
+
+    def isOpened(self) -> bool:
+        return False
+
+    def release(self) -> None:
+        pass
+
+    def set(self, *args, **kwargs) -> None:
+        pass
+
+    def read(self):
+        return False, None
+
+
+@pytest.fixture(scope="module")
+def root():
+    # Module-scoped: creating/destroying a fresh tk.Tk() root per test proved
+    # flaky on Windows (intermittent TclError under repeated rapid create/
+    # destroy). One root for the whole module, with a fresh SessionWindow
+    # Toplevel per test, is both faster and stable.
+    try:
+        r = tk.Tk()
+    except tk.TclError:
+        pytest.skip("no Tk display available")
+    r.withdraw()
+    yield r
+    r.destroy()
+
+
+@pytest.fixture
+def window(root, monkeypatch):
+    monkeypatch.setattr(session_window_module.cv2, "VideoCapture", lambda index: _StubCapture())
+    win = SessionWindow(root)
+    assert win._cap is None, "stubbed VideoCapture.isOpened() should always be False"
+    yield win
+    win.release_camera()
+    win.destroy()
+
+
+def _finish_burst(win: SessionWindow, count: int) -> None:
+    """Drive status none -> capturing -> pass/fail without a real camera."""
+    win._tracker.capture_baseline = lambda frames: count
+    win._on_capture_baseline_click()
+    assert win._baseline["status"] == "capturing"
+    for _ in range(session_window_module.BASELINE_FRAMES):
+        win._capture_baseline_frame(object())
+
+
+def _make_participant(tmp_path) -> ParticipantRecord:
+    folder = tmp_path / "participant999_test"
+    folder.mkdir()
+    return ParticipantRecord(
+        participant_id="participant999", folder=str(folder),
+        created_at="2026-01-01T00:00:00", age=30, weight_kg=70.0, height_cm=170.0,
+        forearm_circ_cm=25.0, mvc_kg=40.0, activity_level="active",
+    )
+
+
+def test_start_disabled_in_phase1(window):
+    assert window._baseline["status"] == "none"
+    assert window._start_btn.enabled is False
+
+
+def test_start_enabled_after_pass(window):
+    _finish_burst(window, 97)
+    assert window._baseline["status"] == "pass"
+    assert window._start_btn.enabled is True
+
+
+def test_start_disabled_on_fail_not_overridden(window):
+    _finish_burst(window, 60)
+    assert window._baseline["status"] == "fail"
+    assert window._baseline["overridden"] is False
+    assert window._start_btn.enabled is False
+
+
+def test_start_enabled_after_override(window):
+    _finish_burst(window, 60)
+    window._on_override_baseline_click()
+    assert window._baseline["overridden"] is True
+    assert window._start_btn.enabled is True
+
+
+def test_override_flag_reaches_saved_payload(window, tmp_path, monkeypatch):
+    saved = {}
+
+    def fake_save_baseline(record, **kwargs):
+        saved.update(kwargs)
+        return "fake/path.json"
+
+    monkeypatch.setattr(session_window_module.participants, "save_baseline", fake_save_baseline)
+    window._participant = _make_participant(tmp_path)
+
+    _finish_burst(window, 60)
+    assert saved == {}  # not saved yet -- only on pass or override
+    window._on_override_baseline_click()
+    assert saved["overridden"] is True
+    assert saved["passed"] is False
+    assert saved["locked_count"] == 60
+
+
+def test_recapture_disabled_after_start(window):
+    _finish_burst(window, 97)
+    assert window._strip_recapture_btn.enabled is True
+    window._on_start()
+    assert window._recording_started is True
+    assert window._strip_recapture_btn.enabled is False
+
+
+def test_recapture_click_ignored_after_start(window):
+    _finish_burst(window, 97)
+    window._on_start()
+    window._on_recapture_baseline_click()
+    assert window._baseline["status"] == "pass"  # unchanged -- no re-lock mid-session

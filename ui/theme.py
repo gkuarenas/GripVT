@@ -30,6 +30,7 @@ HOVER = "#e4e3e3"      # 7% ink: secondary button hover
 ACTIVE = "#d5d4d4"     # 14% ink: secondary button active
 
 # Accent over BG at design opacities (tk has no alpha)
+ACCENT_18 = "#f2cfca"  # ghost button active (18% accent)
 ACCENT_10 = "#f2dfdc"  # toast / alert fill
 ACCENT_08 = "#f2e2e0"  # selected list row
 ACCENT_06 = "#f3e6e5"  # list row hover

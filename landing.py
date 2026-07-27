@@ -8,7 +8,7 @@ from ui.session_window import SessionWindow
 def main():
     holder = {}
 
-    def open_session(cal_win, record, params):
+    def open_session(cal_win, record, result):
         app = holder["app"]
         holder["participant"] = record  # consumed by the session recording pass
         # The camera at CAMERA_INDEX is exclusive, so calibration must let go of
@@ -21,7 +21,10 @@ def main():
             cal_win.deiconify()
             cal_win.retry_camera()
 
-        session_win = SessionWindow(app, on_back=restore_cal, detector_params=params)
+        session_win = SessionWindow(
+            app, on_back=restore_cal, detector_params=result.params,
+            calibration_result=result, participant=record,
+        )
         session_win.protocol(
             "WM_DELETE_WINDOW", lambda: (session_win.release_camera(), app.destroy())
         )
@@ -37,7 +40,7 @@ def main():
         cal_win = CalibrationWindow(
             app, record,
             on_back=restore_np,
-            on_continue=lambda params: open_session(cal_win, record, params),
+            on_continue=lambda result: open_session(cal_win, record, result),
         )
         cal_win.protocol(
             "WM_DELETE_WINDOW", lambda: (cal_win.release_camera(), app.destroy())

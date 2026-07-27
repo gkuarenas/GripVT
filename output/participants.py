@@ -21,6 +21,7 @@ RECORDINGS_DIR = "recordings"
 KEY_PATH = Path(r"C:\Users\Guillaume\Documents\DLSU\THESIS\GripVT_keys\participant_key.json")
 SCHEMA_VERSION = 1
 CALIBRATION_SCHEMA_VERSION = 1
+BASELINE_SCHEMA_VERSION = 1
 
 _FOLDER_RE = re.compile(r"participant(\d+)_")
 
@@ -130,6 +131,45 @@ def save_calibration(
         json.dump(payload, f, indent=2)
     for key, frame in pose_frames.items():
         cv2.imwrite(os.path.join(record.folder, f"pose_{key}_{ts}.png"), frame)
+    return path
+
+
+def save_baseline(
+    record: ParticipantRecord,
+    *,
+    locked_count: int,
+    passed: bool,
+    overridden: bool,
+    corners: dict[str, int] | None,
+    bands: dict[str, int] | None,
+    params: dict,
+) -> str:
+    """Persist one session's Capture Baseline lock into the participant's folder.
+
+    Written once, when the baseline locks -- on a pass, or on an operator
+    override of a below-threshold capture (`overridden=True`, so the record is
+    auditable). Lands beside `calibration_<ts>.json`, not in a session dir --
+    a baseline is captured once per session, before trial 1 exists.
+    """
+    now = datetime.now()
+    ts = now.strftime("%Y%m%d_%H%M%S")
+    payload = {
+        "schema_version": BASELINE_SCHEMA_VERSION,
+        "participant_id": record.participant_id,
+        "captured_at": now.isoformat(timespec="seconds"),
+        "locked_count": locked_count,
+        "target": TARGET_MARKERS,
+        "min_acceptable": MIN_ACCEPTABLE,
+        "passed": passed,
+        "overridden": overridden,
+        "corners": corners,
+        "bands": bands,
+        "params_thresh": params.get("thresh"),
+        "params_min_area": params.get("min_area"),
+    }
+    path = os.path.join(record.folder, f"baseline_{ts}.json")
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
     return path
 
 
