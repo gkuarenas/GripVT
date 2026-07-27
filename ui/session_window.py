@@ -419,20 +419,20 @@ class SessionWindow(tk.Toplevel):
         ).pack(pady=(8, 20))
 
         row = tk.Frame(wrap, bg=theme.ACCENT_10)
-        row.pack(fill="x")
-        row.columnconfigure(0, weight=1, uniform="fail")
-        row.columnconfigure(1, weight=1, uniform="fail")
+        row.pack()
+        # Natural widths, not equal columns -- "Continue Anyway" is much wider
+        # than "Re-capture", and forcing them to share a uniform grid clips it.
         # D2: recording hasn't started yet in this substate (Start can't be
         # pressed until locked), but guard uniformly for defense in depth.
         enabled = not self._recording_started
         self._build_button(
             row, "Re-capture", "primary", None, self._on_recapture_baseline_click,
             enabled=enabled,
-        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        ).pack(side="left", padx=(0, 6))
         self._build_button(
             row, "Continue Anyway", "ghost", None, self._on_override_baseline_click,
             fg_override=theme.ACCENT_700, bg_override=theme.ACCENT_10,
-        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        ).pack(side="left", padx=(6, 0))
 
         tk.Label(
             wrap, text="Overriding flags this baseline in the session record.",
@@ -486,10 +486,17 @@ class SessionWindow(tk.Toplevel):
         count_text = f"{b['count']} / {TARGET_MARKERS} markers"
         if b["subline"]:
             count_text += f" · {b['subline']}"
-        tk.Label(
+        sub = tk.Label(
             text_col, text=count_text, bg=fill, fg=theme.INK_60, font=self._f_strip_subline,
-            anchor="w", wraplength=220, justify="left",
-        ).pack(fill="x", pady=(2, 0))
+            anchor="w", justify="left",
+        )
+        sub.pack(fill="x", pady=(2, 0))
+        # The column's width isn't known until Tk lays the strip out, and a
+        # guessed wraplength wider than it clips instead of wrapping -- so
+        # track the real width rather than hardcoding one.
+        text_col.bind(
+            "<Configure>", lambda e, w=sub: w.configure(wraplength=max(e.width, 1)),
+        )
 
     def _compute_subline(self, corners: dict[str, int]) -> str:
         result = self._calibration_result
@@ -635,7 +642,9 @@ class SessionWindow(tk.Toplevel):
             highlightbackground=border, highlightcolor=border,
         )
         inner = tk.Frame(btn, bg=fill)
-        inner.pack(padx=14, pady=8)
+        # .btn-ghost carries padding-inline: var(--space-1) in the design
+        # system, not the 14px the filled variants use.
+        inner.pack(padx=4 if kind == "ghost" else 14, pady=8)
 
         widgets: list[tk.Widget] = [btn, inner]
         icon_widget: tk.Canvas | None = None
