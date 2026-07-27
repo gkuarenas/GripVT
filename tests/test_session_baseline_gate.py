@@ -126,13 +126,16 @@ def test_override_flag_reaches_saved_payload(window, tmp_path, monkeypatch):
 def test_recapture_disabled_after_start(window):
     _finish_burst(window, 97)
     assert window._strip_recapture_btn.enabled is True
-    window._on_start()
+    # Phase 5 gates Start behind a bookend-confirm modal -- _on_start() only
+    # opens it now. _confirm_start() is the body that used to run directly,
+    # so drive that here rather than opening (and closing) a real modal.
+    window._confirm_start()
     assert window._recording_started is True
     assert window._strip_recapture_btn.enabled is False
 
 
 def test_recapture_click_ignored_after_start(window):
     _finish_burst(window, 97)
-    window._on_start()
+    window._confirm_start()
     window._on_recapture_baseline_click()
     assert window._baseline["status"] == "pass"  # unchanged -- no re-lock mid-session
