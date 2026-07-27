@@ -13,11 +13,26 @@ unlocks Start. A below-threshold capture can be overridden (flags the saved
 record) or recaptured -- but Re-capture is permanently disabled once Start is
 pressed, since Kalman states are locked once per session (see CLAUDE.md).
 
-CSV recording, trial sequencing, the REC timer, and target-force values stay
-static placeholders -- Start/Stop/Next Trial are stubs beyond the baseline
-gate and the D2 Re-capture lockout.
+The REC timer, camera-loss detection/retry, and the {n} / 99 TRACKED
+indicator are real: the timer is wall-clock elapsed time anchored on the
+confirmed Start (E6), camera loss is a debounced cv2.VideoCapture read
+failure (E9) that survives on the locked Kalman states without rebuilding
+the tracker, and the tracked count reads MarkerRecord.autofilled from a
+throttled Tracker.process_frame() once the baseline is locked (E2/E3).
+
+CSV recording, trial sequencing, and target-force values stay static
+placeholders. In particular, the TRIAL kicker's counter and its inline Undo
+button (E7) are in-window UI state only -- Next Trial / Undo move a local
+counter and progress bar, write nothing, and move no real trial boundary;
+there is no trial sequence yet for them to advance. A future pass wiring
+real trial sequencing must not mistake this counter for it. Start/Stop/Next
+Trial otherwise remain stubs beyond the baseline gate, the D2 Re-capture
+lockout, and the bookend confirm flow.
 """
+import logging
+import time
 import tkinter as tk
+from tkinter import font as tkfont
 from typing import Callable
 
 import cv2
@@ -32,13 +47,27 @@ from output import participants
 from output.participants import ParticipantRecord
 from ui import theme
 
-WINDOW_W = 880
-WINDOW_H = 740
+_log = logging.getLogger(__name__)
+
+WINDOW_W = 1100
+WINDOW_H = 820
 FEED_W = 450
 FEED_H = 600
 
 CAMERA_INDEX = 1
 POLL_MS = 33  # ~30 fps, matching viewer_window
+
+# A single dropped read at 30fps is normal jitter, not a disconnection --
+# only a sustained streak means the USB device actually went away (E9).
+CAMERA_FAIL_POLLS = 15  # ~0.5s at POLL_MS
+
+# Full detect+Kalman+Hungarian per frame at 30fps is more work than the
+# indicator needs -- ~10Hz is well past human-perceptible for a count badge.
+TRACK_EVERY = 3
+
+_TOAST_TIMEOUT_MS = 5000
+_FADE_STEPS = 8
+_FADE_INTERVAL_MS = 50
 
 _LETTERBOX_BG = tuple(int(theme.SURFACE.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4))
 
@@ -47,18 +76,34 @@ _BASELINE_IDLE: dict = {
     "overridden": False, "corners": None, "bands": None, "subline": "",
 }
 
+# Phase 7 (E2/E3): {n} / 99 TRACKED badge tiers, keyed by untracked-marker
+# count. "border" is None for the two tiers that render borderless -- see
+# _paint_tracked, which toggles highlightthickness rather than always
+# drawing one.
+_TRACKED_TIERS: dict[str, dict[str, str | None]] = {
+    "calm": {"fill": theme.INK, "fg": theme.BG, "border": None, "dot": theme.ACCENT},
+    "warning": {
+        "fill": theme.ACCENT_10, "fg": theme.ACCENT_700,
+        "border": theme.ACCENT_600, "dot": theme.ACCENT_700,
+    },
+    "alarm": {"fill": theme.ACCENT, "fg": theme.BG, "border": None, "dot": theme.BG},
+}
+
 
 class SessionWindow(tk.Toplevel):
     def __init__(
         self,
         master: tk.Misc,
-        on_back: Callable[[], None] | None = None,
+        on_back: Callable[[str | None], None] | None = None,
         detector_params: dict | None = None,
         calibration_result: SearchResult | None = None,
         participant: ParticipantRecord | None = None,
     ) -> None:
         super().__init__(master)
-        self._on_back = on_back or (lambda: print("Back clicked"))
+        # E1: on_back now takes an optional post-navigation toast message --
+        # Restart's confirmations pass one through to the Calibration window
+        # (landing.restore_cal); ordinary Back always passes None.
+        self._on_back = on_back or (lambda message=None: print("Back clicked"))
         self._calibration_result = calibration_result
         self._participant = participant
 
@@ -69,11 +114,54 @@ class SessionWindow(tk.Toplevel):
 
         self._current_img: ImageTk.PhotoImage | None = None
         self._after_id: str | None = None
+        self._toast_after: str | None = None
         self._cap: cv2.VideoCapture | None = None
+
+        # E6: REC timer -- _rec_elapsed accumulates wall-clock time across
+        # pauses; _rec_segment_start anchors the currently-running segment
+        # (None while paused/stopped), so the displayed elapsed time excludes
+        # dead gaps once Phase 6 wires _pause_timer/_resume_timer to camera
+        # loss/reconnect. Reset on every confirmed Start/Stop, never mid-trial.
+        self._rec_after_id: str | None = None
+        self._rec_segment_start: float | None = None
+        self._rec_elapsed: float = 0.0
+        self._timer_paused = False
+
+        # Modal state (Phase 3) -- at most one open at a time; see _open_modal.
+        self._modal_scrim: tk.Toplevel | None = None
+        self._modal_panel: tk.Toplevel | None = None
+        self._modal_configure_id: str | None = None
+
+        # Phase 6 (E9): consecutive failed cap.read()s since the last good
+        # frame; _set_camera_disconnected fires once this hits
+        # CAMERA_FAIL_POLLS. _disconnect_at anchors the reconnect-gap toast.
+        self._read_fail_streak = 0
+        self._disconnect_at: float = 0.0
+
+        # Phase 7 (E2/E3): throttled process_frame() bookkeeping. A per-frame
+        # exception disables further attempts (_tracking_disabled) rather
+        # than risking the poll loop.
+        self._frame_tick = 0
+        self._tracking_disabled = False
+        self._tracked_tier: str | None = None
+        self._tracked_blink_after: str | None = None
+        self._tracked_blink_state = False
 
         self._baseline: dict = dict(_BASELINE_IDLE)
         self._baseline_frames: list[np.ndarray] = []
         self._recording_started = False
+        # _recording (Phase 5, DCLogic) toggles Start<->Stop within a trial
+        # block; _recording_started (D2) latches True forever on first Start
+        # and permanently disables Re-capture -- the two must not merge.
+        self._recording = False
+        # E7: in-window placeholder trial state only -- no real sequencing
+        # exists yet. Named attributes (not literals) so Phase 8 only has to
+        # assign real values instead of rewiring _refresh_transport.
+        self._trial = 12
+        self._trial_max = 30
+        # Phase 8 (E7): set True by Next Trial, False by Undo -- drives the
+        # Undo button's own enabled state, independent of the transport rules.
+        self._undo_available = False
         self._strip_recapture_btn: tk.Frame | None = None
         self._capture_frame_label: tk.Label | None = None
         self._capture_fill: tk.Frame | None = None
@@ -92,17 +180,9 @@ class SessionWindow(tk.Toplevel):
         if detector_params is not None:
             self._tracker.params = detector_params
 
-        cap = cv2.VideoCapture(CAMERA_INDEX)
-        if cap.isOpened():
-            cal_w, cal_h = self._cal.image_size
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, cal_w)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cal_h)
-            cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)
-            cap.set(cv2.CAP_PROP_EXPOSURE, -6)
-            self._cap = cap
+        if self._open_camera():
             self._poll()
         else:
-            cap.release()
             self._show_placeholder()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -121,6 +201,7 @@ class SessionWindow(tk.Toplevel):
         self._f_target_unit = theme.make_font(self, "heading", 24)
         self._f_small = theme.make_font(self, "body", 12)
         self._f_button = theme.make_font(self, "heading", 14)
+        self._f_toast = theme.make_font(self, "body", 11)
 
         # baseline gate / strip
         self._f_gate_heading = theme.make_font(self, "heading", 20)
@@ -134,10 +215,18 @@ class SessionWindow(tk.Toplevel):
         self._f_strip_tag = theme.make_font(self, "heading", 10)
         self._f_strip_subline = theme.make_font(self, "body", 12)
 
+        # restart modal (Phase 4)
+        self._f_restart_row_heading = theme.make_font(self, "semibold", 14)
+        self._f_restart_danger_heading = theme.make_font(self, "heading", 15)
+
+        # bookend confirm modal (Phase 5) -- 19px, distinct from the restart
+        # modal's 20px "Restart?" heading.
+        self._f_bookend_heading = theme.make_font(self, "heading", 19)
+
     # ── body ────────────────────────────────────────────────────────────────
     def _build_body(self) -> None:
         body = tk.Frame(self, bg=theme.BG)
-        body.pack(fill="both", expand=True, padx=32, pady=(18, 18))
+        body.pack(fill="both", expand=True, padx=32, pady=(22, 20))
 
         self._build_topbar(body)
 
@@ -148,6 +237,7 @@ class SessionWindow(tk.Toplevel):
 
         self._build_feed(content)
         self._build_panel(content)
+        self._build_toast(content)
 
     def _build_topbar(self, parent: tk.Frame) -> None:
         bar = tk.Frame(parent, bg=theme.BG)
@@ -164,7 +254,14 @@ class SessionWindow(tk.Toplevel):
             eyebrow, text="GRIPVT", bg=theme.BG, fg=theme.INK_65, font=self._f_eyebrow
         ).pack(side="left", padx=(8, 0))
 
-        tk.Frame(bar, bg=theme.BG, width=76, height=1).grid(row=0, column=2, sticky="e")
+        # Fills the previously-empty 76px right spacer (E1/E10). No weight on
+        # this column, so it keeps its natural width and the eyebrow's
+        # weighted centre column (1) stays centred, same as before.
+        restart = self._build_button(
+            bar, "Restart", "ghost", "rotate", self._open_restart_modal,
+            fg_override=theme.INK_60, hover_fg=theme.ACCENT_700,
+        )
+        restart.grid(row=0, column=2, sticky="e")
 
     # ── left: camera feed slot ─────────────────────────────────────────────
     def _build_feed(self, parent: tk.Frame) -> None:
@@ -178,17 +275,83 @@ class SessionWindow(tk.Toplevel):
         self._feed_label = tk.Label(slot, bg=theme.SURFACE)
         self._feed_label.pack(fill="both", expand=True)
 
-        # Built once; only placed once recording starts -- see _on_start.
-        badge = tk.Frame(slot, bg=theme.INK)
+        # Phase 6/7: REC (or REC PAUSED) and the {n}/99 TRACKED indicator
+        # share one left-to-right container so they sit beside each other
+        # per the design, always at (12, 12) in the feed slot. The container
+        # itself is placed unconditionally -- with nothing packed inside it
+        # collapses to 0x0, so it draws nothing until a badge is packed.
+        self._badge_container = tk.Frame(slot, bg=theme.BG)
+        self._badge_container.place(x=12, y=12)
+
+        # Built once; only packed once recording starts -- see _confirm_start.
+        badge = tk.Frame(self._badge_container, bg=theme.INK)
         badge_inner = tk.Frame(badge, bg=theme.INK)
         badge_inner.pack(padx=12, pady=6)
         dot = tk.Canvas(badge_inner, width=9, height=9, bg=theme.INK, highlightthickness=0)
         dot.create_oval(0, 0, 9, 9, fill=theme.ACCENT, outline=theme.ACCENT)
         dot.pack(side="left")
-        tk.Label(
+        self._rec_label = tk.Label(
             badge_inner, text="REC 00:00", bg=theme.INK, fg=theme.BG, font=self._f_rec,
-        ).pack(side="left", padx=(6, 0))
+        )
+        self._rec_label.pack(side="left", padx=(6, 0))
         self._rec_badge = badge
+
+        # REC PAUSED variant (Phase 6) -- same fill/text colours as REC, but
+        # a square INK_60 dot (not round, not blinking) and no timer text.
+        # Swapped in/out for _rec_badge rather than reconfigured in place,
+        # per the plan's "build it as a second badge widget" guidance.
+        paused = tk.Frame(self._badge_container, bg=theme.INK)
+        paused_inner = tk.Frame(paused, bg=theme.INK)
+        paused_inner.pack(padx=12, pady=6)
+        tk.Frame(paused_inner, bg=theme.INK_60, width=9, height=9).pack(side="left")
+        tk.Label(
+            paused_inner, text="REC PAUSED", bg=theme.INK, fg=theme.BG, font=self._f_rec,
+        ).pack(side="left", padx=(6, 0))
+        self._rec_paused_badge = paused
+
+        # {n} / 99 TRACKED indicator (Phase 7) -- built once, reconfigured in
+        # place per-tier (_apply_tracked_tier), never destroyed/rebuilt. Only
+        # packed the first time a tier is computed (E2: gated on
+        # baseline_set), and never unpacked again once shown.
+        tracked = tk.Frame(self._badge_container, bg=theme.INK, highlightthickness=0)
+        tracked_inner = tk.Frame(tracked, bg=theme.INK)
+        tracked_inner.pack(padx=12, pady=6)
+        tracked_dot = tk.Canvas(tracked_inner, width=9, height=9, bg=theme.INK, highlightthickness=0)
+        self._tracked_dot_id = tracked_dot.create_oval(0, 0, 9, 9, fill=theme.ACCENT, outline=theme.ACCENT)
+        tracked_dot.pack(side="left")
+        self._tracked_label = tk.Label(
+            tracked_inner, text=f"{TARGET_MARKERS} / {TARGET_MARKERS} TRACKED",
+            bg=theme.INK, fg=theme.BG, font=self._f_rec,
+        )
+        self._tracked_label.pack(side="left", padx=(6, 0))
+        self._tracked_badge = tracked
+        self._tracked_inner = tracked_inner
+        self._tracked_dot = tracked_dot
+
+        # Disconnected feed panel (Phase 6, E9) -- replaces the live feed
+        # while the camera is lost. Built once, hidden until
+        # _set_camera_disconnected shows it; raised above _feed_label but
+        # kept below _badge_container so REC PAUSED / TRACKED stay visible.
+        self._disconnected_panel = tk.Frame(
+            slot, bg=theme.ACCENT_10, highlightthickness=2,
+            highlightbackground=theme.INK, highlightcolor=theme.INK,
+        )
+        dc_wrap = tk.Frame(self._disconnected_panel, bg=theme.ACCENT_10)
+        dc_wrap.place(relx=0.5, rely=0.5, anchor="center")
+        self._warning_icon(dc_wrap, theme.ACCENT_10, size=32).pack(pady=(0, 14))
+        tk.Label(
+            dc_wrap, text="Camera Disconnected", bg=theme.ACCENT_10, fg=theme.ACCENT_700,
+            font=self._f_bookend_heading,  # 19px heading -- same size as this file's other 19px heading
+        ).pack(pady=(0, 8))
+        tk.Label(
+            dc_wrap,
+            text="Recording continues — trial data collected so far is not lost.",
+            bg=theme.ACCENT_10, fg=theme.ACCENT_700, font=self._f_gate_body,
+            wraplength=260, justify="center",
+        ).pack(pady=(0, 20))
+        self._build_button(
+            dc_wrap, "Retry", "primary", "rotate", self.retry_camera,
+        ).pack()
 
     def _show_placeholder(self) -> None:
         self._feed_label.configure(
@@ -204,6 +367,36 @@ class SessionWindow(tk.Toplevel):
 
         self._progress_block(panel, "SESSION", "3 / 10", 0.30)
 
+        # Paused banner (Phase 6) -- built once, packed only while the camera
+        # is disconnected AND a recording is in progress (_set_camera_
+        # disconnected / retry_camera). `before=` at pack-time lets it slot
+        # in above _baseline_container regardless of build order.
+        self._paused_banner = tk.Frame(
+            panel, bg=theme.ACCENT_10, highlightthickness=2,
+            highlightbackground=theme.ACCENT_600, highlightcolor=theme.ACCENT_600,
+        )
+        pb_inner = tk.Frame(self._paused_banner, bg=theme.ACCENT_10)
+        pb_inner.pack(fill="x", padx=14, pady=12)
+        pb_head = tk.Frame(pb_inner, bg=theme.ACCENT_10)
+        pb_head.pack(fill="x")
+        self._icon(pb_head, "pause", theme.ACCENT_700, theme.ACCENT_10).pack(
+            side="left", anchor="n", padx=(0, 10),
+        )
+        pb_text = tk.Frame(pb_head, bg=theme.ACCENT_10)
+        pb_text.pack(side="left", fill="x", expand=True)
+        tk.Label(
+            pb_text, text="Recording Paused — Camera Signal Lost", bg=theme.ACCENT_10,
+            fg=theme.ACCENT_700, font=self._f_gate_value,  # 13px heading
+            anchor="w", justify="left", wraplength=280,
+        ).pack(fill="x")
+        tk.Label(
+            pb_text,
+            text="Session data captured so far is safe. Retry the feed to "
+                 "resume recording.",
+            bg=theme.ACCENT_10, fg=theme.ACCENT_700, font=self._f_small,  # 12px body
+            anchor="w", justify="left", wraplength=280,
+        ).pack(fill="x", pady=(4, 0))
+
         self._baseline_container = tk.Frame(panel, bg=theme.BG)
         self._baseline_container.pack(fill="both", expand=True)
         self._build_phase1(self._baseline_container)
@@ -217,15 +410,34 @@ class SessionWindow(tk.Toplevel):
             row, "Start", "primary", "play", self._on_start, enabled=False,
         )
         self._start_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
-        stop = self._build_button(row, "Stop", "secondary", "stop", self._on_stop, enabled=False)
-        stop.grid(row=0, column=1, sticky="ew", padx=(6, 0))
+        self._stop_btn = self._build_button(
+            row, "Stop", "secondary", "stop", self._on_stop, enabled=False,
+        )
+        self._stop_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
-        next_btn = self._build_button(
+        self._next_btn = self._build_button(
             panel, "Next Trial", "secondary", "arrow-right", self._on_next_trial, enabled=False,
         )
-        next_btn.pack(fill="x", pady=(12, 0))
+        self._next_btn.pack(fill="x", pady=(12, 0))
 
         self._render_baseline()
+
+    def _build_toast(self, parent: tk.Frame) -> None:
+        # Top-right of the content frame -- content is already inset by
+        # body's own (22, 20)/32 padding, so flush-to-corner here reproduces
+        # the design's top:22px; right:32px without a second offset.
+        self._toast_parent = parent
+        self._toast = tk.Frame(
+            parent, bg=theme.ACCENT_10, highlightthickness=1,
+            highlightbackground=theme.ACCENT, highlightcolor=theme.ACCENT,
+        )
+        self._toast_inner = tk.Frame(self._toast, bg=theme.ACCENT_10)
+        self._toast_inner.pack(padx=10, pady=7)
+        self._toast_label = tk.Label(
+            self._toast_inner, text="", bg=theme.ACCENT_10, fg=theme.ACCENT_700,
+            font=self._f_toast, wraplength=220, justify="left",
+        )
+        self._toast_label.pack()
 
     def _progress_block(
         self, parent: tk.Frame, kicker: str, value: str, frac: float, pady_top: int = 0,
@@ -242,6 +454,56 @@ class SessionWindow(tk.Toplevel):
         track.pack(fill="x", pady=(8, 0))
         fill = tk.Frame(track, bg=theme.ACCENT)
         fill.place(relx=0, rely=0, relwidth=frac, relheight=1)
+
+    def _build_trial_block(self, parent: tk.Frame) -> None:
+        """TRIAL gets its own rendering path rather than _progress_block
+        (Phase 8, E7): it carries a live value/bar plus an inline Undo
+        button, so the value label and bar fill are stored for
+        _refresh_trial_block to update without a rebuild. SESSION above
+        keeps using _progress_block unchanged."""
+        wrap = tk.Frame(parent, bg=theme.BG)
+        wrap.pack(fill="x")
+
+        row = tk.Frame(wrap, bg=theme.BG)
+        row.pack(fill="x")
+        kicker_row = tk.Frame(row, bg=theme.BG)
+        kicker_row.pack(side="left")
+        tk.Label(
+            kicker_row, text="TRIAL", bg=theme.BG, fg=theme.INK_60, font=self._f_kicker,
+        ).pack(side="left")
+        # Compact ghost Undo, inline after the kicker (design: margin-left
+        # 10px, 10.5px label -- self._f_strip_tag is this file's existing
+        # 10px heading font, close enough to reuse rather than add a new one).
+        self._undo_btn = self._build_button(
+            kicker_row, "Undo", "ghost", "undo", self._on_undo_trial,
+            enabled=self._undo_available, font=self._f_strip_tag,
+        )
+        self._undo_btn.pack(side="left", padx=(10, 0))
+
+        self._trial_value_label = tk.Label(
+            row, text=self._trial_value_text(), bg=theme.BG, fg=theme.INK,
+            font=self._f_progress_value,
+        )
+        self._trial_value_label.pack(side="right")
+
+        track = tk.Frame(wrap, bg=theme.NEUTRAL_200, height=6)
+        track.pack(fill="x", pady=(8, 0))
+        self._trial_fill = tk.Frame(track, bg=theme.ACCENT)
+        self._trial_fill.place(relx=0, rely=0, relwidth=self._trial_frac(), relheight=1)
+
+    def _trial_value_text(self) -> str:
+        return f"{self._trial} / {self._trial_max}"
+
+    def _trial_frac(self) -> float:
+        return self._trial / self._trial_max if self._trial_max else 0.0
+
+    def _refresh_trial_block(self) -> None:
+        """Repaints the TRIAL value/bar/Undo in place -- called after every
+        Next Trial / Undo (Phase 8), never rebuilds _build_trial_block's
+        widgets."""
+        self._trial_value_label.configure(text=self._trial_value_text())
+        self._trial_fill.place_configure(relwidth=self._trial_frac())
+        self._undo_btn.set_enabled(self._undo_available)
 
     # ── phase 1: baseline gate box ─────────────────────────────────────────
     def _build_phase1(self, parent: tk.Frame) -> None:
@@ -264,7 +526,7 @@ class SessionWindow(tk.Toplevel):
         self._strip = tk.Frame(self._phase2_frame, highlightthickness=1)
         self._strip.pack(fill="x", pady=(0, 16))
 
-        self._progress_block(self._phase2_frame, "TRIAL", "12 / 30", 0.40)
+        self._build_trial_block(self._phase2_frame)
         tk.Frame(self._phase2_frame, bg=theme.DIVIDER, height=2).pack(fill="x", pady=18)
 
         target = tk.Frame(self._phase2_frame, bg=theme.BG)
@@ -306,7 +568,20 @@ class SessionWindow(tk.Toplevel):
             self._phase2_frame.pack_forget()
             self._phase1_frame.pack(fill="both", expand=True)
             self._render_gate_box()
-        self._start_btn.set_enabled(locked)
+        self._refresh_transport()
+
+    def _refresh_transport(self) -> None:
+        """Recompute Start/Stop/Next Trial enabled state per the design's
+        DCLogic (Phase 5). Called from _render_baseline (locked flips) and
+        from _confirm_start/_confirm_stop (recording flips) -- every state
+        change that feeds these rules. trial/trial_max are E7 placeholders."""
+        locked = self._locked()
+        start_disabled = not locked or self._recording
+        stop_disabled = not self._recording
+        next_trial_disabled = self._recording or not locked or self._trial >= self._trial_max
+        self._start_btn.set_enabled(not start_disabled)
+        self._stop_btn.set_enabled(not stop_disabled)
+        self._next_btn.set_enabled(not next_trial_disabled)
 
     def _render_gate_box(self) -> None:
         for child in self._gate_box.winfo_children():
@@ -610,13 +885,24 @@ class SessionWindow(tk.Toplevel):
         c.create_line(*p(18, 12, 22, 12), fill=theme.INK, width=1.6, capstyle="round")
         return c
 
-    def _warning_icon(self, parent: tk.Misc, bg: str) -> tk.Canvas:
-        c = tk.Canvas(parent, width=24, height=24, bg=bg, highlightthickness=0)
+    def _warning_icon(self, parent: tk.Misc, bg: str, size: int = 24) -> tk.Canvas:
+        # size=24 (default) is the shipped baseline-fail-box glyph; size=32 is
+        # for the camera-disconnect panel (Phase 6) -- coordinates scale by
+        # `s`, so the 24px call sites render pixel-identically to before.
+        c = tk.Canvas(parent, width=size, height=size, bg=bg, highlightthickness=0)
+        s = size / 24
+
+        def p(*coords: float) -> list[float]:
+            return [v * s for v in coords]
+
         c.create_polygon(
-            12, 3, 22, 20, 2, 20, fill="", outline=theme.ACCENT_700, width=1.8, joinstyle="round",
+            *p(12, 3, 22, 20, 2, 20), fill="", outline=theme.ACCENT_700, width=1.8,
+            joinstyle="round",
         )
-        c.create_line(12, 9, 12, 13, fill=theme.ACCENT_700, width=1.8, capstyle="round")
-        c.create_oval(11.2, 15.2, 12.8, 16.8, fill=theme.ACCENT_700, outline=theme.ACCENT_700)
+        c.create_line(*p(12, 9, 12, 13), fill=theme.ACCENT_700, width=1.8, capstyle="round")
+        c.create_oval(
+            *p(11.2, 15.2, 12.8, 16.8), fill=theme.ACCENT_700, outline=theme.ACCENT_700,
+        )
         return c
 
     def _check_icon_square(self, parent: tk.Misc, bg: str) -> tk.Frame:
@@ -634,8 +920,10 @@ class SessionWindow(tk.Toplevel):
         self, parent: tk.Misc, label: str, kind: str, icon: str | None,
         command: Callable[[], None], enabled: bool = True,
         fg_override: str | None = None, bg_override: str | None = None,
+        hover_fg: str | None = None, font: tkfont.Font | None = None,
     ) -> tk.Frame:
         fill, fg, border = self._button_style(kind, enabled, fg_override, bg_override)
+        button_font = font or self._f_button
 
         btn = tk.Frame(
             parent, bg=fill, highlightthickness=1,
@@ -648,11 +936,13 @@ class SessionWindow(tk.Toplevel):
 
         widgets: list[tk.Widget] = [btn, inner]
         icon_widget: tk.Canvas | None = None
-        if icon in ("arrow-left", "play", "stop", "dot"):
+        # rotate (Restart/Retry) and undo (Undo) render on the left, same as
+        # the original four -- Phase 6/8 are the first callers to pass them.
+        if icon in ("arrow-left", "play", "stop", "dot", "rotate", "undo"):
             icon_widget = self._icon(inner, icon, fg, fill)
             icon_widget.pack(side="left", padx=(0, 6))
             widgets.append(icon_widget)
-        text = tk.Label(inner, text=label, bg=fill, fg=fg, font=self._f_button)
+        text = tk.Label(inner, text=label, bg=fill, fg=fg, font=button_font)
         text.pack(side="left")
         widgets.append(text)
         if icon == "arrow-right":
@@ -662,7 +952,7 @@ class SessionWindow(tk.Toplevel):
 
         wired = False
 
-        def repaint(en: bool) -> str:
+        def repaint(en: bool) -> tuple[str, str]:
             fill_, fg_, border_ = self._button_style(kind, en, fg_override, bg_override)
             for w in widgets:
                 w.configure(bg=fill_)
@@ -671,14 +961,18 @@ class SessionWindow(tk.Toplevel):
             if icon_widget is not None:
                 icon_widget.delete("all")
                 self._paint_icon_shape(icon_widget, icon, fg_)
-            return fill_
+            return fill_, fg_
 
         def set_enabled(en: bool) -> None:
             nonlocal wired
-            fill_ = repaint(en)
+            fill_, fg_ = repaint(en)
             if en and not wired:
                 hover, active = self._button_hover_active(kind)
-                self._wire_button(btn, widgets, fill_, hover, active, command)
+                self._wire_button(
+                    btn, widgets, fill_, hover, active, command,
+                    text=text, icon_widget=icon_widget, icon=icon,
+                    base_fg=fg_, hover_fg=hover_fg,
+                )
                 wired = True
             elif not en and wired:
                 self._unwire_button(btn, widgets)
@@ -701,6 +995,10 @@ class SessionWindow(tk.Toplevel):
         if kind == "ghost":
             fill = bg_override if bg_override is not None else theme.BG
             return fill, fg_override or theme.ACCENT, fill
+        if kind == "danger":
+            # The design's "Restart Entire Testing" button -- a raw solid
+            # accent-700 fill, not one of the three .btn variants (E10a).
+            return theme.ACCENT_700, theme.BG, theme.ACCENT_700
         fill = bg_override if bg_override is not None else theme.BG
         return fill, theme.INK, theme.DIVIDER
 
@@ -709,6 +1007,8 @@ class SessionWindow(tk.Toplevel):
             return theme.ACCENT_600, theme.ACCENT_700
         if kind == "ghost":
             return theme.ACCENT_10, theme.ACCENT_18
+        if kind == "danger":
+            return theme.ACCENT_600, theme.ACCENT
         return theme.HOVER, theme.ACTIVE
 
     def _icon(self, parent: tk.Misc, kind: str, color: str, bg: str) -> tk.Canvas:
@@ -736,20 +1036,66 @@ class SessionWindow(tk.Toplevel):
             canvas.create_rectangle(*p(5, 5, 19, 19), fill=color, outline=color)
         elif kind == "dot":
             canvas.create_oval(*p(4, 4, 20, 20), fill=color, outline=color)
+        elif kind == "rotate":
+            # Restart's refresh icon -- design SVG:
+            # <path d="M3 12a9 9 0 1 0 2.6-6.4L2 9"/><path d="M2 4v5h5"/>
+            # A ~315deg circle sweep (open at the upper-left) plus the two
+            # line segments that draw the arrowhead sitting in that gap.
+            canvas.create_arc(
+                *p(3, 3, 21, 21), start=180, extent=315, style="arc",
+                outline=color, width=2,
+            )
+            canvas.create_line(*p(2, 4, 2, 9), fill=color, width=2, capstyle="round")
+            canvas.create_line(*p(2, 9, 7, 9), fill=color, width=2, capstyle="round")
+        elif kind == "pause":
+            # <rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>
+            canvas.create_rectangle(*p(6, 4, 10, 20), fill=color, outline=color)
+            canvas.create_rectangle(*p(14, 4, 18, 20), fill=color, outline=color)
+        elif kind == "undo":
+            # design SVG: <path d="M9 14 4 9l5-5"/>
+            # <path d="M4 9h10.5a5.5 5.5 0 1 1 0 11H11"/>
+            # Arrowhead chevron pointing left, then a line that runs right,
+            # loops through a semicircle, and returns left along the bottom.
+            canvas.create_line(*p(9, 14, 4, 9), fill=color, width=2,
+                                capstyle="round", joinstyle="round")
+            canvas.create_line(*p(4, 9, 9, 4), fill=color, width=2,
+                                capstyle="round", joinstyle="round")
+            canvas.create_line(*p(4, 9, 14.5, 9), fill=color, width=2, capstyle="round")
+            canvas.create_arc(
+                *p(9, 9, 20, 20), start=90, extent=-180, style="arc",
+                outline=color, width=2,
+            )
+            canvas.create_line(*p(14.5, 20, 11, 20), fill=color, width=2, capstyle="round")
 
     def _wire_button(
         self, btn: tk.Frame, widgets: list[tk.Widget], base: str,
         hover: str, active: str, command: Callable[[], None],
+        text: tk.Label | None = None, icon_widget: tk.Canvas | None = None,
+        icon: str | None = None, base_fg: str | None = None, hover_fg: str | None = None,
     ) -> None:
         def paint(colour: str) -> None:
             for w in widgets:
                 w.configure(bg=colour)
 
+        def paint_fg(colour: str | None) -> None:
+            # Only the Restart ghost button passes hover_fg today (E10b) --
+            # every other caller leaves this a no-op, so their label/icon
+            # colour stays exactly what repaint() already set.
+            if colour is None:
+                return
+            if text is not None:
+                text.configure(fg=colour)
+            if icon_widget is not None:
+                icon_widget.delete("all")
+                self._paint_icon_shape(icon_widget, icon, colour)
+
         def on_enter(_e: object) -> None:
             paint(hover)
+            paint_fg(hover_fg)
 
         def on_leave(_e: object) -> None:
             paint(base)
+            paint_fg(base_fg)
 
         def on_press(_e: object) -> None:
             paint(active)
@@ -759,9 +1105,11 @@ class SessionWindow(tk.Toplevel):
             hovered = btn.winfo_containing(x, y)
             if hovered is not None and (hovered is btn or str(hovered).startswith(str(btn))):
                 paint(hover)
+                paint_fg(hover_fg)
                 command()
             else:
                 paint(base)
+                paint_fg(base_fg)
 
         for w in widgets:
             w.bind("<Enter>", on_enter)
@@ -780,24 +1128,470 @@ class SessionWindow(tk.Toplevel):
 
     # ── stub handlers ───────────────────────────────────────────────────────
     def _on_start(self) -> None:
-        if not self._locked():
+        # Mirrors _refresh_transport's startDisabled rule -- guards against a
+        # stray call (e.g. a key binding) reaching a disabled button.
+        start_disabled = not self._locked() or self._recording
+        if start_disabled:
             return
-        self._recording_started = True
-        self._rec_badge.place(x=12, y=12)
-        if self._strip_recapture_btn is not None:
-            self._strip_recapture_btn.set_enabled(False)
-        print("Start clicked")
+        self._open_start_bookend_modal()
 
     def _on_stop(self) -> None:
-        print("Stop clicked")
+        stop_disabled = not self._recording
+        if stop_disabled:
+            return
+        self._open_stop_bookend_modal()
 
     def _on_next_trial(self) -> None:
-        print("Next Trial clicked")
+        # Mirrors _refresh_transport's nextTrialDisabled rule (Phase 8, E7) --
+        # guards a stray call the same way _on_start/_on_stop already do.
+        next_trial_disabled = self._recording or not self._locked() or self._trial >= self._trial_max
+        if next_trial_disabled:
+            return
+        self._trial = min(self._trial_max, self._trial + 1)
+        self._undo_available = True
+        self._refresh_trial_block()
+        self._refresh_transport()
+
+    def _on_undo_trial(self) -> None:
+        if not self._undo_available:
+            return
+        self._trial = max(1, self._trial - 1)
+        self._undo_available = False
+        self._refresh_trial_block()
+        self._refresh_transport()
+
+    # ── bookend confirm modals (Phase 5) ────────────────────────────────────
+    def _open_start_bookend_modal(self) -> None:
+        def build(parent: tk.Frame) -> None:
+            self._build_bookend_content(
+                parent,
+                title="Confirm Start Bookend",
+                body="Perform the triple-tap bookend on the dynamometer now, "
+                     "before recording begins.",
+                on_confirm=self._confirm_start,
+            )
+
+        self._open_modal(build)
+
+    def _open_stop_bookend_modal(self) -> None:
+        def build(parent: tk.Frame) -> None:
+            self._build_bookend_content(
+                parent,
+                title="Confirm End Bookend",
+                body="Perform the closing triple-tap bookend on the dynamometer "
+                     "now, before ending the session.",
+                on_confirm=self._confirm_stop,
+            )
+
+        self._open_modal(build)
+
+    def _build_bookend_content(
+        self, parent: tk.Frame, title: str, body: str, on_confirm: Callable[[], None],
+    ) -> None:
+        wrap = tk.Frame(parent, bg=theme.BG)
+        wrap.pack(padx=28, pady=24)
+        # 420px panel -- forced via a zero-height spacer, the same idiom the
+        # topbar uses for its fixed-width Restart column.
+        tk.Frame(wrap, bg=theme.BG, width=364, height=1).pack()
+
+        tk.Label(
+            wrap, text=title, bg=theme.BG, fg=theme.INK, font=self._f_bookend_heading,
+            anchor="w", justify="left",
+        ).pack(fill="x", pady=(4, 12))
+        tk.Label(
+            wrap, text=body, bg=theme.BG, fg=theme.INK_70, font=self._f_gate_body,
+            wraplength=364, justify="left", anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            wrap,
+            text="A missed bookend makes this session's force labels unrecoverable.",
+            bg=theme.BG, fg=theme.INK_70, font=self._f_small, wraplength=364,
+            justify="left", anchor="w",
+        ).pack(fill="x", pady=(8, 20))
+
+        btn_row = tk.Frame(wrap, bg=theme.BG)
+        btn_row.pack(fill="x")
+        self._build_button(btn_row, "Confirm", "primary", None, on_confirm).pack(side="right")
+
+    def _confirm_start(self) -> None:
+        self._close_modal()
+        self._recording = True
+        self._recording_started = True
+        self._show_rec_badge()
+        if self._strip_recapture_btn is not None:
+            self._strip_recapture_btn.set_enabled(False)
+        self._start_timer()
+        self._refresh_transport()
+        print("Start clicked")
+
+    def _confirm_stop(self) -> None:
+        self._close_modal()
+        self._recording = False
+        self._hide_rec_badges()
+        # Defensive: a Stop while disconnected is not a designed flow, but
+        # leaving the paused banner up with no recording in progress would
+        # be a stale, misleading state.
+        self._paused_banner.pack_forget()
+        self._stop_timer()
+        self._refresh_transport()
+        print("Stop clicked")
+
+    # ── REC / REC PAUSED / TRACKED badge helpers (Phase 6/7) ────────────────
+    def _show_rec_badge(self) -> None:
+        """Packs the live REC timer badge, swapping out REC PAUSED if it was
+        showing. `before=` keeps REC ahead of the TRACKED badge in the
+        container's left-to-right order even if TRACKED was packed first
+        (it is packed once, on first tier computation, and never unpacked)."""
+        self._rec_paused_badge.pack_forget()
+        kwargs = {"side": "left"}
+        if self._tracked_badge.winfo_manager() == "pack":
+            kwargs["before"] = self._tracked_badge
+        self._rec_badge.pack(**kwargs)
+
+    def _show_rec_paused_badge(self) -> None:
+        self._rec_badge.pack_forget()
+        kwargs = {"side": "left"}
+        if self._tracked_badge.winfo_manager() == "pack":
+            kwargs["before"] = self._tracked_badge
+        self._rec_paused_badge.pack(**kwargs)
+
+    def _hide_rec_badges(self) -> None:
+        self._rec_badge.pack_forget()
+        self._rec_paused_badge.pack_forget()
+
+    # ── REC timer (Phase 5, E6) ──────────────────────────────────────────────
+    def _start_timer(self) -> None:
+        """Begin the 1s after-tick from the Start confirm. Fresh state every
+        Start -- this is a wall-clock display, not tied to CSV frame
+        timestamps (see the module docstring)."""
+        self._rec_elapsed = 0.0
+        self._rec_segment_start = time.monotonic()
+        self._timer_paused = False
+        self._tick_timer()
+
+    def _tick_timer(self) -> None:
+        elapsed = self._rec_elapsed
+        if self._rec_segment_start is not None:
+            elapsed += time.monotonic() - self._rec_segment_start
+        minutes, seconds = divmod(int(elapsed), 60)
+        self._rec_label.configure(text=f"REC {minutes:02d}:{seconds:02d}")
+        self._rec_after_id = self.after(1000, self._tick_timer)
+
+    def _pause_timer(self) -> None:
+        """Freezes the displayed elapsed time. Phase 6 calls this the moment
+        camera loss is confirmed, so the dead gap is never counted."""
+        if self._timer_paused or self._rec_segment_start is None:
+            return
+        self._rec_elapsed += time.monotonic() - self._rec_segment_start
+        self._rec_segment_start = None
+        self._timer_paused = True
+
+    def _resume_timer(self) -> None:
+        """Re-anchors the running segment. Phase 6 calls this on reconnect."""
+        if not self._timer_paused:
+            return
+        self._rec_segment_start = time.monotonic()
+        self._timer_paused = False
+
+    def _stop_timer(self) -> None:
+        if self._rec_after_id is not None:
+            self.after_cancel(self._rec_after_id)
+            self._rec_after_id = None
+        self._rec_segment_start = None
+        self._timer_paused = False
+        self._rec_elapsed = 0.0
+        self._rec_label.configure(text="REC 00:00")
+
+    # ── restart modal (Phase 4, E1/E8) ──────────────────────────────────────
+    def _open_restart_modal(self) -> None:
+        """Two asymmetric options -- Restart Session costs one session,
+        Restart Entire Testing costs the whole visit. Both close this window
+        via self._on_back(message); the toast lands on Calibration (E1)."""
+        state: dict = {"reason": None, "chips": {}, "note_entry": None, "note_state": None}
+
+        def repaint_chip(key: str) -> None:
+            chip, label = state["chips"][key]
+            selected = state["reason"] == key
+            fill = theme.ACCENT_08 if selected else theme.BG
+            fg = theme.ACCENT_700 if selected else theme.INK
+            border = theme.ACCENT_600 if selected else theme.DIVIDER
+            chip.configure(bg=fill, highlightbackground=border, highlightcolor=border)
+            label.configure(bg=fill, fg=fg)
+
+        def on_chip_click(key: str) -> None:
+            # Single-select toggle -- clicking the selected chip deselects it.
+            state["reason"] = None if state["reason"] == key else key
+            for k in state["chips"]:
+                repaint_chip(k)
+
+        def note_text() -> str:
+            entry = state["note_entry"]
+            note_state = state["note_state"]
+            if entry is None or note_state is None or note_state["placeholder"]:
+                return ""
+            return entry.get()
+
+        def confirm_session() -> None:
+            # E8: reason/note are not persisted -- an abort record needs
+            # sessionN_<ts>/ directories, which need the make_session_dir
+            # retarget and session numbering (both out of scope here; see
+            # docs/checklist/session_recording_checklist.md).
+            print(f"Restart Session clicked — reason={state['reason']!r} note={note_text()!r}")
+            self._close_modal()
+            self.release_camera()
+            self._on_back(
+                "Session 3 abandoned — returned to Sensor Calibration. Sessions 1-2 kept."
+            )
+
+        def confirm_all() -> None:
+            print(
+                f"Restart Entire Testing clicked — reason={state['reason']!r} "
+                f"note={note_text()!r}"
+            )
+            self._close_modal()
+            self.release_camera()
+            self._on_back(
+                "All sessions abandoned — returned to Sensor Calibration. "
+                "Counter reset to 1 of 10."
+            )
+
+        def build(parent: tk.Frame) -> None:
+            wrap = tk.Frame(parent, bg=theme.BG)
+            wrap.pack(padx=28, pady=28)
+            # 560px panel, same fixed-width spacer idiom as the bookend modal.
+            tk.Frame(wrap, bg=theme.BG, width=504, height=1).pack()
+
+            tk.Label(
+                wrap, text="Restart?", bg=theme.BG, fg=theme.INK, font=self._f_gate_heading,
+                anchor="w", justify="left",
+            ).pack(fill="x")
+            tk.Label(
+                wrap,
+                text="Choose what to abandon. Neither option deletes data — this "
+                     "can't be undone once confirmed.",
+                bg=theme.BG, fg=theme.INK_70, font=self._f_gate_body, wraplength=504,
+                justify="left", anchor="w",
+            ).pack(fill="x", pady=(6, 20))
+
+            # Restart Session -- costs one session, kept.
+            row1 = tk.Frame(
+                wrap, bg=theme.BG, highlightthickness=1,
+                highlightbackground=theme.DIVIDER, highlightcolor=theme.DIVIDER,
+            )
+            row1.pack(fill="x", pady=(0, 12))
+            row1_in = tk.Frame(row1, bg=theme.BG)
+            row1_in.pack(fill="x", padx=16, pady=16)
+            row1_text = tk.Frame(row1_in, bg=theme.BG)
+            row1_text.pack(side="left", fill="x", expand=True, padx=(0, 12))
+            tk.Label(
+                row1_text, text="Restart Session", bg=theme.BG, fg=theme.INK,
+                font=self._f_restart_row_heading, anchor="w",
+            ).pack(fill="x")
+            tk.Label(
+                row1_text,
+                text="Abandons session 3 and returns to Sensor Calibration. "
+                     "Sessions 1-2 are kept. The next attempt is still session "
+                     "3 of 10.",
+                bg=theme.BG, fg=theme.INK_70, font=self._f_small, wraplength=320,
+                justify="left", anchor="w",
+            ).pack(fill="x", pady=(4, 0))
+            self._build_button(
+                row1_in, "Restart Session", "secondary", None, confirm_session,
+            ).pack(side="right")
+
+            # Restart Entire Testing -- costs the whole visit, flagged accent
+            # treatment so the asymmetry with the row above reads at a glance.
+            row2 = tk.Frame(
+                wrap, bg=theme.ACCENT_10, highlightthickness=2,
+                highlightbackground=theme.ACCENT_600, highlightcolor=theme.ACCENT_600,
+            )
+            row2.pack(fill="x")
+            row2_in = tk.Frame(row2, bg=theme.ACCENT_10)
+            row2_in.pack(fill="x", padx=18, pady=18)
+            row2_text = tk.Frame(row2_in, bg=theme.ACCENT_10)
+            row2_text.pack(side="left", fill="x", expand=True, padx=(0, 12))
+            tk.Label(
+                row2_text, text="Restart Entire Testing", bg=theme.ACCENT_10,
+                fg=theme.ACCENT_700, font=self._f_restart_danger_heading, anchor="w",
+            ).pack(fill="x")
+            tk.Label(
+                row2_text,
+                text="Abandons all sessions for this participant's visit and "
+                     "returns to Sensor Calibration. Nothing is deleted; every "
+                     "session is kept and flagged. The counter resets to "
+                     "session 1 of 10.",
+                bg=theme.ACCENT_10, fg=theme.ACCENT_700, font=self._f_small,
+                wraplength=320, justify="left", anchor="w",
+            ).pack(fill="x", pady=(4, 0))
+            self._build_button(
+                row2_in, "Restart Entire Testing", "danger", None, confirm_all,
+            ).pack(side="right")
+
+            tk.Frame(wrap, bg=theme.DIVIDER, height=2).pack(fill="x", pady=(20, 16))
+
+            tk.Label(
+                wrap, text="REASON", bg=theme.BG, fg=theme.INK_60, font=self._f_kicker,
+                anchor="w",
+            ).pack(fill="x", pady=(0, 8))
+            chips_row = tk.Frame(wrap, bg=theme.BG)
+            chips_row.pack(fill="x", pady=(0, 16))
+            for key in ("Sensor slipped", "Camera fault", "Participant request", "Other"):
+                chip = tk.Frame(
+                    chips_row, bg=theme.BG, highlightthickness=1,
+                    highlightbackground=theme.DIVIDER, highlightcolor=theme.DIVIDER,
+                )
+                chip.pack(side="left", padx=(0, 8))
+                label = tk.Label(chip, text=key, bg=theme.BG, fg=theme.INK, font=self._f_small)
+                label.pack(padx=12, pady=7)
+                state["chips"][key] = (chip, label)
+                for w in (chip, label):
+                    w.bind("<Button-1>", lambda _e, k=key: on_chip_click(k))
+                    w.configure(cursor="hand2")
+
+            note_entry = tk.Entry(
+                wrap, bg=theme.BG, fg=theme.INK, font=self._f_small, relief="flat",
+                highlightthickness=1, highlightbackground=theme.DIVIDER,
+                highlightcolor=theme.DIVIDER,
+            )
+            note_entry.pack(fill="x", ipady=6, pady=(0, 20))
+            state["note_entry"] = note_entry
+            state["note_state"] = _add_placeholder(note_entry, "Add a note (optional)")
+
+            cancel_row = tk.Frame(wrap, bg=theme.BG)
+            cancel_row.pack(fill="x")
+            self._build_button(
+                cancel_row, "Cancel", "ghost", None, self._close_modal,
+            ).pack(side="right")
+
+        self._open_modal(build)
+
+    # ── toast (copied from calibration_window, not imported, so the windows
+    #    stay independent) ────────────────────────────────────────────────────
+    def _show_toast(self, message: str) -> None:
+        if self._toast_after is not None:
+            self.after_cancel(self._toast_after)
+        self._toast_label.configure(text=message)
+        self._reset_toast_colors()
+        self._toast.place(in_=self._toast_parent, relx=1.0, x=0, y=0, anchor="ne")
+        self._toast.lift()
+        self._toast_after = self.after(_TOAST_TIMEOUT_MS, lambda: self._fade_toast(1))
+
+    def _fade_toast(self, step: int) -> None:
+        t = step / _FADE_STEPS
+        bg = _lerp(theme.ACCENT_10, theme.BG, t)
+        edge = _lerp(theme.ACCENT, theme.BG, t)
+        fg = _lerp(theme.ACCENT_700, theme.BG, t)
+        self._toast.configure(bg=bg, highlightbackground=edge, highlightcolor=edge)
+        self._toast_inner.configure(bg=bg)
+        self._toast_label.configure(bg=bg, fg=fg)
+        if step < _FADE_STEPS:
+            self._toast_after = self.after(_FADE_INTERVAL_MS, lambda: self._fade_toast(step + 1))
+        else:
+            self._toast_after = None
+            self._toast.place_forget()
+            self._reset_toast_colors()
+
+    def _reset_toast_colors(self) -> None:
+        self._toast.configure(
+            bg=theme.ACCENT_10, highlightbackground=theme.ACCENT, highlightcolor=theme.ACCENT
+        )
+        self._toast_inner.configure(bg=theme.ACCENT_10)
+        self._toast_label.configure(bg=theme.ACCENT_10, fg=theme.ACCENT_700)
+
+    # ── modal (Phase 3, E4/E5) ──────────────────────────────────────────────
+    def _open_modal(self, build_content: Callable[[tk.Frame], None]) -> None:
+        """Blocking modal as two borderless Toplevels -- tkinter frames have
+        no alpha, so the design's rgba(32,30,29,0.55) scrim can't be a single
+        widget (E4). Only one modal may be open at a time; opening a second
+        closes the first."""
+        self._close_modal()
+
+        scrim = tk.Toplevel(self)
+        scrim.overrideredirect(True)
+        scrim.transient(self)
+        scrim.attributes("-alpha", 0.55)
+        scrim.configure(bg=theme.INK)
+
+        panel = tk.Toplevel(self)
+        panel.overrideredirect(True)
+        panel.transient(self)
+        panel.configure(
+            bg=theme.BG, highlightthickness=2,
+            highlightbackground=theme.INK, highlightcolor=theme.INK,
+        )
+        inner = tk.Frame(panel, bg=theme.BG)
+        inner.pack()
+        build_content(inner)
+
+        self._modal_scrim = scrim
+        self._modal_panel = panel
+        self._reposition_modal()
+        scrim.lift()
+        panel.lift()
+
+        # The window is resizable(False, False) but can still be dragged, so
+        # both Toplevels have to follow it to stay aligned over the session.
+        self._modal_configure_id = self.bind(
+            "<Configure>", lambda _e: self._reposition_modal(),
+        )
+        panel.grab_set()
+
+    def _reposition_modal(self) -> None:
+        if self._modal_scrim is None or self._modal_panel is None:
+            return
+        self.update_idletasks()
+        x, y = self.winfo_rootx(), self.winfo_rooty()
+        w, h = self.winfo_width(), self.winfo_height()
+        self._modal_scrim.geometry(f"{w}x{h}+{x}+{y}")
+
+        panel = self._modal_panel
+        panel.update_idletasks()
+        pw, ph = panel.winfo_reqwidth(), panel.winfo_reqheight()
+        px, py = x + (w - pw) // 2, y + (h - ph) // 2
+        panel.geometry(f"{pw}x{ph}+{px}+{py}")
+
+    def _close_modal(self) -> None:
+        """Safe to call when no modal is open. Called unconditionally from
+        both _on_close and _handle_back (E5) so a modal held open at window
+        teardown can never leave a dangling grab."""
+        if self._modal_configure_id is not None:
+            self.unbind("<Configure>", self._modal_configure_id)
+            self._modal_configure_id = None
+        if self._modal_panel is not None:
+            self._modal_panel.grab_release()
+            self._modal_panel.destroy()
+            self._modal_panel = None
+        if self._modal_scrim is not None:
+            self._modal_scrim.destroy()
+            self._modal_scrim = None
 
     # ── camera lifecycle ────────────────────────────────────────────────────
+    def _open_camera(self) -> bool:
+        """Factored out of __init__ (Phase 6, mirrors
+        calibration_window._open_camera) so retry_camera() can reopen the
+        capture identically after a disconnect. Returns whether the camera
+        opened; callers own the resulting UI state -- this method touches
+        only self._cap."""
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened():
+            cap.release()
+            return False
+        cal_w, cal_h = self._cal.image_size
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cal_w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cal_h)
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0)
+        cap.set(cv2.CAP_PROP_EXPOSURE, -6)
+        self._cap = cap
+        return True
+
     def _poll(self) -> None:
+        # Mirrors calibration_window._poll's early-return shape -- a stopped
+        # capture must never reschedule itself (Phase 6).
+        if self._cap is None:
+            return
         ret, frame = self._cap.read()
         if ret:
+            self._read_fail_streak = 0
             if self._baseline["status"] == "capturing":
                 self._capture_baseline_frame(frame)
             display = self._tracker.undistort(frame)
@@ -807,23 +1601,197 @@ class SessionWindow(tk.Toplevel):
             photo = ImageTk.PhotoImage(img)
             self._feed_label.configure(image=photo)
             self._current_img = photo  # plain tk.Label drops the image without this ref
+            self._update_tracked_indicator(frame)
+        else:
+            # E9: a lone dropped read is normal 30fps jitter -- only a
+            # sustained streak means the camera actually disconnected.
+            self._read_fail_streak += 1
+            if self._read_fail_streak >= CAMERA_FAIL_POLLS:
+                self._set_camera_disconnected()
+                return  # disconnected state owns rescheduling from here (none, until retry)
         self._after_id = self.after(POLL_MS, self._poll)
 
+    def _set_camera_disconnected(self) -> None:
+        """E9: fires only after CAMERA_FAIL_POLLS consecutive failed reads.
+        Never touches self._tracker -- the baseline and all locked Kalman
+        states must survive a disconnect/reconnect cycle untouched
+        (CLAUDE.md; decision 5 of the design brief)."""
+        self._after_id = None
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+        self._disconnect_at = time.monotonic()
+        self._read_fail_streak = 0
+
+        self._feed_label.lower()
+        self._disconnected_panel.place(x=0, y=0, relwidth=1, relheight=1)
+        self._disconnected_panel.lift()
+        self._badge_container.lift()  # stays above the disconnected panel
+
+        if self._recording:
+            self._pause_timer()
+            self._show_rec_paused_badge()
+            self._paused_banner.pack(fill="x", pady=(0, 16), before=self._baseline_container)
+
+    def retry_camera(self) -> None:
+        """Public (Phase 6, mirrors CalibrationWindow.retry_camera): no-op
+        while a capture is already open; the disconnected panel's Retry
+        button is the only caller today."""
+        if self._cap is not None:
+            return
+        if not self._open_camera():
+            self._show_toast("Camera still unavailable — check the USB connection.")
+            return
+
+        self._disconnected_panel.place_forget()
+        self._paused_banner.pack_forget()
+        if self._recording:
+            self._show_rec_badge()
+            self._resume_timer()
+        self._read_fail_streak = 0
+        gap = round(time.monotonic() - self._disconnect_at)
+        self._show_toast(f"Camera reconnected — {gap}s gap")
+        self._poll()
+
+    # ── tracked-marker indicator (Phase 7, E2/E3) ───────────────────────────
+    def _update_tracked_indicator(self, raw_frame: np.ndarray) -> None:
+        """Throttled Tracker.process_frame() driving the {n}/99 TRACKED
+        badge. E2: gated on baseline_set -- before Capture Baseline there
+        are no Kalman states and process_frame() raises RuntimeError. Any
+        per-frame exception disables further attempts rather than risking
+        the live feed's poll loop."""
+        if not self._tracker.baseline_set or self._tracking_disabled:
+            return
+        self._frame_tick += 1
+        if self._frame_tick % TRACK_EVERY != 0:
+            return
+        try:
+            records = self._tracker.process_frame(raw_frame)
+        except Exception:
+            _log.exception("process_frame failed -- disabling tracked-marker indicator")
+            self._tracking_disabled = True
+            return
+        untracked = sum(r.autofilled for r in records)
+        self._set_tracked_badge(untracked)
+
+    def _set_tracked_badge(self, untracked: int) -> None:
+        tracked = TARGET_MARKERS - untracked
+        self._tracked_label.configure(text=f"{tracked} / {TARGET_MARKERS} TRACKED")
+
+        if untracked == 0:
+            tier = "calm"
+        elif untracked <= 5:
+            tier = "warning"
+        else:
+            tier = "alarm"
+        if tier != self._tracked_tier:
+            self._tracked_tier = tier
+            self._apply_tracked_tier(tier)
+
+        if self._tracked_badge.winfo_manager() != "pack":
+            self._tracked_badge.pack(side="left", padx=(8, 0))
+
+    def _apply_tracked_tier(self, tier: str) -> None:
+        """Reconfigures the existing badge widgets in place -- never
+        destroys/rebuilds them, since this runs at ~10Hz (TRACK_EVERY)."""
+        self._cancel_tracked_blink()
+        spec = _TRACKED_TIERS[tier]
+        self._paint_tracked(spec["fill"], spec["fg"], spec["border"], spec["dot"])
+        if tier == "alarm":
+            # E3: blink only the alarm tier -- REC's dot stays static, and
+            # the brief permits nothing more than this one deliberate pulse.
+            self._tracked_blink_state = False
+            self._tick_tracked_blink()
+
+    def _paint_tracked(
+        self, fill: str, fg: str, border: str | None, dot: str,
+    ) -> None:
+        self._tracked_badge.configure(bg=fill)
+        self._tracked_inner.configure(bg=fill)
+        self._tracked_label.configure(bg=fill, fg=fg)
+        self._tracked_dot.configure(bg=fill)
+        self._tracked_dot.itemconfigure(self._tracked_dot_id, fill=dot, outline=dot)
+        if border is not None:
+            self._tracked_badge.configure(
+                highlightthickness=1, highlightbackground=border, highlightcolor=border,
+            )
+        else:
+            self._tracked_badge.configure(highlightthickness=0)
+
+    def _tick_tracked_blink(self) -> None:
+        # ~600ms half-period -> ~1.2s full cycle, matching the design.
+        # Toggles only the fill (ACCENT <-> ACCENT_600); fg/dot already
+        # contrast against both, so they're left alone.
+        self._tracked_blink_state = not self._tracked_blink_state
+        fill = theme.ACCENT if self._tracked_blink_state else theme.ACCENT_600
+        self._tracked_badge.configure(bg=fill)
+        self._tracked_inner.configure(bg=fill)
+        self._tracked_label.configure(bg=fill)
+        self._tracked_dot.configure(bg=fill)
+        self._tracked_blink_after = self.after(600, self._tick_tracked_blink)
+
+    def _cancel_tracked_blink(self) -> None:
+        if self._tracked_blink_after is not None:
+            self.after_cancel(self._tracked_blink_after)
+            self._tracked_blink_after = None
+
     def release_camera(self) -> None:
-        if self._after_id is not None:
-            self.after_cancel(self._after_id)
-            self._after_id = None
+        for attr in ("_after_id", "_toast_after", "_rec_after_id", "_tracked_blink_after"):
+            pending = getattr(self, attr)
+            if pending is not None:
+                self.after_cancel(pending)
+                setattr(self, attr, None)
         if self._cap is not None:
             self._cap.release()
             self._cap = None
 
     def _handle_back(self) -> None:
+        self._close_modal()  # E5: never leave a grab held by a dead widget
         self.release_camera()
-        self._on_back()
+        self._on_back(None)  # ordinary Back carries no toast message (E1)
 
     def _on_close(self) -> None:
+        self._close_modal()  # E5: same guard as _handle_back
         self.release_camera()
         self.destroy()
+
+
+def _add_placeholder(entry: tk.Entry, text: str) -> dict:
+    """Grey placeholder that clears on focus and restores while empty.
+
+    Copied from new_participant_window.py, not imported -- see the
+    _build_button section's comment on this file's independence convention.
+    Returns the mutable state dict so callers can tell whether the field is
+    still showing placeholder text (i.e. effectively empty) rather than input.
+    """
+    state = {"placeholder": True}
+
+    def show() -> None:
+        entry.delete(0, "end")
+        entry.insert(0, text)
+        entry.configure(fg=theme.INK_55)
+        state["placeholder"] = True
+
+    def on_focus_in(_e: object) -> None:
+        if state["placeholder"]:
+            entry.delete(0, "end")
+            entry.configure(fg=theme.INK)
+            state["placeholder"] = False
+
+    def on_focus_out(_e: object) -> None:
+        if not entry.get():
+            show()
+
+    show()
+    entry.bind("<FocusIn>", on_focus_in)
+    entry.bind("<FocusOut>", on_focus_out)
+    return state
+
+
+def _lerp(from_hex: str, to_hex: str, t: float) -> str:
+    a = tuple(int(from_hex[i : i + 2], 16) for i in (1, 3, 5))
+    b = tuple(int(to_hex[i : i + 2], 16) for i in (1, 3, 5))
+    return "#%02x%02x%02x" % tuple(round(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
 def _fit_letterbox(img: Image.Image, box_w: int, box_h: int) -> Image.Image:

@@ -16,10 +16,12 @@ def main():
         cal_win.release_camera()
         cal_win.withdraw()
 
-        def restore_cal():
+        def restore_cal(message: str | None = None):
             session_win.destroy()
             cal_win.deiconify()
             cal_win.retry_camera()
+            if message is not None:
+                cal_win.show_toast(message)
 
         session_win = SessionWindow(
             app, on_back=restore_cal, detector_params=result.params,

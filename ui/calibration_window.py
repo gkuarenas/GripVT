@@ -641,7 +641,11 @@ class CalibrationWindow(tk.Toplevel):
         self._on_continue(result)
 
     # ── toast ───────────────────────────────────────────────────────────────
-    def _show_toast(self, message: str) -> None:
+    def show_toast(self, message: str) -> None:
+        """Public (E1): landing.restore_cal calls this from outside the class
+        after a Session-window Restart hands back a post-navigation message.
+        _show_toast alias kept below so every existing internal caller (this
+        file's own retry/detect-failure paths) still works unchanged."""
         if self._toast_after is not None:
             self.after_cancel(self._toast_after)
         self._toast_label.configure(text=message)
@@ -649,6 +653,8 @@ class CalibrationWindow(tk.Toplevel):
         self._toast.place(in_=self._toast_parent, relx=1.0, x=0, y=0, anchor="ne")
         self._toast.lift()
         self._toast_after = self.after(_TOAST_TIMEOUT_MS, lambda: self._fade_toast(1))
+
+    _show_toast = show_toast  # E1: private alias for this file's own callers
 
     def _fade_toast(self, step: int) -> None:
         t = step / _FADE_STEPS
