@@ -17,9 +17,10 @@ BASELINE_FRAMES = 15
 BASELINE_PRESENCE_FRACTION = 0.6
 # Max distance between detections across frames to count as the same
 # marker. The sensor doesn't move during baseline capture, so this only
-# needs to absorb centroid jitter -- well under half the ~60-90px marker
-# pitch, so adjacent markers can't get merged into one cluster.
-BASELINE_CLUSTER_RADIUS_PX = 15.0
+# needs to absorb centroid jitter -- well under half the 30-51px
+# rig-measured marker pitch, so adjacent markers can't get merged into
+# one cluster.
+BASELINE_CLUSTER_RADIUS_PX = 12.0
 BASELINE_COUNT_TOLERANCE = 5
 
 
