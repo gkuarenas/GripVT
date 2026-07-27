@@ -72,17 +72,14 @@ class _StubCaptureConnected:
         return True, self._frame
 
 
-@pytest.fixture(scope="module")
-def root():
-    # Module-scoped for the same reason as test_session_baseline_gate.py:
-    # per-test tk.Tk() create/destroy proved flaky on Windows.
-    try:
-        r = tk.Tk()
-    except tk.TclError:
-        pytest.skip("no Tk display available")
-    r.withdraw()
-    yield r
-    r.destroy()
+@pytest.fixture
+def root(tk_root):
+    # tk_root (tests/conftest.py) is session-scoped and shared with
+    # test_session_baseline_gate.py -- a second module-scoped tk.Tk() in this
+    # file intermittently raised TclError when both files ran in the same
+    # process (~1/3 of runs, reproduced directly). One process-wide root
+    # removes the destroy-then-create sequence between modules entirely.
+    return tk_root
 
 
 @pytest.fixture
@@ -120,7 +117,10 @@ def _finish_burst(win: SessionWindow, count: int) -> None:
 # ── transport state matrix ──────────────────────────────────────────────────
 # start_enabled = locked and not recording
 # stop_enabled  = recording
-# next_enabled  = locked and not recording and trial < trial_max
+# next_enabled  = locked and trial < trial_max  -- recording-independent
+#                 (E7 revision, rig-feedback correction: Start/Stop bracket
+#                 the whole session, not one trial, so Next Trial must stay
+#                 usable throughout)
 
 def test_transport_unlocked_idle(window):
     assert window._locked() is False
@@ -143,7 +143,9 @@ def test_transport_locked_recording(window):
     window._confirm_start()
     assert window._start_btn.enabled is False
     assert window._stop_btn.enabled is True
-    assert window._next_btn.enabled is False
+    # E7 revision: Next Trial is recording-independent -- Start/Stop bracket
+    # the whole session, not one trial, so it must stay enabled here.
+    assert window._next_btn.enabled is True
 
 
 def test_transport_locked_idle_trial_at_max(window):
@@ -394,6 +396,98 @@ def test_on_close_closes_open_modal(root, monkeypatch):
     assert win._modal_scrim is None
 
 
+# ── modal reposition + drag-to-move (rig-feedback correction, 2026-07-27) ───
+# A freshly-created overrideredirect Toplevel's geometry doesn't reliably
+# "stick" on Windows until the next event-loop tick, so _open_modal now
+# schedules a second _reposition_modal() via after_idle on top of the
+# immediate call. Since there's no OS titlebar on an overrideredirect
+# window, the panel also grew manual click-and-drag, bound directly to the
+# panel Toplevel so it never intercepts clicks on the content built inside.
+
+class _FakeEvent:
+    """Minimal stand-in for a tkinter Event -- carries only the attributes
+    _on_modal_drag_start/_on_modal_drag_motion read. Driving the real
+    <ButtonPress-1>/<B1-Motion> sequence via event_generate is unreliable
+    headlessly (no guarantee the synthetic pointer position lands on an
+    overrideredirect window), so the bound handlers are called directly."""
+
+    def __init__(self, x: int = 0, y: int = 0, x_root: int = 0, y_root: int = 0) -> None:
+        self.x = x
+        self.y = y
+        self.x_root = x_root
+        self.y_root = y_root
+
+
+def test_open_modal_schedules_idle_reposition(window, monkeypatch):
+    calls = []
+    original = window._reposition_modal
+
+    def spy():
+        calls.append(1)
+        original()
+
+    monkeypatch.setattr(window, "_reposition_modal", spy)
+    window._open_modal(lambda parent: None)
+    calls_after_open = len(calls)
+    assert calls_after_open >= 1  # the immediate call in _open_modal
+
+    # update_idletasks() drains pending idle callbacks (after_idle included)
+    # without needing a real running mainloop -- same idiom the rest of this
+    # file relies on via _reposition_modal's own self.update_idletasks() call.
+    window.update_idletasks()
+    assert len(calls) > calls_after_open  # the after_idle callback also ran
+
+    window._close_modal()
+
+
+def test_modal_drag_moves_panel_but_not_scrim(window):
+    window._open_modal(lambda parent: None)
+    panel, scrim = window._modal_panel, window._modal_scrim
+    window.update_idletasks()
+    scrim_geometry_before = scrim.geometry()
+
+    window._on_modal_drag_start(_FakeEvent(x=10, y=8))
+    window._on_modal_drag_motion(_FakeEvent(x=10, y=8, x_root=300, y_root=250))
+    window.update_idletasks()
+
+    assert panel.winfo_rootx() == 300 - 10
+    assert panel.winfo_rooty() == 250 - 8
+    assert scrim.geometry() == scrim_geometry_before  # dragging never touches the scrim
+
+    window._close_modal()
+
+
+def test_modal_drag_start_records_pointer_offset(window):
+    window._open_modal(lambda parent: None)
+
+    window._on_modal_drag_start(_FakeEvent(x=42, y=17))
+
+    assert window._modal_drag_offset == (42, 17)
+
+    window._close_modal()
+
+
+def test_close_modal_after_drag_is_clean(window):
+    window._open_modal(lambda parent: None)
+    window._on_modal_drag_start(_FakeEvent(x=5, y=5))
+    window._on_modal_drag_motion(_FakeEvent(x=5, y=5, x_root=200, y_root=200))
+
+    window._close_modal()
+
+    assert window._modal_panel is None
+    assert window._modal_scrim is None
+    assert window.grab_current() is None
+
+    # A stale after_idle(_reposition_modal) queued by the _open_modal call
+    # above may still be pending -- firing it post-close must be a silent
+    # no-op (guarded by the None checks at the top of _reposition_modal),
+    # never an exception.
+    window.update_idletasks()
+
+    # A drag motion event delivered after close must be equally inert.
+    window._on_modal_drag_motion(_FakeEvent(x=5, y=5, x_root=210, y_root=210))
+
+
 # ── E1 navigation contract ───────────────────────────────────────────────────
 
 def test_ordinary_back_calls_on_back_with_none(window):
@@ -500,3 +594,47 @@ def test_undo_clamps_at_one(window):
 
     assert window._trial == 1
     assert window._undo_available is False
+
+
+# ── Next Trial is recording-independent (E7 revision, rig-feedback
+# correction) -- Start/Stop bracket the whole 30-trial session, not one
+# trial, so Next Trial must stay usable both before and during recording. ──
+
+def test_next_trial_enabled_while_recording(window):
+    _finish_burst(window, 97)
+    window._confirm_start()
+    assert window._recording is True
+    assert window._next_btn.enabled is True
+
+
+def test_next_trial_advances_while_recording(window):
+    _finish_burst(window, 97)
+    window._confirm_start()
+    trial_before = window._trial
+
+    window._on_next_trial()  # must not be a guarded no-op while recording
+
+    assert window._trial == trial_before + 1
+    assert window._undo_available is True
+
+
+def test_next_trial_disabled_while_recording_at_trial_max(window):
+    _finish_burst(window, 97)
+    window._confirm_start()
+    window._trial = window._trial_max
+    window._refresh_transport()
+    assert window._recording is True
+    assert window._next_btn.enabled is False
+
+    window._on_next_trial()  # guarded no-op -- trial >= trial_max, recording or not
+
+    assert window._trial == window._trial_max
+
+
+def test_next_trial_disabled_while_unlocked_regardless_of_recording(window):
+    assert window._locked() is False
+    assert window._next_btn.enabled is False
+
+    window._on_next_trial()  # guarded no-op -- not locked
+
+    assert window._trial == 12  # unchanged from __init__'s placeholder

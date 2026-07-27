@@ -36,19 +36,15 @@ class _StubCapture:
         return False, None
 
 
-@pytest.fixture(scope="module")
-def root():
-    # Module-scoped: creating/destroying a fresh tk.Tk() root per test proved
-    # flaky on Windows (intermittent TclError under repeated rapid create/
-    # destroy). One root for the whole module, with a fresh SessionWindow
-    # Toplevel per test, is both faster and stable.
-    try:
-        r = tk.Tk()
-    except tk.TclError:
-        pytest.skip("no Tk display available")
-    r.withdraw()
-    yield r
-    r.destroy()
+@pytest.fixture
+def root(tk_root):
+    # tk_root (tests/conftest.py) is session-scoped, not module-scoped -- a
+    # second in-process tk.Tk() created after this module's own root had
+    # already run and torn down intermittently raised TclError once
+    # test_session_error_handling.py added a second Tk-based test module.
+    # One process-wide root, with a fresh SessionWindow Toplevel per test,
+    # avoids the destroy-then-create sequence that triggered it.
+    return tk_root
 
 
 @pytest.fixture

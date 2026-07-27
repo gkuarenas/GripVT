@@ -131,6 +131,9 @@ class SessionWindow(tk.Toplevel):
         self._modal_scrim: tk.Toplevel | None = None
         self._modal_panel: tk.Toplevel | None = None
         self._modal_configure_id: str | None = None
+        # Rig-feedback correction (2026-07-27): pointer offset from the
+        # panel's top-left at drag start, re-applied on every <B1-Motion>.
+        self._modal_drag_offset: tuple[int, int] = (0, 0)
 
         # Phase 6 (E9): consecutive failed cap.read()s since the last good
         # frame; _set_camera_disconnected fires once this hits
@@ -574,11 +577,20 @@ class SessionWindow(tk.Toplevel):
         """Recompute Start/Stop/Next Trial enabled state per the design's
         DCLogic (Phase 5). Called from _render_baseline (locked flips) and
         from _confirm_start/_confirm_stop (recording flips) -- every state
-        change that feeds these rules. trial/trial_max are E7 placeholders."""
+        change that feeds these rules. trial/trial_max are E7 placeholders.
+
+        Rig-feedback correction (2026-07-27, E7 revision): Next Trial is
+        deliberately recording-independent. Start/Stop bracket the *entire*
+        session, not one trial at a time, so Next Trial has to stay usable
+        both before and during an active recording to mark trial boundaries
+        inside that one continuous recording. Do not reintroduce a
+        `self._recording` term into next_trial_disabled -- that was the
+        original (wrong) rule, copied from a design mock that assumed
+        Start/Stop bracketed a single trial."""
         locked = self._locked()
         start_disabled = not locked or self._recording
         stop_disabled = not self._recording
-        next_trial_disabled = self._recording or not locked or self._trial >= self._trial_max
+        next_trial_disabled = not locked or self._trial >= self._trial_max
         self._start_btn.set_enabled(not start_disabled)
         self._stop_btn.set_enabled(not stop_disabled)
         self._next_btn.set_enabled(not next_trial_disabled)
@@ -1142,9 +1154,10 @@ class SessionWindow(tk.Toplevel):
         self._open_stop_bookend_modal()
 
     def _on_next_trial(self) -> None:
-        # Mirrors _refresh_transport's nextTrialDisabled rule (Phase 8, E7) --
-        # guards a stray call the same way _on_start/_on_stop already do.
-        next_trial_disabled = self._recording or not self._locked() or self._trial >= self._trial_max
+        # Mirrors _refresh_transport's nextTrialDisabled rule (Phase 8, E7,
+        # recording-independent per the rig-feedback correction) -- guards a
+        # stray call the same way _on_start/_on_stop already do.
+        next_trial_disabled = not self._locked() or self._trial >= self._trial_max
         if next_trial_disabled:
             return
         self._trial = min(self._trial_max, self._trial + 1)
@@ -1526,6 +1539,14 @@ class SessionWindow(tk.Toplevel):
         self._modal_scrim = scrim
         self._modal_panel = panel
         self._reposition_modal()
+        # Rig-feedback correction (2026-07-27): on Windows a freshly-created
+        # overrideredirect Toplevel's initial geometry doesn't reliably
+        # "stick" before the next event-loop tick -- on the rig this landed
+        # the modal pinned at the desktop's top-left instead of centered.
+        # Re-applying once more once the loop goes idle fixes it. Safe even
+        # if the modal has since closed: _reposition_modal no-ops when
+        # _modal_scrim/_modal_panel are None.
+        self.after_idle(self._reposition_modal)
         scrim.lift()
         panel.lift()
 
@@ -1534,6 +1555,23 @@ class SessionWindow(tk.Toplevel):
         self._modal_configure_id = self.bind(
             "<Configure>", lambda _e: self._reposition_modal(),
         )
+
+        # Manual drag-to-move (rig-feedback correction, 2026-07-27): an
+        # overrideredirect Toplevel has no OS titlebar to grab, so dragging
+        # the panel is the permanent fallback regardless of whether the idle
+        # re-position above also fixes the underlying race. Bound directly
+        # to the panel Toplevel itself, not its content children, so
+        # grabbing empty panel background moves it while clicks on the
+        # buttons/entries/chips built by build_content keep their own
+        # bindings untouched. Only the panel moves -- the scrim is left
+        # alone here and keeps tracking the session window via the
+        # <Configure> binding above, so it still covers the whole window.
+        # A fresh bind per _open_modal call (panel is a new Toplevel every
+        # time); destroying the Toplevel in _close_modal removes these
+        # bindings with it, so there is nothing to unbind explicitly.
+        panel.bind("<ButtonPress-1>", self._on_modal_drag_start)
+        panel.bind("<B1-Motion>", self._on_modal_drag_motion)
+
         panel.grab_set()
 
     def _reposition_modal(self) -> None:
@@ -1549,6 +1587,25 @@ class SessionWindow(tk.Toplevel):
         pw, ph = panel.winfo_reqwidth(), panel.winfo_reqheight()
         px, py = x + (w - pw) // 2, y + (h - ph) // 2
         panel.geometry(f"{pw}x{ph}+{px}+{py}")
+
+    def _on_modal_drag_start(self, event: tk.Event) -> None:
+        """<ButtonPress-1> on the panel Toplevel -- event.x/y are already
+        panel-relative because the binding is on the panel itself, so this
+        is directly the pointer's offset from the panel's top-left."""
+        self._modal_drag_offset = (event.x, event.y)
+
+    def _on_modal_drag_motion(self, event: tk.Event) -> None:
+        """<B1-Motion> on the panel Toplevel. Moves only the panel -- the
+        scrim is meant to keep covering the whole session window and stays
+        aligned to it via the <Configure> binding in _open_modal, not via
+        drag. Guarded the same way _reposition_modal is, in case a queued
+        motion event still lands after the modal has closed mid-drag."""
+        if self._modal_panel is None:
+            return
+        offset_x, offset_y = self._modal_drag_offset
+        x = event.x_root - offset_x
+        y = event.y_root - offset_y
+        self._modal_panel.geometry(f"+{x}+{y}")
 
     def _close_modal(self) -> None:
         """Safe to call when no modal is open. Called unconditionally from
