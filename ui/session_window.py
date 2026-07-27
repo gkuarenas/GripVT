@@ -453,8 +453,19 @@ class SessionWindow(tk.Toplevel):
         row = tk.Frame(self._strip, bg=fill)
         row.pack(fill="x", padx=14, pady=10)
 
+        # D2: Re-capture is disabled the moment Start is pressed, permanently.
+        # Packed before `left` so it claims its natural width first -- `left`
+        # fills+expands into the remainder, so a long subline never squeezes
+        # the button down to an unreadable sliver.
+        enabled = not self._recording_started
+        self._strip_recapture_btn = self._build_button(
+            row, "Re-capture", "ghost", None, self._on_recapture_baseline_click,
+            enabled=enabled, bg_override=fill,
+        )
+        self._strip_recapture_btn.pack(side="right")
+
         left = tk.Frame(row, bg=fill)
-        left.pack(side="left", fill="x", expand=True)
+        left.pack(side="left", fill="x", expand=True, padx=(0, 10))
         self._check_icon_square(left, icon_bg).pack(side="left", padx=(0, 10))
 
         text_col = tk.Frame(left, bg=fill)
@@ -477,16 +488,8 @@ class SessionWindow(tk.Toplevel):
             count_text += f" · {b['subline']}"
         tk.Label(
             text_col, text=count_text, bg=fill, fg=theme.INK_60, font=self._f_strip_subline,
-            anchor="w",
+            anchor="w", wraplength=220, justify="left",
         ).pack(fill="x", pady=(2, 0))
-
-        # D2: Re-capture is disabled the moment Start is pressed, permanently.
-        enabled = not self._recording_started
-        self._strip_recapture_btn = self._build_button(
-            row, "Re-capture", "ghost", None, self._on_recapture_baseline_click,
-            enabled=enabled, bg_override=fill,
-        )
-        self._strip_recapture_btn.pack(side="right")
 
     def _compute_subline(self, corners: dict[str, int]) -> str:
         result = self._calibration_result
