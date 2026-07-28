@@ -1391,6 +1391,11 @@ class SessionWindow(tk.Toplevel):
         self._trial_log.close_trial(self._segment_id, now_ms(self._t0_wall_ms, self._t0_monotonic))
         if discard_open_segment:
             self._writer.discard_window()
+            # Rig-found 2026-07-28: without this, a Restart-discarded segment
+            # still showed up in trials.csv as a real, non-voided, completed
+            # trial (valid start_ts/end_ts) despite having zero markers.csv
+            # rows -- indistinguishable from genuine (empty) data.
+            self._trial_log.void_trial(self._segment_id)
         else:
             self._writer.write_window()
 
@@ -2036,6 +2041,13 @@ class SessionWindow(tk.Toplevel):
         self._on_back(None)  # ordinary Back carries no toast message (E1)
 
     def _on_close(self) -> None:
+        """Default WM_DELETE_WINDOW handler -- SessionWindow's own fallback
+        if constructed without an overriding caller (e.g. headless tests).
+        landing.py's real app flow registers its own protocol handler after
+        construction (2026-07-28 rig finding: that override skipped
+        _finalize_recording entirely, since Tk keeps only one handler per
+        protocol name and the later registration wins) -- see landing.py's
+        open_session() for the real X-button path."""
         self._close_modal()  # E5: same guard as _handle_back
         self._finalize_recording("closed")  # D8: every exit path finalizes
         self.release_camera()

@@ -27,8 +27,21 @@ def main():
             app, on_back=restore_cal, detector_params=result.params,
             calibration_result=result, participant=record,
         )
+        # Titlebar X quits the whole program, same as every other window in
+        # this flow -- but unlike New Participant/Calibration, Session may
+        # have an open recording. This overrides SessionWindow's own
+        # _on_close (session_window.py) since Tk keeps only one handler per
+        # protocol name, so finalize has to happen here explicitly or an
+        # in-progress recording's trials.csv/events.json/overlay.png are
+        # lost silently (rig-found 2026-07-28: closing via X left only
+        # markers.csv on disk).
         session_win.protocol(
-            "WM_DELETE_WINDOW", lambda: (session_win.release_camera(), app.destroy())
+            "WM_DELETE_WINDOW",
+            lambda: (
+                session_win._finalize_recording("closed"),
+                session_win.release_camera(),
+                app.destroy(),
+            ),
         )
 
     def open_calibration(np_win, record):

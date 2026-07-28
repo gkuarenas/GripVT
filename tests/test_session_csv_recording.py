@@ -597,6 +597,12 @@ def test_restart_session_aborts_open_segment_keeps_committed_trial(connected_win
         trial_rows = {r["trial_id"]: r for r in csv.DictReader(f)}
     assert trial_rows["0"]["voided"] == "False"
     assert trial_rows["0"]["end_ts"] != ""
+    # Rig-found 2026-07-28 (participant008): the discarded in-progress
+    # segment must be voided too, or trials.csv shows a "completed, valid"
+    # trial with zero markers.csv rows behind it -- indistinguishable from
+    # real (empty) data.
+    assert trial_rows["1"]["voided"] == "True"
+    assert trial_rows["1"]["end_ts"] != ""
 
     with open(os.path.join(session_dir, "events.json")) as f:
         envelope = json.load(f)
@@ -630,6 +636,10 @@ def test_restart_all_aborts_open_segment_with_scope_all(connected_window, tmp_pa
     aborts = [e for e in envelope["events"] if e["type"] == "session_aborted"]
     assert len(aborts) == 1
     assert aborts[0]["scope"] == "all"
+
+    with open(os.path.join(session_dir, "trials.csv"), newline="") as f:
+        trial_rows = {r["trial_id"]: r for r in csv.DictReader(f)}
+    assert trial_rows["0"]["voided"] == "True"
 
     assert win._writer is None
     assert win._trial_log is None
