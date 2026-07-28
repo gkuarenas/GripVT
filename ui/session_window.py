@@ -1395,10 +1395,19 @@ class SessionWindow(tk.Toplevel):
             self._writer.write_window()
 
         if self._last_records is not None and self._tracker.last_undistorted is not None:
-            overlay = draw_overlay(
-                self._tracker.last_undistorted, self._last_records, True, self._tracker.frame_index,
-            )
-            cv2.imwrite(self._writer.png_path, overlay)
+            # Best-effort visualization -- must never block the data-integrity
+            # flushes below it. A failure here previously left trials.csv and
+            # events.json unwritten even though markers.csv had already
+            # committed (found via rig verification 2026-07-28: closing the
+            # window mid-recording produced markers.csv alone).
+            try:
+                overlay = draw_overlay(
+                    self._tracker.last_undistorted, self._last_records, True,
+                    self._tracker.frame_index,
+                )
+                cv2.imwrite(self._writer.png_path, overlay)
+            except Exception:
+                _log.exception("overlay.png write failed during _finalize_recording")
 
         self._trial_log.flush()
         self._event_log.flush()

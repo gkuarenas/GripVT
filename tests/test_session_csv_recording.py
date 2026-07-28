@@ -659,3 +659,91 @@ def test_restart_before_start_is_noop(connected_window, tmp_path):
     assert not any(
         name.startswith("session") for name in os.listdir(win._participant.folder)
     )
+
+
+def test_close_after_committed_trial_still_finalizes(connected_window, tmp_path):
+    """Rig-found bug (2026-07-28, participant007 session5): closing the
+    window after at least one Next-Trial commit is a different code path
+    from closing an untouched first segment -- test_handle_back/on_close_
+    finalizes_recording_mid_session above only ever exercise a single,
+    never-committed segment. This reproduces the real sequence: commit one
+    segment via Next Trial, then close mid-second-segment."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    for _ in range(3):
+        win._poll()
+    win._on_next_trial()
+    for _ in range(3):
+        win._poll()
+
+    win._handle_back()
+
+    assert win._writer is None
+    assert win._trial_log is None
+    assert win._event_log is None
+
+    markers_csv = os.path.join(session_dir, "markers.csv")
+    trials_csv = os.path.join(session_dir, "trials.csv")
+    events_json = os.path.join(session_dir, "events.json")
+    overlay_png = os.path.join(session_dir, "overlay.png")
+    for path in (markers_csv, trials_csv, events_json, overlay_png):
+        assert os.path.exists(path), path
+
+    with open(markers_csv, newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 6 * MARKER_COUNT
+    trial_ids = sorted(set(r["trial_id"] for r in rows))
+    assert trial_ids == ["0", "1"]
+
+    with open(trials_csv, newline="") as f:
+        trial_rows = list(csv.DictReader(f))
+    assert len(trial_rows) == 2
+    assert all(r["end_ts"] != "" for r in trial_rows), "both segments must be closed"
+
+
+def test_finalize_survives_overlay_failure(connected_window, tmp_path, monkeypatch):
+    """The actual guarantee behind the fix above: a failure while drawing/
+    writing overlay.png (a best-effort visualization) must never prevent
+    trials.csv/events.json from being flushed or the writer from closing --
+    those are the data-integrity-critical files. Forces draw_overlay to
+    raise and asserts finalize still completes correctly."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+
+    def _boom(*args, **kwargs):
+        raise ValueError("simulated overlay failure")
+
+    monkeypatch.setattr(session_window_module, "draw_overlay", _boom)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    for _ in range(3):
+        win._poll()
+
+    win._handle_back()  # must not raise, despite draw_overlay blowing up
+
+    assert win._writer is None
+    assert win._trial_log is None
+    assert win._event_log is None
+
+    trials_csv = os.path.join(session_dir, "trials.csv")
+    events_json = os.path.join(session_dir, "events.json")
+    markers_csv = os.path.join(session_dir, "markers.csv")
+    for path in (markers_csv, trials_csv, events_json):
+        assert os.path.exists(path), path
+
+    with open(trials_csv, newline="") as f:
+        trial_rows = list(csv.DictReader(f))
+    assert trial_rows[0]["end_ts"] != ""
+
+    with open(events_json) as f:
+        json.load(f)  # parses cleanly
