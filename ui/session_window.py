@@ -579,18 +579,20 @@ class SessionWindow(tk.Toplevel):
         from _confirm_start/_confirm_stop (recording flips) -- every state
         change that feeds these rules. trial/trial_max are E7 placeholders.
 
-        Rig-feedback correction (2026-07-27, E7 revision): Next Trial is
-        deliberately recording-independent. Start/Stop bracket the *entire*
-        session, not one trial at a time, so Next Trial has to stay usable
-        both before and during an active recording to mark trial boundaries
-        inside that one continuous recording. Do not reintroduce a
-        `self._recording` term into next_trial_disabled -- that was the
-        original (wrong) rule, copied from a design mock that assumed
-        Start/Stop bracketed a single trial."""
+        Rig-feedback correction (2026-07-27, E7 revision): Next Trial stays
+        usable throughout an active recording -- Start/Stop bracket the
+        *entire* session, not one trial, so Next Trial marks trial
+        boundaries mid-recording.
+
+        2026-07-28 correction: that recording-independence does not extend
+        to *before* Start. self._trial's value at Start becomes the
+        persisted trial_index for the first segment (see D9-addendum), so a
+        pre-Start Next Trial/Undo click would silently mislabel it -- gate
+        on self._recording too."""
         locked = self._locked()
         start_disabled = not locked or self._recording
         stop_disabled = not self._recording
-        next_trial_disabled = not locked or self._trial >= self._trial_max
+        next_trial_disabled = not locked or not self._recording or self._trial >= self._trial_max
         self._start_btn.set_enabled(not start_disabled)
         self._stop_btn.set_enabled(not stop_disabled)
         self._next_btn.set_enabled(not next_trial_disabled)
