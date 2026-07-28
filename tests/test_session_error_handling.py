@@ -117,10 +117,10 @@ def _finish_burst(win: SessionWindow, count: int) -> None:
 # ── transport state matrix ──────────────────────────────────────────────────
 # start_enabled = locked and not recording
 # stop_enabled  = recording
-# next_enabled  = locked and trial < trial_max  -- recording-independent
-#                 (E7 revision, rig-feedback correction: Start/Stop bracket
-#                 the whole session, not one trial, so Next Trial must stay
-#                 usable throughout)
+# next_enabled  = locked and recording and trial < trial_max  -- usable
+#                 throughout an active recording (E7 revision, rig-feedback
+#                 correction), but not before Start (2026-07-28 correction,
+#                 D9-addendum: self._trial at Start becomes persisted data)
 
 def test_transport_unlocked_idle(window):
     assert window._locked() is False
@@ -135,7 +135,7 @@ def test_transport_locked_idle(window):
     assert window._trial < window._trial_max
     assert window._start_btn.enabled is True
     assert window._stop_btn.enabled is False
-    assert window._next_btn.enabled is True
+    assert window._next_btn.enabled is False
 
 
 def test_transport_locked_recording(window):
@@ -596,9 +596,9 @@ def test_undo_clamps_at_one(window):
     assert window._undo_available is False
 
 
-# ── Next Trial is recording-independent (E7 revision, rig-feedback
-# correction) -- Start/Stop bracket the whole 30-trial session, not one
-# trial, so Next Trial must stay usable both before and during recording. ──
+# ── Next Trial stays usable throughout an active recording (E7 revision,
+# rig-feedback correction) -- Start/Stop bracket the whole 30-trial session,
+# not one trial. It is gated off before Start (2026-07-28, D9-addendum). ──
 
 def test_next_trial_enabled_while_recording(window):
     _finish_burst(window, 97)

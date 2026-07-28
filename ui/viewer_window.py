@@ -156,7 +156,7 @@ class ViewerWindow(ctk.CTk):
             self._start_session()
 
     def _start_session(self) -> None:
-        session_dir = make_session_dir()
+        session_dir = make_session_dir("recordings/_viewer_scratch")
         self._session_writer = CSVWriter(session_dir)
         self._session_t0 = time.monotonic()
         self._session_active = True
