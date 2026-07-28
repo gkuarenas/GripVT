@@ -32,6 +32,7 @@ lockout, and the bookend confirm flow.
 import logging
 import time
 import tkinter as tk
+from datetime import datetime
 from tkinter import font as tkfont
 from typing import Callable
 
@@ -42,10 +43,14 @@ from PIL import Image, ImageTk
 from core.calibration import CameraCalibration
 from core.detector_search import MIN_ACCEPTABLE, TARGET_MARKERS, SearchResult, region_counts
 from core.roi import DEFAULT_ALPHA, ROICrop
-from core.tracker import BASELINE_FRAMES, Tracker
+from core.tracker import BASELINE_FRAMES, MarkerRecord, Tracker
 from output import participants
 from output.participants import ParticipantRecord
+from output.writer import (
+    CSVWriter, EventLog, TrialLog, anchor_wall_clock, make_session_dir, now_ms,
+)
 from ui import theme
+from ui.overlay import draw_overlay
 
 _log = logging.getLogger(__name__)
 
@@ -64,6 +69,19 @@ CAMERA_FAIL_POLLS = 15  # ~0.5s at POLL_MS
 # Full detect+Kalman+Hungarian per frame at 30fps is more work than the
 # indicator needs -- ~10Hz is well past human-perceptible for a count badge.
 TRACK_EVERY = 3
+
+# D3 (session CSV recording plan): while a recording is active, process_frame()
+# runs every poll instead of throttled at TRACK_EVERY -- the CSV needs every
+# frame, unlike the count badge. Bump to 2 (~15Hz) only after an empirical rig
+# test shows 30Hz drops frames; see docs/logs/20260728_121200_session_csv_
+# recording_plan.md D3. A change away from 1 logs one rate_fallback event at
+# Start (static config check, not a dynamic heuristic).
+RECORDING_TRACK_EVERY = 1
+
+# D7: force-commit buffered markers.csv rows before they grow past this many
+# buffered frames (~60s at 30fps), so an unbroken recording with no Next
+# Trial press can't hold an unbounded amount of uncommitted data in RAM.
+MAX_BUFFER_FRAMES = 1800
 
 _TOAST_TIMEOUT_MS = 5000
 _FADE_STEPS = 8
@@ -157,6 +175,29 @@ class SessionWindow(tk.Toplevel):
         # block; _recording_started (D2) latches True forever on first Start
         # and permanently disables Re-capture -- the two must not merge.
         self._recording = False
+        # Phase 3 (session CSV recording plan): writer/log handles exist only
+        # while a session dir is open -- _finalize_recording nulls all three
+        # together, so "is a writer open" always has one source of truth
+        # (self._writer is not None), never a second flag to drift out of sync.
+        self._writer: CSVWriter | None = None
+        self._trial_log: TrialLog | None = None
+        self._event_log: EventLog | None = None
+        # Phase 5: the still-open camera_loss event dict, or None -- appended
+        # to self._event_log in _set_camera_disconnected and closed (end_ts
+        # set) in retry_camera or _finalize_recording. EventLog.append() just
+        # appends this same dict reference to its internal list, so mutating
+        # it in place after append is safe and needs no second lookup.
+        self._open_camera_loss_event: dict | None = None
+        # D2: monotonic trial-segment ordinal, distinct from self._trial (the
+        # operator-facing counter) -- never reused, never decremented by Undo.
+        self._segment_id = 0
+        # Latest process_frame() records, refreshed on every call (recording
+        # or not) -- _finalize_recording needs these for the overlay PNG.
+        self._last_records: list[MarkerRecord] | None = None
+        # D1: anchored together at confirmed Start via anchor_wall_clock();
+        # every buffered timestamp derives from these two via now_ms().
+        self._t0_wall_ms: float = 0.0
+        self._t0_monotonic: float = 0.0
         # E7: in-window placeholder trial state only -- no real sequencing
         # exists yet. Named attributes (not literals) so Phase 8 only has to
         # assign real values instead of rewiring _refresh_transport.
@@ -1162,7 +1203,23 @@ class SessionWindow(tk.Toplevel):
         next_trial_disabled = not self._locked() or self._trial >= self._trial_max
         if next_trial_disabled:
             return
+        if self._trial_log is not None:
+            # D9: persist the trial boundary only while a recording is open
+            # -- guard on _trial_log, not self._recording, so the two can
+            # never disagree. Commits the segment that's ending, then opens
+            # the next one under a fresh, never-reused segment_id (D2).
+            assert self._writer is not None
+            self._writer.write_window()
+            self._trial_log.close_trial(
+                self._segment_id, now_ms(self._t0_wall_ms, self._t0_monotonic),
+            )
+            self._segment_id += 1
         self._trial = min(self._trial_max, self._trial + 1)
+        if self._trial_log is not None:
+            self._trial_log.open_trial(
+                trial_id=self._segment_id, trial_index=self._trial,
+                start_ts=now_ms(self._t0_wall_ms, self._t0_monotonic),
+            )
         self._undo_available = True
         self._refresh_trial_block()
         self._refresh_transport()
@@ -1170,6 +1227,26 @@ class SessionWindow(tk.Toplevel):
     def _on_undo_trial(self) -> None:
         if not self._undo_available:
             return
+        if self._trial_log is not None:
+            # D2 tombstone: void the segment Next Trial just closed and
+            # committed (self._segment_id - 1) -- its markers.csv rows stay
+            # on disk untouched, only trials.csv's voided flag flips.
+            assert self._writer is not None
+            self._trial_log.void_trial(self._segment_id - 1)
+            # The just-opened segment (self._segment_id) is still in
+            # progress -- discard whatever it has buffered so far (could be
+            # zero or a few frames) and re-open it fresh for the redo.
+            # open_trial() only stages a row in memory (trials.csv is only
+            # written by flush()), so overwriting that entry here leaves no
+            # "completed" row behind for a segment that never happened.
+            # self._segment_id itself is never decremented (D2) -- only
+            # self._trial, the displayed counter, moves back.
+            self._writer.discard_window()
+            redo_trial_index = max(1, self._trial - 1)
+            self._trial_log.open_trial(
+                trial_id=self._segment_id, trial_index=redo_trial_index,
+                start_ts=now_ms(self._t0_wall_ms, self._t0_monotonic),
+            )
         self._trial = max(1, self._trial - 1)
         self._undo_available = False
         self._refresh_trial_block()
@@ -1239,6 +1316,36 @@ class SessionWindow(tk.Toplevel):
         self._refresh_transport()
         print("Start clicked")
 
+        # D5/D8: degrade to a no-op, mirroring _save_baseline_record's guard
+        # (self._participant is None is the headless/test-fixture path) --
+        # never crash, never write to the project root.
+        if self._participant is None:
+            return
+        session_dir = make_session_dir(self._participant.folder)
+        self._writer = CSVWriter(session_dir)
+        self._trial_log = TrialLog(session_dir)
+        self._event_log = EventLog(
+            session_dir,
+            participant_id=self._participant.participant_id,
+            started_at=datetime.now().isoformat(timespec="seconds"),
+            frame_index_at_start=self._tracker.frame_index,
+        )
+        self._t0_wall_ms, self._t0_monotonic = anchor_wall_clock()
+        self._segment_id = 0
+        self._trial_log.open_trial(
+            trial_id=self._segment_id, trial_index=self._trial,
+            start_ts=now_ms(self._t0_wall_ms, self._t0_monotonic),
+        )
+        if RECORDING_TRACK_EVERY != 1:
+            # D3 approved addition: a static config check, not a dynamic
+            # heuristic -- fires once, here, if RECORDING_TRACK_EVERY is ever
+            # manually bumped after a rig test shows 30Hz drops frames.
+            self._event_log.append({
+                "type": "rate_fallback",
+                "target_hz": 30 / RECORDING_TRACK_EVERY,
+                "ts": now_ms(self._t0_wall_ms, self._t0_monotonic),
+            })
+
     def _confirm_stop(self) -> None:
         self._close_modal()
         self._recording = False
@@ -1250,6 +1357,55 @@ class SessionWindow(tk.Toplevel):
         self._stop_timer()
         self._refresh_transport()
         print("Stop clicked")
+        self._finalize_recording("stopped")
+
+    def _buffer_recording_frame(self, records: list[MarkerRecord]) -> None:
+        """D7: appends one frame to the CSVWriter's in-RAM buffer and force-
+        commits early if it has grown past MAX_BUFFER_FRAMES, so a long
+        unbroken recording can't hold unbounded uncommitted data."""
+        assert self._writer is not None and self._event_log is not None
+        ts = now_ms(self._t0_wall_ms, self._t0_monotonic)
+        self._writer.buffer_frame(records, self._tracker.frame_index, ts, trial_id=self._segment_id)
+        if self._writer.pending_count >= MAX_BUFFER_FRAMES:
+            self._writer.write_window()
+            self._event_log.append({
+                "type": "buffer_flushed",
+                "frame_count": MAX_BUFFER_FRAMES,
+                "ts": now_ms(self._t0_wall_ms, self._t0_monotonic),
+            })
+
+    def _finalize_recording(self, reason: str, discard_open_segment: bool = False) -> None:
+        """General-purpose recording finalizer (D8) -- Phase 3's only caller
+        is _confirm_stop, always with the default (commit, not discard).
+        Later phases (camera-loss hooks, exit paths, Restart) call this too,
+        some with discard_open_segment=True; `reason` is accepted now so
+        those callers don't need a second finalize signature -- Phase 3 does
+        not itself log it anywhere.
+        """
+        if self._writer is None:
+            return
+        assert self._trial_log is not None and self._event_log is not None
+        if self._open_camera_loss_event is not None:
+            self._open_camera_loss_event["end_ts"] = now_ms(self._t0_wall_ms, self._t0_monotonic)
+            self._open_camera_loss_event = None
+        self._trial_log.close_trial(self._segment_id, now_ms(self._t0_wall_ms, self._t0_monotonic))
+        if discard_open_segment:
+            self._writer.discard_window()
+        else:
+            self._writer.write_window()
+
+        if self._last_records is not None and self._tracker.last_undistorted is not None:
+            overlay = draw_overlay(
+                self._tracker.last_undistorted, self._last_records, True, self._tracker.frame_index,
+            )
+            cv2.imwrite(self._writer.png_path, overlay)
+
+        self._trial_log.flush()
+        self._event_log.flush()
+        self._writer.close()
+        self._writer = None
+        self._trial_log = None
+        self._event_log = None
 
     # ── REC / REC PAUSED / TRACKED badge helpers (Phase 6/7) ────────────────
     def _show_rec_badge(self) -> None:
@@ -1347,11 +1503,20 @@ class SessionWindow(tk.Toplevel):
             return entry.get()
 
         def confirm_session() -> None:
-            # E8: reason/note are not persisted -- an abort record needs
-            # sessionN_<ts>/ directories, which need the make_session_dir
-            # retarget and session numbering (both out of scope here; see
-            # docs/checklist/session_recording_checklist.md).
-            print(f"Restart Session clicked — reason={state['reason']!r} note={note_text()!r}")
+            # D6: Restart aborts the in-progress segment -- log the reason/
+            # note as a session_aborted event, then discard the uncommitted
+            # buffer (already-committed trials stay on disk untouched). No
+            # event log exists if Restart was pressed before any Start, in
+            # which case there is nothing to record.
+            if self._event_log is not None:
+                self._event_log.append({
+                    "type": "session_aborted",
+                    "scope": "session",
+                    "reason": state["reason"],
+                    "note": note_text(),
+                    "ts": now_ms(self._t0_wall_ms, self._t0_monotonic),
+                })
+                self._finalize_recording("restart", discard_open_segment=True)
             self._close_modal()
             self.release_camera()
             self._on_back(
@@ -1359,10 +1524,16 @@ class SessionWindow(tk.Toplevel):
             )
 
         def confirm_all() -> None:
-            print(
-                f"Restart Entire Testing clicked — reason={state['reason']!r} "
-                f"note={note_text()!r}"
-            )
+            # D6: same abort handling as confirm_session, scope="all".
+            if self._event_log is not None:
+                self._event_log.append({
+                    "type": "session_aborted",
+                    "scope": "all",
+                    "reason": state["reason"],
+                    "note": note_text(),
+                    "ts": now_ms(self._t0_wall_ms, self._t0_monotonic),
+                })
+                self._finalize_recording("restart", discard_open_segment=True)
             self._close_modal()
             self.release_camera()
             self._on_back(
@@ -1691,6 +1862,12 @@ class SessionWindow(tk.Toplevel):
             self._pause_timer()
             self._show_rec_paused_badge()
             self._paused_banner.pack(fill="x", pady=(0, 16), before=self._baseline_container)
+            if self._event_log is not None:
+                self._open_camera_loss_event = {
+                    "type": "camera_loss",
+                    "start_ts": now_ms(self._t0_wall_ms, self._t0_monotonic),
+                }
+                self._event_log.append(self._open_camera_loss_event)
 
     def retry_camera(self) -> None:
         """Public (Phase 6, mirrors CalibrationWindow.retry_camera): no-op
@@ -1707,6 +1884,9 @@ class SessionWindow(tk.Toplevel):
         if self._recording:
             self._show_rec_badge()
             self._resume_timer()
+            if self._open_camera_loss_event is not None:
+                self._open_camera_loss_event["end_ts"] = now_ms(self._t0_wall_ms, self._t0_monotonic)
+                self._open_camera_loss_event = None
         self._read_fail_streak = 0
         gap = round(time.monotonic() - self._disconnect_at)
         self._show_toast(f"Camera reconnected — {gap}s gap")
@@ -1718,20 +1898,56 @@ class SessionWindow(tk.Toplevel):
         badge. E2: gated on baseline_set -- before Capture Baseline there
         are no Kalman states and process_frame() raises RuntimeError. Any
         per-frame exception disables further attempts rather than risking
-        the live feed's poll loop."""
+        the live feed's poll loop.
+
+        D3 (session CSV recording plan): while self._recording, the
+        process_frame() call itself runs every poll (RECORDING_TRACK_EVERY)
+        instead of throttled at TRACK_EVERY, so no frame is lost to the CSV
+        -- but the badge repaint stays throttled at TRACK_EVERY regardless,
+        since a count label doesn't need to redraw at 30Hz.
+        """
         if not self._tracker.baseline_set or self._tracking_disabled:
             return
         self._frame_tick += 1
-        if self._frame_tick % TRACK_EVERY != 0:
+        track_every = RECORDING_TRACK_EVERY if self._recording else TRACK_EVERY
+        should_process = self._frame_tick % track_every == 0
+        should_repaint = self._frame_tick % TRACK_EVERY == 0
+        if not should_process and not should_repaint:
             return
         try:
             records = self._tracker.process_frame(raw_frame)
-        except Exception:
+        except Exception as e:
             _log.exception("process_frame failed -- disabling tracked-marker indicator")
             self._tracking_disabled = True
+            if self._recording:
+                # D8: a dead tracker must not leave a REC badge counting over
+                # a writer that will never receive another frame -- log the
+                # failure and finalize now, same as any other exit path.
+                if self._event_log is not None:
+                    self._event_log.append({
+                        "type": "tracking_failed",
+                        "ts": now_ms(self._t0_wall_ms, self._t0_monotonic),
+                        "error": str(e),
+                    })
+                self._show_toast("Tracking failed — recording stopped.")
+                self._finalize_recording("tracking_failed")
+                # Phase 5 follow-up: mirror _confirm_stop's UI teardown so the
+                # REC badge/timer don't keep counting over a finalized writer.
+                # Done after finalize -- neither touches self._recording, and
+                # _finalize_recording's no-op guard checks self._writer, not
+                # self._recording, so ordering here can't affect it.
+                self._recording = False
+                self._hide_rec_badges()
+                self._paused_banner.pack_forget()
+                self._stop_timer()
+                self._refresh_transport()
             return
-        untracked = sum(r.autofilled for r in records)
-        self._set_tracked_badge(untracked)
+        self._last_records = records
+        if self._recording and self._writer is not None:
+            self._buffer_recording_frame(records)
+        if should_repaint:
+            untracked = sum(r.autofilled for r in records)
+            self._set_tracked_badge(untracked)
 
     def _set_tracked_badge(self, untracked: int) -> None:
         tracked = TARGET_MARKERS - untracked
@@ -1806,11 +2022,13 @@ class SessionWindow(tk.Toplevel):
 
     def _handle_back(self) -> None:
         self._close_modal()  # E5: never leave a grab held by a dead widget
+        self._finalize_recording("closed")  # D8: every exit path finalizes
         self.release_camera()
         self._on_back(None)  # ordinary Back carries no toast message (E1)
 
     def _on_close(self) -> None:
         self._close_modal()  # E5: same guard as _handle_back
+        self._finalize_recording("closed")  # D8: every exit path finalizes
         self.release_camera()
         self.destroy()
 
