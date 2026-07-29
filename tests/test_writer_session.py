@@ -11,14 +11,17 @@ import os
 from unittest.mock import patch
 
 from core.tracker import MarkerRecord
+from core.trial_sequence import FORBIDDEN_ADJACENT, LEVELS_PCT, REPS_PER_LEVEL, generate_sequence
 from output.writer import (
     COLUMNS,
     CSVWriter,
     EventLog,
+    SEQUENCE_SCHEMA_VERSION,
     TrialLog,
     anchor_wall_clock,
     make_session_dir,
     now_ms,
+    save_sequence,
 )
 
 
@@ -203,12 +206,45 @@ def test_trial_log_open_close_flush_round_trips(tmp_path):
     rows = read_rows(log.csv_path)
     assert len(rows) == 1
     row = rows[0]
-    assert set(row.keys()) == {"trial_id", "trial_index", "start_ts", "end_ts", "voided"}
+    assert set(row.keys()) == {
+        "trial_id", "trial_index", "start_ts", "end_ts", "voided",
+        "target_pct", "target_kg",
+    }
     assert row["trial_id"] == "0"
     assert row["trial_index"] == "1"
     assert row["start_ts"] == "1000.0"
     assert row["end_ts"] == "2000.0"
     assert row["voided"] == "False"
+
+
+def test_trial_log_open_trial_defaults_target_columns_to_empty_string(tmp_path):
+    log = TrialLog(str(tmp_path / "session1_20260728_120000"))
+    log.open_trial(trial_id=0, trial_index=1, start_ts=0.0)
+    log.flush()
+
+    rows = read_rows(log.csv_path)
+    assert rows[0]["target_pct"] == ""
+    assert rows[0]["target_kg"] == ""
+
+
+def test_trial_log_open_trial_stores_target_pct_and_kg(tmp_path):
+    log = TrialLog(str(tmp_path / "session1_20260728_120000"))
+    log.open_trial(trial_id=0, trial_index=1, start_ts=0.0, target_pct=20, target_kg=8.0)
+    log.flush()
+
+    rows = read_rows(log.csv_path)
+    assert rows[0]["target_pct"] == "20"
+    assert rows[0]["target_kg"] == "8.0"
+
+
+def test_trial_log_open_trial_target_pct_zero_is_not_treated_as_missing(tmp_path):
+    log = TrialLog(str(tmp_path / "session1_20260728_120000"))
+    log.open_trial(trial_id=0, trial_index=1, start_ts=0.0, target_pct=0, target_kg=0.0)
+    log.flush()
+
+    rows = read_rows(log.csv_path)
+    assert rows[0]["target_pct"] == "0"
+    assert rows[0]["target_kg"] == "0.0"
 
 
 def test_trial_log_void_only_affects_voided_trial(tmp_path):
@@ -338,3 +374,128 @@ def test_anchor_wall_clock_returns_matched_pair():
 
     assert t0_wall_ms == 1_700_000_000_000.0
     assert t0_monotonic == 123.456
+
+
+# ── save_sequence ────────────────────────────────────────────────────────────
+
+
+def test_save_sequence_writes_sequence_json_in_session_dir(tmp_path):
+    session_dir = str(tmp_path / "session1_20260728_120000")
+    os.makedirs(session_dir)
+    seq = generate_sequence(seed=1)
+
+    path = save_sequence(session_dir, participant_id="participant007", sequence=seq, mvc_kg=40.0)
+
+    assert path == os.path.join(session_dir, "sequence.json")
+    assert os.path.exists(path)
+
+
+def test_save_sequence_envelope_has_all_schema_keys(tmp_path):
+    session_dir = str(tmp_path / "session1_20260728_120000")
+    os.makedirs(session_dir)
+    seq = generate_sequence(seed=1)
+
+    path = save_sequence(session_dir, participant_id="participant007", sequence=seq, mvc_kg=40.0)
+    with open(path) as f:
+        payload = json.load(f)
+
+    assert set(payload.keys()) == {
+        "schema_version", "participant_id", "session_dir", "generated_at",
+        "generator", "seed", "attempts", "mvc_kg", "levels_pct",
+        "reps_per_level", "forbidden_adjacent_pairs", "sequence_pct", "sequence_kg",
+    }
+    assert payload["schema_version"] == SEQUENCE_SCHEMA_VERSION
+    assert payload["participant_id"] == "participant007"
+    assert payload["session_dir"] == session_dir
+    assert payload["generator"] == "balanced_multiset_rejection_v1"
+    assert payload["seed"] == seq.seed
+    assert payload["attempts"] == seq.attempts
+    assert payload["levels_pct"] == list(LEVELS_PCT)
+    assert payload["reps_per_level"] == REPS_PER_LEVEL
+    assert sorted(tuple(p) for p in payload["forbidden_adjacent_pairs"]) == sorted(
+        {tuple(sorted(p, reverse=True)) for p in FORBIDDEN_ADJACENT}
+    )
+
+
+def test_save_sequence_has_thirty_pct_and_kg_entries(tmp_path):
+    session_dir = str(tmp_path / "session1_20260728_120000")
+    os.makedirs(session_dir)
+    seq = generate_sequence(seed=1)
+
+    path = save_sequence(session_dir, participant_id="participant007", sequence=seq, mvc_kg=40.0)
+    with open(path) as f:
+        payload = json.load(f)
+
+    assert len(payload["sequence_pct"]) == 30
+    assert len(payload["sequence_kg"]) == 30
+    assert payload["sequence_pct"] == list(seq.levels_pct)
+
+
+def test_save_sequence_kg_matches_pct_over_mvc_conversion(tmp_path):
+    session_dir = str(tmp_path / "session1_20260728_120000")
+    os.makedirs(session_dir)
+    seq = generate_sequence(seed=1)
+    mvc = 33.333
+
+    path = save_sequence(session_dir, participant_id="participant007", sequence=seq, mvc_kg=mvc)
+    with open(path) as f:
+        payload = json.load(f)
+
+    assert payload["mvc_kg"] == mvc
+    for pct, kg in zip(payload["sequence_pct"], payload["sequence_kg"]):
+        assert kg == round(pct / 100 * mvc, 3)
+
+
+def test_save_sequence_with_no_mvc_writes_null_shape(tmp_path):
+    session_dir = str(tmp_path / "session1_20260728_120000")
+    os.makedirs(session_dir)
+    seq = generate_sequence(seed=1)
+
+    path = save_sequence(session_dir, participant_id="participant007", sequence=seq, mvc_kg=None)
+    with open(path) as f:
+        payload = json.load(f)
+
+    assert payload["mvc_kg"] is None
+    assert payload["sequence_kg"] == [None] * 30
+    assert len(payload["sequence_kg"]) == 30
+
+
+def test_save_sequence_is_atomic_no_tmp_file_left_behind(tmp_path):
+    session_dir = str(tmp_path / "session1_20260728_120000")
+    os.makedirs(session_dir)
+    seq = generate_sequence(seed=1)
+
+    path = save_sequence(session_dir, participant_id="participant007", sequence=seq, mvc_kg=40.0)
+
+    assert os.path.exists(path)
+    assert not os.path.exists(path + ".tmp")
+
+
+def test_save_sequence_no_participant_name_in_payload(tmp_path):
+    session_dir = str(tmp_path / "session1_20260728_120000")
+    os.makedirs(session_dir)
+    seq = generate_sequence(seed=1)
+
+    path = save_sequence(session_dir, participant_id="participant007", sequence=seq, mvc_kg=40.0)
+    with open(path) as f:
+        contents = f.read()
+
+    assert "name" not in json.loads(contents)
+
+
+def test_save_sequence_seed_round_trips_through_generate_sequence(tmp_path):
+    """Success criterion 7, tested at the persistence boundary: replaying the
+    logged seed through generate_sequence() must reproduce the persisted
+    sequence_pct byte-for-byte, including the rejected shuffle attempts the
+    seed also determines."""
+    session_dir = str(tmp_path / "session1_20260728_120000")
+    os.makedirs(session_dir)
+    seq = generate_sequence(seed=987654321)
+
+    path = save_sequence(session_dir, participant_id="participant007", sequence=seq, mvc_kg=40.0)
+    with open(path) as f:
+        payload = json.load(f)
+
+    replayed = generate_sequence(seed=payload["seed"])
+    assert list(replayed.levels_pct) == payload["sequence_pct"]
+    assert replayed.attempts == payload["attempts"]

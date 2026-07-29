@@ -6,7 +6,17 @@ import time
 from datetime import datetime
 
 from core.tracker import MarkerRecord
+from core.trial_sequence import (
+    FORBIDDEN_ADJACENT,
+    GENERATOR_VERSION,
+    LEVELS_PCT,
+    REPS_PER_LEVEL,
+    TrialSequence,
+    target_kg,
+)
 
+
+SEQUENCE_SCHEMA_VERSION = 1
 
 COLUMNS = [
     "frame", "timestamp_ms", "marker_id",
@@ -95,7 +105,10 @@ class CSVWriter:
         self._f.close()
 
 
-_TRIAL_COLUMNS = ["trial_id", "trial_index", "start_ts", "end_ts", "voided"]
+_TRIAL_COLUMNS = [
+    "trial_id", "trial_index", "start_ts", "end_ts", "voided",
+    "target_pct", "target_kg",
+]
 
 
 class TrialLog:
@@ -113,13 +126,22 @@ class TrialLog:
         self.csv_path = os.path.join(session_dir, "trials.csv")
         self._trials: dict[int, dict] = {}
 
-    def open_trial(self, trial_id: int, trial_index: int, start_ts: float) -> None:
+    def open_trial(
+        self,
+        trial_id: int,
+        trial_index: int,
+        start_ts: float,
+        target_pct: int | None = None,
+        target_kg: float | None = None,
+    ) -> None:
         self._trials[trial_id] = {
             "trial_id": trial_id,
             "trial_index": trial_index,
             "start_ts": round(start_ts, 3),
             "end_ts": "",
             "voided": False,
+            "target_pct": target_pct if target_pct is not None else "",
+            "target_kg": target_kg if target_kg is not None else "",
         }
 
     def close_trial(self, trial_id: int, end_ts: float) -> None:
@@ -175,6 +197,48 @@ class EventLog:
         with open(tmp_path, "w") as f:
             json.dump(self._envelope, f, indent=2)
         os.replace(tmp_path, self.json_path)
+
+
+def save_sequence(
+    session_dir: str,
+    *,
+    participant_id: str,
+    sequence: TrialSequence,
+    mvc_kg: float | None,
+) -> str:
+    """Persist the session's locked 30-trial sequence, once, at Start (D6).
+
+    Written through the same .tmp + os.replace idiom as EventLog.flush, so a
+    crash mid-write cannot leave a half-written sequence.json behind.
+    """
+    if mvc_kg is None:
+        sequence_kg = [None] * len(sequence.levels_pct)
+    else:
+        sequence_kg = [target_kg(pct, mvc_kg) for pct in sequence.levels_pct]
+
+    forbidden_pairs = {tuple(sorted(pair, reverse=True)) for pair in FORBIDDEN_ADJACENT}
+    payload = {
+        "schema_version": SEQUENCE_SCHEMA_VERSION,
+        "participant_id": participant_id,
+        "session_dir": session_dir,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "generator": GENERATOR_VERSION,
+        "seed": sequence.seed,
+        "attempts": sequence.attempts,
+        "mvc_kg": mvc_kg,
+        "levels_pct": list(LEVELS_PCT),
+        "reps_per_level": REPS_PER_LEVEL,
+        "forbidden_adjacent_pairs": [list(pair) for pair in sorted(forbidden_pairs, reverse=True)],
+        "sequence_pct": list(sequence.levels_pct),
+        "sequence_kg": sequence_kg,
+    }
+
+    json_path = os.path.join(session_dir, "sequence.json")
+    tmp_path = json_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, json_path)
+    return json_path
 
 
 def anchor_wall_clock() -> tuple[float, float]:
