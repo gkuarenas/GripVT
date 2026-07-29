@@ -3,9 +3,10 @@
 ## Project
 **GripVT** — Marker displacement tracker for the GripVT visuotactile forearm sensor.
 
-`viewer.py` — live feed + baseline capture + session recording — is the sole app for v1.
-Bench characterization (and its planned `test_app.py` test suite) was descoped by the
-adviser on 2026-07-17; scope is now human data collection only.
+`main.py` is the sole app entry point for v1, launching the flow
+LandingWindow → NewParticipantWindow → CalibrationWindow → SessionWindow (live feed,
+baseline capture, session recording). Bench characterization (and its planned `test_app.py`
+test suite) was descoped by the adviser on 2026-07-17; scope is now human data collection only.
 
 The pipeline (threshold + connected-component detection → Kalman tracking → Hungarian assignment) was ported from `mdm-kalman` (phantom slab testing). Core logic is the same; geometry and camera differ.
 
@@ -19,7 +20,7 @@ The pipeline (threshold + connected-component detection → Kalman tracking → 
 
 ## Camera
 4:3 aspect ratio camera, native 1024×768 (GXIVISION S8M01, fixed-focus M12 lens). Camera is loaded raw via `cv2.VideoCapture`.
-Intrinsics are calibrated (fisheye model, near-rectilinear `D`) at the sensor's working distance; see `camera_calibration/results/<timestamp>/calibration.json`.
+Intrinsics are calibrated (fisheye model, near-rectilinear `D`) at the sensor's working distance; see `calibration/intrinsics/results/<timestamp>/calibration.json`.
 Undistortion maps are precomputed **once at startup** in `core/calibration.py` from `K, D` — never inside the frame loop. See the undistortion policy under Conventions.
 
 ## Marker geometry
@@ -30,7 +31,8 @@ Undistortion maps are precomputed **once at startup** in `core/calibration.py` f
 ## Structure
 ```
 GripVT/
-  viewer.py               # Viewer app entry point
+  main.py                  # App entry point (LandingWindow -> NewParticipantWindow ->
+                            # CalibrationWindow -> SessionWindow)
   requirements.txt
   core/
     detector.py           # Threshold + connected-component marker detection
@@ -38,8 +40,18 @@ GripVT/
     hungarian.py          # Assignment via scipy.optimize.linear_sum_assignment
     tracker.py            # Orchestrates predict -> assign -> correct per frame
   ui/
-    viewer_window.py      # CTk main window for viewer app
-    overlay.py            # Frame annotation drawing
+    session/              # SessionWindow split into mixins
+      window.py           # SessionWindow scaffold + shared __init__
+      progress.py         # Session/trial/target progress blocks
+      baseline.py         # Baseline capture state machine
+      recording.py        # Trial recording, timers, finalize
+      modals.py           # Modal/toast plumbing
+      camera_feed.py      # Camera polling + tracked-marker indicator
+    overlay.py             # Frame annotation drawing
+  calibration/
+    intrinsics/            # Fisheye camera calibration (K, D)
+    detector_tuning/       # Detector param tuning tool
+    roi/                   # ROI selection tool (run once per camera mount)
   output/
     writer.py             # Base CSV writer
     participants.py       # De-identified participant persistence + external name key
@@ -54,8 +66,8 @@ Participant names live only in an external key file outside the repo:
 
 ## Commands
 ```bash
-# Run viewer app
-python viewer.py
+# Run app
+python main.py
 
 # Install dependencies
 pip install -r requirements.txt
