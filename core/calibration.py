@@ -7,7 +7,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-_RESULTS_DIR = Path(__file__).parent.parent / "camera_calibration" / "results"
+_RESULTS_DIR = Path(__file__).parent.parent / "calibration" / "intrinsics" / "results"
 
 
 def _latest_calibration_path() -> Path:

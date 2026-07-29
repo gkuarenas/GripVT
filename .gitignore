@@ -8,7 +8,7 @@ __pycache__/
 # Output data
 output/sessions/
 recordings/
-camera_calibration/results/
+calibration/intrinsics/results/
 
 
 # specific folders and files
@@ -30,8 +30,8 @@ Thumbs.db
 .mypy_cache/
 
 # Track only the latest calibration.json (intrinsics travel with the code)
-!camera_calibration/results/
-camera_calibration/results/*
-!camera_calibration/results/20260701_180005_calibration/
-camera_calibration/results/20260701_180005_calibration/*
-!camera_calibration/results/20260701_180005_calibration/calibration.json
+!calibration/intrinsics/results/
+calibration/intrinsics/results/*
+!calibration/intrinsics/results/20260701_180005_calibration/
+calibration/intrinsics/results/20260701_180005_calibration/*
+!calibration/intrinsics/results/20260701_180005_calibration/calibration.json

@@ -5,11 +5,15 @@ trackbars against the known curved 11x11 marker grid, then save the winning
 parameters with 's'.
 """
 import json
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 import cv2
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from core.calibration import CameraCalibration
 from core.detector import (
@@ -103,7 +107,7 @@ class CalibratorApp:
     def __init__(self) -> None:
         self._roi = ROICrop()
         # Undistort with whatever alpha the ROI was selected under (see
-        # tools/select_roi.py) -- a mismatch here remaps pixel positions and
+        # calibration/roi/select_roi.py) -- a mismatch here remaps pixel positions and
         # misaligns the crop with the marker grid.
         roi_config = self._roi.config
         alpha = roi_config.alpha if roi_config is not None else DEFAULT_ALPHA

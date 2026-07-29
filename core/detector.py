@@ -6,7 +6,7 @@ import numpy as np
 
 from core.blobfit import estimate_background, fit_gaussian_logparabola, fit_moments
 
-_PARAMS_PATH = Path(__file__).parent.parent / "detector_params.json"
+_PARAMS_PATH = Path(__file__).parent.parent / "calibration" / "detector_tuning" / "detector_params.json"
 
 
 def default_params() -> dict:

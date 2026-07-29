@@ -80,7 +80,7 @@ class MarkerRecord:
 class Tracker:
     def __init__(self, calibration: CameraCalibration, roi: ROICrop | None = None) -> None:
         # Undistorts through the same CameraCalibration + alpha/balance path
-        # roi.json was authored against (see tools/select_roi.py), so the ROI
+        # roi.json was authored against (see calibration/roi/select_roi.py), so the ROI
         # crop below lands on the marker grid correctly.
         self._calibration = calibration
         calib_w, calib_h = calibration.image_size
@@ -120,7 +120,7 @@ class Tracker:
             frame = cv2.resize(frame, (self._calib_w, self._calib_h), interpolation=cv2.INTER_LINEAR)
         undistorted = self._calibration.undistort(frame)
         # Rotate to match the viewer's display orientation -- roi.json's box
-        # (see tools/select_roi.py) is defined in this rotated coordinate
+        # (see calibration/roi/select_roi.py) is defined in this rotated coordinate
         # space, so cropping must happen after this, not before.
         return cv2.rotate(undistorted, cv2.ROTATE_90_CLOCKWISE)
 

@@ -16,9 +16,9 @@ cylindrical sensor. Skipping it (ENTER with no points) keeps the old
 rectangle-only behavior.
 
 Usage:
-    python tools/select_roi.py
-    python tools/select_roi.py --camera 1   # if camera index is not 0
-    python tools/select_roi.py --alpha 0    # select under "crop" undistort mode instead
+    python calibration/roi/select_roi.py
+    python calibration/roi/select_roi.py --camera 1   # if camera index is not 0
+    python calibration/roi/select_roi.py --alpha 0    # select under "crop" undistort mode instead
 """
 import argparse
 import json
@@ -28,8 +28,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-ROOT = Path(__file__).parent.parent
-ROI_PATH = ROOT / "roi.json"
+ROOT = Path(__file__).parent.parent.parent
+ROI_PATH = Path(__file__).parent / "roi.json"
 
 sys.path.insert(0, str(ROOT))
 from core.calibration import CameraCalibration  # noqa: E402

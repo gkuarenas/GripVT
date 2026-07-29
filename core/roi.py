@@ -7,7 +7,7 @@ to the ROI origin. Add (roi.x, roi.y) back before any back-projection
 to 3D cylinder coordinates.
 
 The ROI box was drawn on a frame undistorted with a specific alpha
-(see tools/select_roi.py). Undistorting with a different alpha remaps
+(see calibration/roi/select_roi.py). Undistorting with a different alpha remaps
 pixel positions, so the saved box only lines up with the marker grid
 when consumers undistort with the same alpha it was selected under —
 hence alpha travels with x/y/w/h instead of being chosen independently
@@ -17,7 +17,7 @@ The rectangular crop alone still includes the dark curved margins of
 the cylindrical sensor (its outline isn't a rectangle), which is where
 stray blobs get falsely detected as markers. sensor_mask() gates
 detection to a polygon traced around the sensor outline, authored by
-tools/select_roi.py and stored crop-relative so it doesn't need to
+calibration/roi/select_roi.py and stored crop-relative so it doesn't need to
 know the rect's origin.
 """
 import json
@@ -28,7 +28,7 @@ from typing import Optional
 import cv2
 import numpy as np
 
-_ROI_PATH = Path(__file__).parent.parent / "roi.json"
+_ROI_PATH = Path(__file__).parent.parent / "calibration" / "roi" / "roi.json"
 DEFAULT_ALPHA = 1.0
 
 
