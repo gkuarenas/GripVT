@@ -25,10 +25,12 @@ import tkinter as tk
 import numpy as np
 import pytest
 
-import ui.session_window as session_window_module
+import ui.session.baseline as baseline_module
+import ui.session.camera_feed as camera_feed_module
+import ui.session.recording as recording_module
 from core.detector_search import TARGET_MARKERS
 from ui import theme
-from ui.session_window import SessionWindow
+from ui.session import SessionWindow
 
 
 class _StubCapture:
@@ -84,7 +86,7 @@ def root(tk_root):
 
 @pytest.fixture
 def window(root, monkeypatch):
-    monkeypatch.setattr(session_window_module.cv2, "VideoCapture", lambda index: _StubCapture())
+    monkeypatch.setattr(camera_feed_module.cv2, "VideoCapture", lambda index: _StubCapture())
     win = SessionWindow(root)
     assert win._cap is None, "stubbed VideoCapture.isOpened() should always be False"
     yield win
@@ -95,9 +97,9 @@ def window(root, monkeypatch):
 @pytest.fixture
 def connected_window(root, monkeypatch):
     stub = _StubCaptureConnected()
-    monkeypatch.setattr(session_window_module.cv2, "VideoCapture", lambda index: stub)
-    monkeypatch.setattr(session_window_module.Tracker, "undistort", lambda self, frame: frame)
-    monkeypatch.setattr(session_window_module.ROICrop, "crop", lambda self, frame: frame)
+    monkeypatch.setattr(camera_feed_module.cv2, "VideoCapture", lambda index: stub)
+    monkeypatch.setattr(camera_feed_module.Tracker, "undistort", lambda self, frame: frame)
+    monkeypatch.setattr(camera_feed_module.ROICrop, "crop", lambda self, frame: frame)
     win = SessionWindow(root)
     assert win._cap is not None, "stubbed VideoCapture.isOpened() should always be True"
     yield win, stub
@@ -110,7 +112,7 @@ def _finish_burst(win: SessionWindow, count: int) -> None:
     camera, same helper as test_session_baseline_gate.py."""
     win._tracker.capture_baseline = lambda frames: count
     win._on_capture_baseline_click()
-    for _ in range(session_window_module.BASELINE_FRAMES):
+    for _ in range(baseline_module.BASELINE_FRAMES):
         win._capture_baseline_frame(object())
 
 
@@ -249,17 +251,17 @@ def test_alarm_blink_cancelled_when_leaving_alarm_tier(window):
 def test_camera_loss_debounced_below_threshold(connected_window):
     win, stub = connected_window
     stub.fail = True
-    for _ in range(session_window_module.CAMERA_FAIL_POLLS - 1):
+    for _ in range(camera_feed_module.CAMERA_FAIL_POLLS - 1):
         win._poll()
     assert win._cap is not None
-    assert win._read_fail_streak == session_window_module.CAMERA_FAIL_POLLS - 1
+    assert win._read_fail_streak == camera_feed_module.CAMERA_FAIL_POLLS - 1
     assert win._disconnected_panel.winfo_manager() == ""
 
 
 def test_camera_loss_flips_at_threshold(connected_window):
     win, stub = connected_window
     stub.fail = True
-    for _ in range(session_window_module.CAMERA_FAIL_POLLS):
+    for _ in range(camera_feed_module.CAMERA_FAIL_POLLS):
         win._poll()
     assert win._cap is None
     assert win._disconnected_panel.winfo_manager() == "place"
@@ -302,7 +304,7 @@ def test_tracker_survives_disconnect_reconnect(connected_window, monkeypatch):
 
     # Disconnect.
     stub.fail = True
-    for _ in range(session_window_module.CAMERA_FAIL_POLLS):
+    for _ in range(camera_feed_module.CAMERA_FAIL_POLLS):
         win._poll()
     assert win._cap is None
 
@@ -323,7 +325,7 @@ def test_tracker_survives_disconnect_reconnect(connected_window, monkeypatch):
 
 def test_rec_timer_excludes_paused_gap(window, monkeypatch):
     clock = {"t": 0.0}
-    monkeypatch.setattr(session_window_module.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(recording_module.time, "monotonic", lambda: clock["t"])
 
     window._confirm_start()  # segment_start anchored at t=0
     clock["t"] = 5.0
@@ -385,7 +387,7 @@ def test_handle_back_closes_open_modal(window):
 
 
 def test_on_close_closes_open_modal(root, monkeypatch):
-    monkeypatch.setattr(session_window_module.cv2, "VideoCapture", lambda index: _StubCapture())
+    monkeypatch.setattr(camera_feed_module.cv2, "VideoCapture", lambda index: _StubCapture())
     win = SessionWindow(root)
     win._open_modal(lambda parent: None)
     assert win._modal_panel is not None

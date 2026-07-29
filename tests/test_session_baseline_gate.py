@@ -3,7 +3,7 @@
 Drives SessionWindow's baseline state transitions directly, with no camera
 and no polling loop. The test controls the camera itself rather than
 assuming one is absent -- cv2.VideoCapture is monkeypatched inside
-ui.session_window to a stub whose isOpened() is always False, so __init__
+ui.session.camera_feed to a stub whose isOpened() is always False, so __init__
 deterministically takes its _show_placeholder() branch and never schedules
 _poll(), on any machine (including a rig with a real camera at
 CAMERA_INDEX). Tracker.capture_baseline() is separately monkeypatched so the
@@ -14,9 +14,10 @@ import tkinter as tk
 
 import pytest
 
-import ui.session_window as session_window_module
+import ui.session.baseline as baseline_module
+import ui.session.camera_feed as camera_feed_module
 from output.participants import ParticipantRecord
-from ui.session_window import SessionWindow
+from ui.session import SessionWindow
 
 
 class _StubCapture:
@@ -49,7 +50,7 @@ def root(tk_root):
 
 @pytest.fixture
 def window(root, monkeypatch):
-    monkeypatch.setattr(session_window_module.cv2, "VideoCapture", lambda index: _StubCapture())
+    monkeypatch.setattr(camera_feed_module.cv2, "VideoCapture", lambda index: _StubCapture())
     win = SessionWindow(root)
     assert win._cap is None, "stubbed VideoCapture.isOpened() should always be False"
     yield win
@@ -62,7 +63,7 @@ def _finish_burst(win: SessionWindow, count: int) -> None:
     win._tracker.capture_baseline = lambda frames: count
     win._on_capture_baseline_click()
     assert win._baseline["status"] == "capturing"
-    for _ in range(session_window_module.BASELINE_FRAMES):
+    for _ in range(baseline_module.BASELINE_FRAMES):
         win._capture_baseline_frame(object())
 
 
@@ -108,7 +109,7 @@ def test_override_flag_reaches_saved_payload(window, tmp_path, monkeypatch):
         saved.update(kwargs)
         return "fake/path.json"
 
-    monkeypatch.setattr(session_window_module.participants, "save_baseline", fake_save_baseline)
+    monkeypatch.setattr(baseline_module.participants, "save_baseline", fake_save_baseline)
     window._participant = _make_participant(tmp_path)
 
     _finish_burst(window, 60)

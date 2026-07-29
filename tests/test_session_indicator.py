@@ -11,8 +11,9 @@ import tkinter as tk
 
 import pytest
 
-import ui.session_window as session_window_module
-from ui.session_window import SESSION_COUNT, SessionWindow
+import ui.session.window as session_window_module
+from ui.session import SessionWindow
+from ui.session.progress import SESSION_COUNT
 
 from tests.test_session_csv_recording import (
     MARKER_COUNT, _StubCaptureConnected, _install_fake_process_frame, _lock_baseline,

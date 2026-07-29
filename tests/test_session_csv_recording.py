@@ -21,10 +21,12 @@ import time
 import numpy as np
 import pytest
 
-import ui.session_window as session_window_module
+import ui.session.baseline as baseline_module
+import ui.session.camera_feed as camera_feed_module
+import ui.session.recording as recording_module
 from core.tracker import MarkerRecord
 from output.participants import ParticipantRecord
-from ui.session_window import SessionWindow
+from ui.session import SessionWindow
 
 MARKER_COUNT = 5
 
@@ -73,9 +75,9 @@ def root(tk_root):
 @pytest.fixture
 def connected_window(root, monkeypatch):
     stub = _StubCaptureConnected()
-    monkeypatch.setattr(session_window_module.cv2, "VideoCapture", lambda index: stub)
-    monkeypatch.setattr(session_window_module.Tracker, "undistort", lambda self, frame: frame)
-    monkeypatch.setattr(session_window_module.ROICrop, "crop", lambda self, frame: frame)
+    monkeypatch.setattr(camera_feed_module.cv2, "VideoCapture", lambda index: stub)
+    monkeypatch.setattr(camera_feed_module.Tracker, "undistort", lambda self, frame: frame)
+    monkeypatch.setattr(camera_feed_module.ROICrop, "crop", lambda self, frame: frame)
     win = SessionWindow(root)
     assert win._cap is not None, "stubbed VideoCapture.isOpened() should always be True"
     yield win
@@ -86,9 +88,9 @@ def connected_window(root, monkeypatch):
 @pytest.fixture
 def failable_window(root, monkeypatch):
     stub = _StubCaptureFailable()
-    monkeypatch.setattr(session_window_module.cv2, "VideoCapture", lambda index: stub)
-    monkeypatch.setattr(session_window_module.Tracker, "undistort", lambda self, frame: frame)
-    monkeypatch.setattr(session_window_module.ROICrop, "crop", lambda self, frame: frame)
+    monkeypatch.setattr(camera_feed_module.cv2, "VideoCapture", lambda index: stub)
+    monkeypatch.setattr(camera_feed_module.Tracker, "undistort", lambda self, frame: frame)
+    monkeypatch.setattr(camera_feed_module.ROICrop, "crop", lambda self, frame: frame)
     win = SessionWindow(root)
     assert win._cap is not None, "stubbed VideoCapture.isOpened() should always be True"
     yield win, stub
@@ -113,7 +115,7 @@ def _lock_baseline(win: SessionWindow, count: int = 97) -> None:
     not lock any Kalman states or flip that flag itself."""
     win._tracker.capture_baseline = lambda frames: count
     win._on_capture_baseline_click()
-    for _ in range(session_window_module.BASELINE_FRAMES):
+    for _ in range(baseline_module.BASELINE_FRAMES):
         win._capture_baseline_frame(object())
     assert win._baseline["status"] == "pass"
     win._tracker.baseline_set = True
@@ -224,7 +226,7 @@ def test_buffer_flushed_before_max_frames(connected_window, tmp_path, monkeypatc
     win._participant = _make_participant(tmp_path)
     _lock_baseline(win)
     _install_fake_process_frame(win, MARKER_COUNT)
-    monkeypatch.setattr(session_window_module, "MAX_BUFFER_FRAMES", 3)
+    monkeypatch.setattr(recording_module, "MAX_BUFFER_FRAMES", 3)
 
     win._confirm_start()
     session_dir = win._writer.session_dir
@@ -362,7 +364,7 @@ def test_camera_loss_during_recording_closes_paired_event(failable_window, tmp_p
         win._poll()
 
     stub.fail = True
-    for _ in range(session_window_module.CAMERA_FAIL_POLLS):
+    for _ in range(camera_feed_module.CAMERA_FAIL_POLLS):
         win._poll()
     assert win._cap is None
     assert win._open_camera_loss_event is not None
@@ -418,7 +420,7 @@ def test_camera_loss_never_retried_closed_at_finalize(failable_window, tmp_path)
 
     win._poll()
     stub.fail = True
-    for _ in range(session_window_module.CAMERA_FAIL_POLLS):
+    for _ in range(camera_feed_module.CAMERA_FAIL_POLLS):
         win._poll()
     assert win._open_camera_loss_event is not None
 
@@ -732,7 +734,7 @@ def test_finalize_survives_overlay_failure(connected_window, tmp_path, monkeypat
     def _boom(*args, **kwargs):
         raise ValueError("simulated overlay failure")
 
-    monkeypatch.setattr(session_window_module, "draw_overlay", _boom)
+    monkeypatch.setattr(recording_module, "draw_overlay", _boom)
 
     win._confirm_start()
     session_dir = win._writer.session_dir

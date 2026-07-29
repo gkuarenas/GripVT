@@ -15,11 +15,12 @@ import os
 
 import pytest
 
-import ui.session_window as session_window_module
+import ui.session.camera_feed as camera_feed_module
+import ui.session.recording as recording_module
 import ui.theme as theme
 from core.trial_sequence import SequenceGenerationError, TRIAL_COUNT, generate_sequence, is_valid
 from output.participants import ParticipantRecord
-from ui.session_window import SessionWindow
+from ui.session import SessionWindow
 
 from tests.test_session_csv_recording import (
     MARKER_COUNT, _StubCaptureConnected, _install_fake_process_frame, _lock_baseline,
@@ -35,9 +36,9 @@ def root(tk_root):
 @pytest.fixture
 def connected_window(root, monkeypatch):
     stub = _StubCaptureConnected()
-    monkeypatch.setattr(session_window_module.cv2, "VideoCapture", lambda index: stub)
-    monkeypatch.setattr(session_window_module.Tracker, "undistort", lambda self, frame: frame)
-    monkeypatch.setattr(session_window_module.ROICrop, "crop", lambda self, frame: frame)
+    monkeypatch.setattr(camera_feed_module.cv2, "VideoCapture", lambda index: stub)
+    monkeypatch.setattr(camera_feed_module.Tracker, "undistort", lambda self, frame: frame)
+    monkeypatch.setattr(camera_feed_module.ROICrop, "crop", lambda self, frame: frame)
     win = SessionWindow(root)
     assert win._cap is not None, "stubbed VideoCapture.isOpened() should always be True"
     yield win
@@ -222,7 +223,7 @@ def test_sequence_generation_error_aborts_start_before_any_mutation(
     def _raise(seed=None):
         raise SequenceGenerationError("no valid sequence found")
 
-    monkeypatch.setattr(session_window_module, "generate_sequence", _raise)
+    monkeypatch.setattr(recording_module, "generate_sequence", _raise)
     before = set(os.listdir(win._participant.folder))
 
     win._confirm_start()
