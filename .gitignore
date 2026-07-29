@@ -35,3 +35,9 @@ calibration/intrinsics/results/*
 !calibration/intrinsics/results/20260701_180005_calibration/
 calibration/intrinsics/results/20260701_180005_calibration/*
 !calibration/intrinsics/results/20260701_180005_calibration/calibration.json
+
+# Track images referenced by README.md
+!docs/
+docs/*
+!docs/images/
+!docs/images/**
