@@ -20,14 +20,14 @@ failure (E9) that survives on the locked Kalman states without rebuilding
 the tracker, and the tracked count reads MarkerRecord.autofilled from a
 throttled Tracker.process_frame() once the baseline is locked (E2/E3).
 
-CSV recording, trial sequencing, and target-force values stay static
-placeholders. In particular, the TRIAL kicker's counter and its inline Undo
-button (E7) are in-window UI state only -- Next Trial / Undo move a local
-counter and progress bar, write nothing, and move no real trial boundary;
-there is no trial sequence yet for them to advance. A future pass wiring
-real trial sequencing must not mistake this counter for it. Start/Stop/Next
-Trial otherwise remain stubs beyond the baseline gate, the D2 Re-capture
-lockout, and the bookend confirm flow.
+CSV recording, trial sequencing, and target-force values are real. A
+confirmed Start generates and locks a 30-trial randomized %MVC sequence
+(core/trial_sequence.py), persists it to sequence.json, and drives the
+TRIAL kicker and TARGET FORCE block off sequence[trial_index - 1] --
+self._trial is the sole index into that sequence, so Next Trial / Undo
+(E7) can never desync from it (see D2 in the trial-sequencing plan). Both
+also open/close/void real segments in trials.csv via TrialLog, alongside
+markers.csv (per-frame) and events.json (bookend/annotation) writers.
 """
 import logging
 import time
@@ -44,10 +44,13 @@ from core.calibration import CameraCalibration
 from core.detector_search import MIN_ACCEPTABLE, TARGET_MARKERS, SearchResult, region_counts
 from core.roi import DEFAULT_ALPHA, ROICrop
 from core.tracker import BASELINE_FRAMES, MarkerRecord, Tracker
+from core.trial_sequence import (
+    TRIAL_COUNT, SequenceGenerationError, TrialSequence, generate_sequence, target_kg,
+)
 from output import participants
 from output.participants import ParticipantRecord
 from output.writer import (
-    CSVWriter, EventLog, TrialLog, anchor_wall_clock, make_session_dir, now_ms,
+    CSVWriter, EventLog, TrialLog, anchor_wall_clock, make_session_dir, now_ms, save_sequence,
 )
 from ui import theme
 from ui.overlay import draw_overlay
@@ -188,6 +191,9 @@ class SessionWindow(tk.Toplevel):
         # appends this same dict reference to its internal list, so mutating
         # it in place after append is safe and needs no second lookup.
         self._open_camera_loss_event: dict | None = None
+        # Phase 3 (trial sequencing plan): the locked 30-trial sequence,
+        # assigned once at confirmed Start (D6) -- None until then.
+        self._sequence: TrialSequence | None = None
         # D2: monotonic trial-segment ordinal, distinct from self._trial (the
         # operator-facing counter) -- never reused, never decremented by Undo.
         self._segment_id = 0
@@ -201,8 +207,8 @@ class SessionWindow(tk.Toplevel):
         # E7: in-window placeholder trial state only -- no real sequencing
         # exists yet. Named attributes (not literals) so Phase 8 only has to
         # assign real values instead of rewiring _refresh_transport.
-        self._trial = 12
-        self._trial_max = 30
+        self._trial = 0
+        self._trial_max = TRIAL_COUNT
         # Phase 8 (E7): set True by Next Trial, False by Undo -- drives the
         # Undo button's own enabled state, independent of the transport rules.
         self._undo_available = False
@@ -541,6 +547,18 @@ class SessionWindow(tk.Toplevel):
     def _trial_frac(self) -> float:
         return self._trial / self._trial_max if self._trial_max else 0.0
 
+    def _target_pct_for_trial(self) -> int | None:
+        if self._sequence is None:
+            return None
+        assert 0 <= self._trial - 1 < TRIAL_COUNT
+        return self._sequence.levels_pct[self._trial - 1]
+
+    def _target_kg_for_trial(self) -> float | None:
+        pct = self._target_pct_for_trial()
+        if pct is None or self._participant is None:
+            return None
+        return target_kg(pct, self._participant.mvc_kg)
+
     def _refresh_trial_block(self) -> None:
         """Repaints the TRIAL value/bar/Undo in place -- called after every
         Next Trial / Undo (Phase 8), never rebuilds _build_trial_block's
@@ -548,6 +566,24 @@ class SessionWindow(tk.Toplevel):
         self._trial_value_label.configure(text=self._trial_value_text())
         self._trial_fill.place_configure(relwidth=self._trial_frac())
         self._undo_btn.set_enabled(self._undo_available)
+
+    def _target_num_text(self) -> str:
+        kg = self._target_kg_for_trial()
+        return f"{kg:.1f}" if kg is not None else "—"
+
+    def _target_sub_text(self) -> str:
+        pct = self._target_pct_for_trial()
+        return f"{pct}% MVC" if pct is not None else "AWAITING START"
+
+    def _target_color(self) -> str:
+        return theme.INK if self._target_pct_for_trial() is not None else theme.INK_55
+
+    def _refresh_target_block(self) -> None:
+        """Repaints the TARGET FORCE value/subline in place -- called after
+        every Next Trial / Undo (Phase 8), mirroring _refresh_trial_block."""
+        color = self._target_color()
+        self._target_num_label.configure(text=self._target_num_text(), fg=color)
+        self._target_sub_label.configure(text=self._target_sub_text(), fg=color)
 
     # ── phase 1: baseline gate box ─────────────────────────────────────────
     def _build_phase1(self, parent: tk.Frame) -> None:
@@ -580,15 +616,20 @@ class SessionWindow(tk.Toplevel):
         ).pack()
         num_row = tk.Frame(target, bg=theme.BG)
         num_row.pack(pady=(6, 0))
-        tk.Label(
-            num_row, text="18.4", bg=theme.BG, fg=theme.INK, font=self._f_target_num,
-        ).pack(side="left")
-        tk.Label(
+        self._target_num_label = tk.Label(
+            num_row, text=self._target_num_text(), bg=theme.BG, fg=self._target_color(),
+            font=self._f_target_num,
+        )
+        self._target_num_label.pack(side="left")
+        self._target_unit_label = tk.Label(
             num_row, text="kg", bg=theme.BG, fg=theme.INK, font=self._f_target_unit,
-        ).pack(side="left", anchor="s", pady=(0, 10))
-        tk.Label(
-            target, text="40% MVC", bg=theme.BG, fg=theme.INK_55, font=self._f_small,
-        ).pack(pady=(4, 0))
+        )
+        self._target_unit_label.pack(side="left", anchor="s", pady=(0, 10))
+        self._target_sub_label = tk.Label(
+            target, text=self._target_sub_text(), bg=theme.BG, fg=self._target_color(),
+            font=self._f_small,
+        )
+        self._target_sub_label.pack(pady=(4, 0))
 
         tk.Frame(self._phase2_frame, bg=theme.DIVIDER, height=2).pack(fill="x", pady=(18, 0))
 
@@ -1199,8 +1240,13 @@ class SessionWindow(tk.Toplevel):
     def _on_next_trial(self) -> None:
         # Mirrors _refresh_transport's nextTrialDisabled rule (Phase 8, E7,
         # recording-independent per the rig-feedback correction) -- guards a
-        # stray call the same way _on_start/_on_stop already do.
-        next_trial_disabled = not self._locked() or self._trial >= self._trial_max
+        # stray call the same way _on_start/_on_stop already do. D9: also
+        # gated on self._recording (see _refresh_transport's 2026-07-28
+        # correction) -- a pre-Start call would advance _trial against a
+        # sequence that doesn't exist yet (self._sequence is None).
+        next_trial_disabled = (
+            not self._locked() or not self._recording or self._trial >= self._trial_max
+        )
         if next_trial_disabled:
             return
         if self._trial_log is not None:
@@ -1219,9 +1265,12 @@ class SessionWindow(tk.Toplevel):
             self._trial_log.open_trial(
                 trial_id=self._segment_id, trial_index=self._trial,
                 start_ts=now_ms(self._t0_wall_ms, self._t0_monotonic),
+                target_pct=self._target_pct_for_trial(),
+                target_kg=self._target_kg_for_trial(),
             )
         self._undo_available = True
         self._refresh_trial_block()
+        self._refresh_target_block()
         self._refresh_transport()
 
     def _on_undo_trial(self) -> None:
@@ -1240,16 +1289,39 @@ class SessionWindow(tk.Toplevel):
             # written by flush()), so overwriting that entry here leaves no
             # "completed" row behind for a segment that never happened.
             # self._segment_id itself is never decremented (D2) -- only
-            # self._trial, the displayed counter, moves back.
+            # self._trial, the displayed counter, moves back. The voided
+            # segment's trial_index was set to self._trial - 1 when the
+            # Next Trial that just closed it opened it; redo_trial_index
+            # below is computed the same way from the same (still
+            # undecremented) self._trial. Both therefore carry the
+            # identical trial_index and resolve to the same
+            # sequence[trial_index - 1] target (D2) -- Undo re-shows
+            # exactly what it just left.
             self._writer.discard_window()
             redo_trial_index = max(1, self._trial - 1)
+            # self._trial is not decremented until below, so the bare
+            # _target_pct_for_trial()/_target_kg_for_trial() helpers would
+            # read the pre-Undo trial here, not redo_trial_index -- index
+            # the sequence directly for redo_trial_index instead.
+            redo_target_pct = (
+                self._sequence.levels_pct[redo_trial_index - 1]
+                if self._sequence is not None else None
+            )
+            redo_target_kg = (
+                target_kg(redo_target_pct, self._participant.mvc_kg)
+                if redo_target_pct is not None and self._participant is not None
+                else None
+            )
             self._trial_log.open_trial(
                 trial_id=self._segment_id, trial_index=redo_trial_index,
                 start_ts=now_ms(self._t0_wall_ms, self._t0_monotonic),
+                target_pct=redo_target_pct,
+                target_kg=redo_target_kg,
             )
         self._trial = max(1, self._trial - 1)
         self._undo_available = False
         self._refresh_trial_block()
+        self._refresh_target_block()
         self._refresh_transport()
 
     # ── bookend confirm modals (Phase 5) ────────────────────────────────────
@@ -1307,6 +1379,17 @@ class SessionWindow(tk.Toplevel):
 
     def _confirm_start(self) -> None:
         self._close_modal()
+        if self._participant is not None and self._participant.mvc_kg <= 0:
+            self._show_toast("Participant MVC is 0 kg — re-enter MVC before recording")
+            return
+        try:
+            seq = generate_sequence()
+        except SequenceGenerationError:
+            self._show_toast("Could not generate a trial sequence — Start again")
+            return
+        self._sequence = seq
+        self._trial = 1
+        self._undo_available = False
         self._recording = True
         self._recording_started = True
         self._show_rec_badge()
@@ -1314,6 +1397,8 @@ class SessionWindow(tk.Toplevel):
             self._strip_recapture_btn.set_enabled(False)
         self._start_timer()
         self._refresh_transport()
+        self._refresh_trial_block()
+        self._refresh_target_block()
         print("Start clicked")
 
         # D5/D8: degrade to a no-op, mirroring _save_baseline_record's guard
@@ -1332,9 +1417,15 @@ class SessionWindow(tk.Toplevel):
         )
         self._t0_wall_ms, self._t0_monotonic = anchor_wall_clock()
         self._segment_id = 0
+        save_sequence(
+            session_dir, participant_id=self._participant.participant_id,
+            sequence=seq, mvc_kg=self._participant.mvc_kg,
+        )
         self._trial_log.open_trial(
             trial_id=self._segment_id, trial_index=self._trial,
             start_ts=now_ms(self._t0_wall_ms, self._t0_monotonic),
+            target_pct=self._target_pct_for_trial(),
+            target_kg=self._target_kg_for_trial(),
         )
         if RECORDING_TRACK_EVERY != 1:
             # D3 approved addition: a static config check, not a dynamic

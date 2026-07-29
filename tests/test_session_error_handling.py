@@ -541,6 +541,7 @@ def test_restart_entire_testing_confirmation_calls_on_back_with_message(window):
 
 def test_next_trial_advances_and_enables_undo(window):
     _finish_burst(window, 97)
+    window._confirm_start()  # D9: Next Trial requires an active recording
     trial_before = window._trial
     assert window._undo_available is False
     assert window._undo_btn.enabled is False
@@ -554,6 +555,9 @@ def test_next_trial_advances_and_enables_undo(window):
 
 def test_undo_steps_back_once_and_disables(window):
     _finish_burst(window, 97)
+    # Not 0 -- Undo's floor is max(1, ...), so stepping back from trial 1
+    # lands on 1, not 0 (trial 0 is only ever the pre-first-Start state).
+    window._trial = 5
     trial_before = window._trial
     window._on_next_trial()
 
@@ -637,4 +641,4 @@ def test_next_trial_disabled_while_unlocked_regardless_of_recording(window):
 
     window._on_next_trial()  # guarded no-op -- not locked
 
-    assert window._trial == 12  # unchanged from __init__'s placeholder
+    assert window._trial == 0  # unchanged from __init__'s value
