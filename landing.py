@@ -17,15 +17,19 @@ def main():
         cal_win.withdraw()
 
         def restore_cal(message: str | None = None):
+            # D3: read before destroy() -- session_win is still alive here.
+            holder["session_num"] = session_win._session_num
             session_win.destroy()
             cal_win.deiconify()
             cal_win.retry_camera()
             if message is not None:
                 cal_win.show_toast(message)
 
+        session_num = holder["session_num"]
         session_win = SessionWindow(
             app, on_back=restore_cal, detector_params=result.params,
             calibration_result=result, participant=record,
+            session_num=session_num,
         )
         # Titlebar X quits the whole program, same as every other window in
         # this flow -- but unlike New Participant/Calibration, Session may
@@ -46,6 +50,7 @@ def main():
 
     def open_calibration(np_win, record):
         app = holder["app"]
+        holder["session_num"] = 0  # per-visit counter, seeded once (D3)
         np_win.withdraw()
 
         def restore_np():
