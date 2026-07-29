@@ -2,7 +2,7 @@
 from ui.calibration_window import CalibrationWindow
 from ui.landing_window import LandingWindow
 from ui.new_participant_window import NewParticipantWindow
-from ui.session_window import SessionWindow
+from ui.session import SessionWindow
 
 
 def main():
