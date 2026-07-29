@@ -111,6 +111,11 @@ _TRACKED_TIERS: dict[str, dict[str, str | None]] = {
 }
 
 
+# D1 (session-indicator plan): pure UI/visit bookkeeping, not a sequence-
+# driving module like TRIAL_COUNT -- lives here next to self._trial_max.
+SESSION_COUNT = 10
+
+
 class SessionWindow(tk.Toplevel):
     def __init__(
         self,
@@ -119,6 +124,7 @@ class SessionWindow(tk.Toplevel):
         detector_params: dict | None = None,
         calibration_result: SearchResult | None = None,
         participant: ParticipantRecord | None = None,
+        session_num: int = 0,
     ) -> None:
         super().__init__(master)
         # E1: on_back now takes an optional post-navigation toast message --
@@ -127,6 +133,11 @@ class SessionWindow(tk.Toplevel):
         self._on_back = on_back or (lambda message=None: print("Back clicked"))
         self._calibration_result = calibration_result
         self._participant = participant
+        # D2 (session-indicator plan): _session_num is mutable and live;
+        # _session_num_at_open is a frozen snapshot Restart Session rolls
+        # back to -- see _confirm_start's single increment site.
+        self._session_num = session_num
+        self._session_num_at_open = session_num
 
         self.title("GripVT — Session Recording")
         self.configure(bg=theme.BG)
@@ -307,11 +318,14 @@ class SessionWindow(tk.Toplevel):
         # Fills the previously-empty 76px right spacer (E1/E10). No weight on
         # this column, so it keeps its natural width and the eyebrow's
         # weighted centre column (1) stays centred, same as before.
-        restart = self._build_button(
+        # D7 (session-indicator plan): gated on self._session_num >= 1 --
+        # nothing to restart before the first confirmed Start.
+        self._restart_btn = self._build_button(
             bar, "Restart", "ghost", "rotate", self._open_restart_modal,
             fg_override=theme.INK_60, hover_fg=theme.ACCENT_700,
+            enabled=self._session_num >= 1,
         )
-        restart.grid(row=0, column=2, sticky="e")
+        self._restart_btn.grid(row=0, column=2, sticky="e")
 
     # ── left: camera feed slot ─────────────────────────────────────────────
     def _build_feed(self, parent: tk.Frame) -> None:
@@ -415,7 +429,7 @@ class SessionWindow(tk.Toplevel):
         panel = tk.Frame(parent, bg=theme.BG)
         panel.grid(row=0, column=1, sticky="nsew", padx=(28, 0))
 
-        self._progress_block(panel, "SESSION", "3 / 10", 0.30)
+        self._build_session_block(panel)
 
         # Paused banner (Phase 6) -- built once, packed only while the camera
         # is disconnected AND a recording is in progress (_set_camera_
@@ -505,12 +519,61 @@ class SessionWindow(tk.Toplevel):
         fill = tk.Frame(track, bg=theme.ACCENT)
         fill.place(relx=0, rely=0, relwidth=frac, relheight=1)
 
+    def _build_session_block(self, parent: tk.Frame) -> None:
+        """D5 (session-indicator plan): SESSION needs the same live-refresh
+        treatment as _build_trial_block below rather than _progress_block's
+        throwaway static build -- _confirm_start's self._session_num += 1
+        has to repaint this in place, not just at construction."""
+        wrap = tk.Frame(parent, bg=theme.BG)
+        wrap.pack(fill="x")
+
+        row = tk.Frame(wrap, bg=theme.BG)
+        row.pack(fill="x")
+        tk.Label(
+            row, text="SESSION", bg=theme.BG, fg=theme.INK_60, font=self._f_kicker,
+        ).pack(side="left")
+        self._session_value_label = tk.Label(
+            row, text=self._session_value_text(), bg=theme.BG, fg=theme.INK,
+            font=self._f_progress_value,
+        )
+        self._session_value_label.pack(side="right")
+
+        track = tk.Frame(wrap, bg=theme.NEUTRAL_200, height=6)
+        track.pack(fill="x", pady=(8, 0))
+        self._session_fill = tk.Frame(track, bg=theme.ACCENT)
+        self._session_fill.place(relx=0, rely=0, relwidth=self._session_frac(), relheight=1)
+
+    def _session_value_text(self) -> str:
+        return f"{self._session_num} / {SESSION_COUNT}"
+
+    def _session_frac(self) -> float:
+        return self._session_num / SESSION_COUNT if SESSION_COUNT else 0.0
+
+    def _refresh_session_block(self) -> None:
+        """D4 (session-indicator plan): called once, immediately after
+        _confirm_start's self._session_num += 1 -- the only place SESSION's
+        value changes within a window's lifetime (see D4 for why TRIAL needs
+        three refresh call sites and SESSION needs exactly one)."""
+        self._session_value_label.configure(text=self._session_value_text())
+        self._session_fill.place_configure(relwidth=self._session_frac())
+
+    def _kept_sessions_phrase(self) -> str:
+        """D6: single source of truth for "how many prior sessions in this
+        visit are still on disk," read at the moment Restart Session would
+        fire. D7 keeps Restart disabled below self._session_num == 1, so 0
+        is unreachable here -- only the == 1 (no priors yet) vs. > 1 split
+        matters."""
+        if self._session_num <= 1:
+            return "No prior sessions yet."
+        return f"Sessions 1-{self._session_num - 1} are kept."
+
     def _build_trial_block(self, parent: tk.Frame) -> None:
         """TRIAL gets its own rendering path rather than _progress_block
         (Phase 8, E7): it carries a live value/bar plus an inline Undo
         button, so the value label and bar fill are stored for
         _refresh_trial_block to update without a rebuild. SESSION above
-        keeps using _progress_block unchanged."""
+        (_build_session_block) now follows the same pattern; _progress_block
+        itself is unused but left in place (D5, session-indicator plan)."""
         wrap = tk.Frame(parent, bg=theme.BG)
         wrap.pack(fill="x")
 
@@ -678,6 +741,8 @@ class SessionWindow(tk.Toplevel):
         self._start_btn.set_enabled(not start_disabled)
         self._stop_btn.set_enabled(not stop_disabled)
         self._next_btn.set_enabled(not next_trial_disabled)
+        # D7: flips on the instant the first Start of a window is confirmed.
+        self._restart_btn.set_enabled(self._session_num >= 1)
 
     def _render_gate_box(self) -> None:
         for child in self._gate_box.winfo_children():
@@ -1389,6 +1454,8 @@ class SessionWindow(tk.Toplevel):
             return
         self._sequence = seq
         self._trial = 1
+        self._session_num += 1
+        self._refresh_session_block()
         self._undo_available = False
         self._recording = True
         self._recording_started = True
@@ -1624,9 +1691,15 @@ class SessionWindow(tk.Toplevel):
                 self._finalize_recording("restart", discard_open_segment=True)
             self._close_modal()
             self.release_camera()
-            self._on_back(
-                "Session 3 abandoned — returned to Sensor Calibration. Sessions 1-2 kept."
+            message = (
+                f"Session {self._session_num} abandoned — returned to Sensor "
+                f"Calibration. {self._kept_sessions_phrase()}"
             )
+            # D3: hand the next window the pre-Start snapshot, not the
+            # incremented live value, so the retried session reuses the
+            # same number -- built the toast off the live value above first.
+            self._session_num = self._session_num_at_open
+            self._on_back(message)
 
         def confirm_all() -> None:
             # D6: same abort handling as confirm_session, scope="all".
@@ -1641,10 +1714,12 @@ class SessionWindow(tk.Toplevel):
                 self._finalize_recording("restart", discard_open_segment=True)
             self._close_modal()
             self.release_camera()
-            self._on_back(
+            message = (
                 "All sessions abandoned — returned to Sensor Calibration. "
-                "Counter reset to 1 of 10."
+                f"The next session recorded will be session 1 of {SESSION_COUNT}."
             )
+            self._session_num = 0  # D3: full reset, per Q1
+            self._on_back(message)
 
         def build(parent: tk.Frame) -> None:
             wrap = tk.Frame(parent, bg=theme.BG)
@@ -1680,9 +1755,11 @@ class SessionWindow(tk.Toplevel):
             ).pack(fill="x")
             tk.Label(
                 row1_text,
-                text="Abandons session 3 and returns to Sensor Calibration. "
-                     "Sessions 1-2 are kept. The next attempt is still session "
-                     "3 of 10.",
+                text=(
+                    f"Abandons session {self._session_num} and returns to Sensor "
+                    f"Calibration. {self._kept_sessions_phrase()} The next attempt "
+                    f"is still session {self._session_num} of {SESSION_COUNT}."
+                ),
                 bg=theme.BG, fg=theme.INK_70, font=self._f_small, wraplength=320,
                 justify="left", anchor="w",
             ).pack(fill="x", pady=(4, 0))
@@ -1707,10 +1784,12 @@ class SessionWindow(tk.Toplevel):
             ).pack(fill="x")
             tk.Label(
                 row2_text,
-                text="Abandons all sessions for this participant's visit and "
-                     "returns to Sensor Calibration. Nothing is deleted; every "
-                     "session is kept and flagged. The counter resets to "
-                     "session 1 of 10.",
+                text=(
+                    "Abandons all sessions for this participant's visit and "
+                    "returns to Sensor Calibration. Nothing is deleted; every "
+                    "session is kept and flagged. The next session recorded "
+                    f"will be session 1 of {SESSION_COUNT}."
+                ),
                 bg=theme.ACCENT_10, fg=theme.ACCENT_700, font=self._f_small,
                 wraplength=320, justify="left", anchor="w",
             ).pack(fill="x", pady=(4, 0))
