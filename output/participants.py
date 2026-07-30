@@ -8,6 +8,7 @@ recordings tree can be backed up without leaking identities.
 import json
 import os
 import re
+import shutil
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -59,6 +60,7 @@ def create_participant(
     forearm_circ_cm: float,
     mvc_kg: float,
     activity_level: str,
+    mvc_source_path: str,
 ) -> ParticipantRecord:
     now = datetime.now()
     ts = now.strftime("%Y%m%d_%H%M%S")
@@ -67,6 +69,12 @@ def create_participant(
 
     folder = os.path.join(RECORDINGS_DIR, f"{pid}_{ts}")
     os.makedirs(folder, exist_ok=True)
+
+    # mvc.txt is the primary provenance record behind mvc_kg -- a failed copy
+    # (missing/unreadable source) must abort here, before participant.json is
+    # ever written, rather than degrade silently (D10 of
+    # docs/logs/20260730_150048_mvc_file_load_plan.md).
+    shutil.copy2(mvc_source_path, os.path.join(folder, "mvc.txt"))
 
     record = ParticipantRecord(
         participant_id=pid,

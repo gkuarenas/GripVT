@@ -11,9 +11,11 @@ name is routed to an external key file (see ``output/participants.py``). The
 resulting ``ParticipantRecord`` is handed to ``on_save`` to open the session.
 """
 import tkinter as tk
+from tkinter import filedialog
 from typing import Callable
 
 from output import participants
+from output.mvc import MvcParseError, parse_mvc_file
 from output.participants import ParticipantRecord
 from ui import theme
 
@@ -40,8 +42,13 @@ MEASUREMENTS = [
     ("Weight (kg)", "e.g. 72.5", "decimal"),
     ("Height (cm)", "e.g. 172", "decimal"),
     ("Forearm Circ. (cm)", "e.g. 26.4", "decimal"),
-    ("MVC (kg)", "e.g. 32.1", "decimal"),
 ]
+
+# "Load MVC File" (not the longer "Load MVC Recording File") -- measured via
+# tkfont.measure() against the real 5-up 134.4px column at body-12: 81px,
+# comfortable margin. See docs/logs/20260730_150048_mvc_file_load_plan.md
+# Phase 3 (the prior MVC-field plan hit this exact fit problem once already).
+MVC_BUTTON_LABEL = "Load MVC File"
 
 
 class NewParticipantWindow(tk.Toplevel):
@@ -65,6 +72,10 @@ class NewParticipantWindow(tk.Toplevel):
         self._ph_state: dict[tk.Entry, dict] = {}
         self._field_errors: dict[tk.Entry, tk.Label] = {}
         self._banner_after: str | None = None
+        # MVC has no Entry (D9, mvc_file_load_plan): its value/source/error
+        # state lives here instead of in the Entry-keyed dicts above.
+        self._mvc_kg: float | None = None
+        self._mvc_source_path: str | None = None
 
         self._init_fonts()
         self._build_body()
@@ -127,11 +138,13 @@ class NewParticipantWindow(tk.Toplevel):
             field = self._build_field(grid, label, placeholder, numeric, label_h=_MEASURE_LABEL_H)
             # sticky="new" (top-anchored): a "Required." line under one field grows that
             # cell downward without re-centering its neighbours, so inputs stay on one row.
-            field.master.grid(
-                row=0, column=col, sticky="new",
-                padx=(0, 14) if col < len(MEASUREMENTS) - 1 else 0,
-            )
+            # MVC's cell always follows (below), so every measurement column gets a gap.
+            field.master.grid(row=0, column=col, sticky="new", padx=(0, 14))
             self._measures.append(field)
+
+        mvc_col = len(MEASUREMENTS)
+        grid.columnconfigure(mvc_col, weight=1, uniform="m")
+        self._build_mvc_field(grid).grid(row=0, column=mvc_col, sticky="new")
 
     def _build_activity(self, parent: tk.Frame) -> None:
         wrap = tk.Frame(parent, bg=theme.BG)
@@ -195,7 +208,7 @@ class NewParticipantWindow(tk.Toplevel):
             missing.append("Full Name")
 
         values: dict = {}
-        keys = ["age", "weight_kg", "height_cm", "forearm_circ_cm", "mvc_kg"]
+        keys = ["age", "weight_kg", "height_cm", "forearm_circ_cm"]
         for (label, _ph, numeric), entry, key in zip(MEASUREMENTS, self._measures, keys):
             raw = self._field_value(entry)
             parsed = None
@@ -209,6 +222,11 @@ class NewParticipantWindow(tk.Toplevel):
             else:
                 values[key] = parsed
 
+        if self._mvc_kg is None:
+            missing.append("MVC (kg)")
+        else:
+            values["mvc_kg"] = self._mvc_kg
+
         if missing:
             return None, missing
         values["name"] = name
@@ -221,7 +239,18 @@ class NewParticipantWindow(tk.Toplevel):
             self._show_field_errors(missing)
             return
         self._clear_field_errors()
-        record = participants.create_participant(**values)
+        try:
+            record = participants.create_participant(
+                **values, mvc_source_path=self._mvc_source_path
+            )
+        except OSError as exc:
+            # D10 (mvc_file_load_plan): a failed copy blocks the save rather
+            # than degrading silently -- mvc.txt is the primary provenance
+            # record behind the mvc_kg just computed, not a fallback artifact.
+            self._mvc_status.configure(text=f"Could not save MVC file: {exc}", fg=theme.ACCENT_700)
+            self._mvc_status.pack(fill="x", anchor="w", pady=(4, 0))
+            self._mvc_box.configure(highlightbackground=theme.ACCENT)
+            return
         self._on_save(record)
 
     def _show_field_errors(self, missing: list[str]) -> None:
@@ -233,6 +262,7 @@ class NewParticipantWindow(tk.Toplevel):
                 err.pack(fill="x", anchor="w", pady=(4, 0))
             else:
                 err.pack_forget()
+        self._set_mvc_error("MVC (kg)" in missing)
         if self._banner_after is not None:
             self.after_cancel(self._banner_after)
         self._reset_banner_colors()
@@ -275,7 +305,19 @@ class NewParticipantWindow(tk.Toplevel):
         for _label, entry in self._labeled_entries():
             entry.configure(highlightbackground=theme.DIVIDER)
             self._field_errors[entry].pack_forget()
+        self._mvc_box.configure(highlightbackground=theme.DIVIDER)
         self._hide_banner()
+
+    def _set_mvc_error(self, bad: bool) -> None:
+        """Toggle the MVC cell's "Required." state, parallel to the Entry fields'
+        _show_field_errors branch above but keyed on self._mvc_kg, not a widget dict
+        (D9, mvc_file_load_plan -- MVC has no Entry to key an error dict on)."""
+        self._mvc_box.configure(highlightbackground=theme.ACCENT if bad else theme.DIVIDER)
+        if bad:
+            self._mvc_status.configure(text="Required.", fg=theme.ACCENT_700)
+            self._mvc_status.pack(fill="x", anchor="w", pady=(4, 0))
+        elif self._mvc_kg is None:
+            self._mvc_status.pack_forget()
 
     def _clear_one(self, entry: tk.Entry) -> None:
         """Clear a single field's error once it holds input, matching the design."""
@@ -338,6 +380,83 @@ class NewParticipantWindow(tk.Toplevel):
         )
         entry.bind("<KeyRelease>", lambda _e, en=entry: self._clear_one(en), add="+")
         return entry
+
+    def _build_mvc_field(self, parent: tk.Misc) -> tk.Frame:
+        """MVC's cell: same label row as _build_field, but a button in place of an
+        Entry (D9, mvc_file_load_plan -- MVC is computed from a loaded file, not typed)."""
+        field = tk.Frame(parent, bg=theme.BG)
+
+        head = tk.Frame(field, bg=theme.BG, height=_MEASURE_LABEL_H)
+        head.pack_propagate(False)
+        head.pack(fill="x", pady=(0, 5))
+        row = tk.Frame(head, bg=theme.BG)
+        row.pack(side="bottom", fill="x")
+        tk.Label(row, text="MVC (kg)", bg=theme.BG, fg=theme.INK_70, font=self._f_label).pack(side="left")
+        tk.Label(row, text=" *", bg=theme.BG, fg=theme.ACCENT_700, font=self._f_label).pack(side="left")
+
+        self._mvc_box = tk.Frame(
+            field, bg=theme.SURFACE, highlightthickness=1,
+            highlightbackground=theme.DIVIDER, highlightcolor=theme.ACCENT,
+        )
+        self._mvc_box.pack(fill="x", ipady=6)
+        mvc_text = tk.Label(
+            self._mvc_box, text=MVC_BUTTON_LABEL, bg=theme.SURFACE, fg=theme.INK, font=self._f_label,
+        )
+        mvc_text.pack()
+
+        def paint(colour: str) -> None:
+            self._mvc_box.configure(bg=colour)
+            mvc_text.configure(bg=colour)
+
+        def on_release(_e: object) -> None:
+            # _handle_load_mvc blocks on a modal file dialog, so the pointer may
+            # have moved by the time it returns -- re-check rather than assume
+            # hover (mirrors _wire_button's on_release above).
+            self._handle_load_mvc()
+            x, y = self._mvc_box.winfo_pointerxy()
+            hovered = self._mvc_box.winfo_containing(x, y)
+            still_over = hovered is not None and (
+                hovered is self._mvc_box or str(hovered).startswith(str(self._mvc_box))
+            )
+            paint(theme.HOVER if still_over else theme.SURFACE)
+
+        for w in (self._mvc_box, mvc_text):
+            w.configure(cursor="hand2")
+            w.bind("<Enter>", lambda _e: paint(theme.HOVER))
+            w.bind("<Leave>", lambda _e: paint(theme.SURFACE))
+            w.bind("<ButtonPress-1>", lambda _e: paint(theme.ACTIVE))
+            w.bind("<ButtonRelease-1>", on_release)
+
+        # Not packed initially -- matches the other fields' hidden "Required."
+        # labels (built, shown only once there's something to say).
+        self._mvc_status = tk.Label(
+            field, bg=theme.BG, font=self._f_desc, anchor="w",
+        )
+        return field
+
+    def _handle_load_mvc(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self, title="Select MVC Recording File",
+            filetypes=[("MVC recording", "*.txt"), ("All files", "*.*")],
+        )
+        if not path:
+            return  # dialog cancelled -- leave any prior state untouched
+
+        try:
+            result = parse_mvc_file(path)
+        except MvcParseError as exc:
+            self._mvc_kg = None
+            self._mvc_source_path = None
+            self._mvc_box.configure(highlightbackground=theme.ACCENT)
+            self._mvc_status.configure(text=str(exc), fg=theme.ACCENT_700)
+            self._mvc_status.pack(fill="x", anchor="w", pady=(4, 0))
+            return
+
+        self._mvc_kg = result.mvc_kg
+        self._mvc_source_path = path
+        self._mvc_box.configure(highlightbackground=theme.DIVIDER)
+        self._mvc_status.configure(text=f"{result.mvc_kg:.2f} kg loaded (3 clenches).", fg=theme.INK_70)
+        self._mvc_status.pack(fill="x", anchor="w", pady=(4, 0))
 
     # ── radios (custom flat dot, matching .radio) ───────────────────────────
     def _build_radio(self, parent: tk.Frame, col: int, value: str, desc: str) -> None:
