@@ -81,6 +81,11 @@ class NewParticipantWindow(tk.Toplevel):
 
         self._init_fonts()
         self._build_body()
+        # grid's uniform-column widths (e.g. the MVC button's field) resolve over
+        # two geometry passes -- without forcing both to complete before the window
+        # is shown, the first (unsettled) pass can paint, e.g. the MVC button's
+        # label at 1px wide before it re-fills to match the button on the next pass.
+        self.update()
         theme.apply_dark_titlebar(self)
 
     def _center(self, w: int, h: int) -> None:
@@ -411,7 +416,7 @@ class NewParticipantWindow(tk.Toplevel):
         mvc_text = tk.Label(
             self._mvc_box, text=MVC_BUTTON_LABEL, bg=theme.ACCENT, fg=theme.BG, font=self._f_button,
         )
-        mvc_text.pack()
+        mvc_text.pack(fill="both", expand=True)
 
         def paint(colour: str) -> None:
             self._mvc_box.configure(bg=colour)
