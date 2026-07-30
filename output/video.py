@@ -16,7 +16,10 @@ ffmpeg subprocess with explicit -crf) is the spec'd fallback, not built here.
 import cv2
 import numpy as np
 
-VIDEO_FPS = 30.0  # matches the probe's FPS and D3's full-30fps decision
+# Container write-cadence only, NOT the achieved rate -- see the video_log
+# event's real_duration_ms/achieved_fps and markers.csv's timestamp_ms for
+# the true per-frame clock (docs/logs/20260730_163901_video_fps_labeling_plan.md).
+VIDEO_FPS = 30.0
 VIDEO_EXT = ".mp4"  # Phase 1 probe: only .mp4 opened under MSMF; .avi failed for every fourcc
 VIDEO_FOURCC = "avc1"  # Phase 1 probe: avc1/H264/h264/X264 were byte-identical under MSMF; avc1 chosen as most conventional
 
@@ -29,10 +32,16 @@ class VideoLogWriter:
             raise RuntimeError(f"VideoLogWriter: failed to open {path!r} (fourcc={VIDEO_FOURCC!r}, size={size}, fps={fps})")
         self.path = path
         self.frame_count = 0
+        self.first_ts_ms: float | None = None
+        self.last_ts_ms: float | None = None
 
-    def write(self, frame: np.ndarray) -> None:
+    def write(self, frame: np.ndarray, timestamp_ms: float | None = None) -> None:
         self._writer.write(frame)
         self.frame_count += 1
+        if timestamp_ms is not None:
+            if self.first_ts_ms is None:
+                self.first_ts_ms = timestamp_ms
+            self.last_ts_ms = timestamp_ms
 
     def close(self) -> None:
         if self._writer is not None:

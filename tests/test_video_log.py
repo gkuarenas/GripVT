@@ -66,3 +66,24 @@ def test_init_raises_on_unwritable_path(tmp_path):
     bad_path = str(tmp_path / "does_not_exist" / f"raw_video{VIDEO_EXT}")
     with pytest.raises(Exception):
         VideoLogWriter(bad_path, size=SIZE, fps=VIDEO_FPS)
+
+
+def test_write_tracks_first_and_last_timestamp(tmp_path):
+    path = str(tmp_path / f"raw_video{VIDEO_EXT}")
+    writer = VideoLogWriter(path, size=SIZE, fps=VIDEO_FPS)
+    for frame, ts in zip(make_frames(3), [100.0, 200.0, 350.0]):
+        writer.write(frame, ts)
+    writer.close()
+
+    assert writer.first_ts_ms == 100.0
+    assert writer.last_ts_ms == 350.0
+
+
+def test_write_without_timestamp_leaves_ts_none(tmp_path):
+    path = str(tmp_path / f"raw_video{VIDEO_EXT}")
+    writer = VideoLogWriter(path, size=SIZE, fps=VIDEO_FPS)
+    writer.write(make_frames(1)[0])  # existing callers don't pass timestamp_ms
+    writer.close()
+
+    assert writer.first_ts_ms is None
+    assert writer.last_ts_ms is None

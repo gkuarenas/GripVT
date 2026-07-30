@@ -157,7 +157,8 @@ class CameraFeedMixin:
         if ret:
             self._read_fail_streak = 0
             if self._video is not None:
-                self._video.write(frame)  # raw, pre-undistortion (D7)
+                ts = now_ms(self._t0_wall_ms, self._t0_monotonic)
+                self._video.write(frame, ts)  # raw, pre-undistortion (D7)
             if self._baseline["status"] == "capturing":
                 self._capture_baseline_frame(frame)
             display = self._tracker.undistort(frame)

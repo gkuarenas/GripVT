@@ -416,11 +416,17 @@ class RecordingMixin:
                 _log.exception("overlay.png write failed during _finalize_recording")
 
         if self._video is not None:
-            self._event_log.append({
+            event = {
                 "type": "video_log",
                 "path": os.path.basename(self._video.path),
                 "frame_count": self._video.frame_count,
-            })
+            }
+            if self._video.first_ts_ms is not None and self._video.last_ts_ms is not None:
+                real_duration_ms = self._video.last_ts_ms - self._video.first_ts_ms
+                event["real_duration_ms"] = real_duration_ms
+                if real_duration_ms > 0:
+                    event["achieved_fps"] = self._video.frame_count / (real_duration_ms / 1000)
+            self._event_log.append(event)
             self._video.close()
             self._video = None
 

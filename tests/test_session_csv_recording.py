@@ -850,6 +850,35 @@ def test_finalize_closes_video_and_rereads_expected_frame_count(video_window, tm
     assert video_events[0]["frame_count"] == n_polls
 
 
+def test_video_log_event_carries_real_duration_and_achieved_fps(video_window, tmp_path):
+    """docs/logs/20260730_163901_video_fps_labeling_plan.md, Phase 3 -- the
+    video_log event must carry the true per-frame timing, not just frame_count,
+    since VIDEO_FPS is a nominal write-cadence, not the achieved rate."""
+    win = video_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+
+    n_polls = 3
+    for _ in range(n_polls):
+        win._poll()
+        time.sleep(0.02)  # ensure a measurable, real duration between frames
+
+    win._confirm_stop()
+
+    with open(os.path.join(session_dir, "events.json")) as f:
+        envelope = json.load(f)
+    event = [e for e in envelope["events"] if e["type"] == "video_log"][0]
+
+    assert event["real_duration_ms"] > 0
+    assert event["achieved_fps"] == pytest.approx(
+        n_polls / (event["real_duration_ms"] / 1000), rel=1e-6
+    )
+
+
 def test_video_log_open_failure_degrades_to_no_video(connected_window, tmp_path, monkeypatch):
     """D10: a VideoLogWriter that raises on construction must never block the
     session -- markers.csv/trials.csv/events.json still get written normally,
