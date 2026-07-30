@@ -11,13 +11,25 @@ marker count is controlled directly rather than depending on real detection
 against synthetic frames.
 """
 import tkinter as tk
+from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 
 import ui.session.baseline as baseline_module
 import ui.session.camera_feed as camera_feed_module
+from output import participants
 from output.participants import ParticipantRecord
 from ui.session import SessionWindow
+
+_CLIP_FRAME_SIZE = (48, 64, 3)  # (h, w, c) -- small, for fast test encodes
+
+# The `window` fixture monkeypatches cv2.VideoCapture on the shared cv2
+# module (camera_feed.py's `cv2` is the same module object), which would
+# also stub out re-reads of a written clip within the same test. Grab the
+# real class before any test can patch it.
+_REAL_VIDEO_CAPTURE = cv2.VideoCapture
 
 
 class _StubCapture:
@@ -65,6 +77,29 @@ def _finish_burst(win: SessionWindow, count: int) -> None:
     assert win._baseline["status"] == "capturing"
     for _ in range(baseline_module.BASELINE_FRAMES):
         win._capture_baseline_frame(object())
+
+
+def _finish_burst_with_video(win: SessionWindow, count: int) -> None:
+    """Like _finish_burst, but feeds real frames so the resulting baseline
+    clip is a genuine, re-readable video."""
+    win._tracker.capture_baseline = lambda frames: count
+    win._on_capture_baseline_click()
+    assert win._baseline["status"] == "capturing"
+    for _ in range(baseline_module.BASELINE_FRAMES):
+        frame = np.random.randint(0, 256, _CLIP_FRAME_SIZE, dtype=np.uint8)
+        win._capture_baseline_frame(frame)
+
+
+def _count_video_frames(path: Path) -> int:
+    cap = _REAL_VIDEO_CAPTURE(str(path))
+    n = 0
+    for _ in range(baseline_module.BASELINE_FRAMES + 5):  # bounded: no hang on a stuck backend
+        ok, _ = cap.read()
+        if not ok:
+            break
+        n += 1
+    cap.release()
+    return n
 
 
 def _make_participant(tmp_path) -> ParticipantRecord:
@@ -136,3 +171,95 @@ def test_recapture_click_ignored_after_start(window):
     window._confirm_start()
     window._on_recapture_baseline_click()
     assert window._baseline["status"] == "pass"  # unchanged -- no re-lock mid-session
+
+
+def test_pass_path_writes_matching_baseline_clip(window, tmp_path):
+    window._participant = _make_participant(tmp_path)
+    _finish_burst_with_video(window, 97)
+
+    folder = Path(window._participant.folder)
+    jsons = list(folder.glob("baseline_*.json"))
+    clips = list(folder.glob("baseline_*.mp4"))
+    assert len(jsons) == 1
+    assert len(clips) == 1
+    assert jsons[0].stem == clips[0].stem
+    assert _count_video_frames(clips[0]) == baseline_module.BASELINE_FRAMES
+
+
+def test_override_path_writes_matching_baseline_clip(window, tmp_path):
+    window._participant = _make_participant(tmp_path)
+    _finish_burst_with_video(window, 60)
+    assert window._baseline["status"] == "fail"
+    window._on_override_baseline_click()
+
+    folder = Path(window._participant.folder)
+    jsons = list(folder.glob("baseline_*.json"))
+    clips = list(folder.glob("baseline_*.mp4"))
+    assert len(jsons) == 1
+    assert len(clips) == 1
+    assert jsons[0].stem == clips[0].stem
+    assert _count_video_frames(clips[0]) == baseline_module.BASELINE_FRAMES
+
+
+def test_fail_recapture_pass_writes_exactly_one_clip(window, tmp_path):
+    window._participant = _make_participant(tmp_path)
+
+    _finish_burst_with_video(window, 50)  # fail, discarded
+    assert window._baseline["status"] == "fail"
+    window._on_recapture_baseline_click()
+
+    _finish_burst_with_video(window, 55)  # fail again, discarded
+    assert window._baseline["status"] == "fail"
+    window._on_recapture_baseline_click()
+
+    _finish_burst_with_video(window, 97)  # winning attempt
+
+    folder = Path(window._participant.folder)
+    jsons = list(folder.glob("baseline_*.json"))
+    clips = list(folder.glob("baseline_*.mp4"))
+    assert len(jsons) == 1
+    assert len(clips) == 1
+    assert jsons[0].stem == clips[0].stem
+
+
+def test_save_baseline_writes_clip_under_json_ts(tmp_path):
+    record = _make_participant(tmp_path)
+    frames = [
+        np.random.randint(0, 256, _CLIP_FRAME_SIZE, dtype=np.uint8) for _ in range(15)
+    ]
+
+    json_path = Path(
+        participants.save_baseline(
+            record,
+            locked_count=97,
+            passed=True,
+            overridden=False,
+            corners=None,
+            bands=None,
+            params={"thresh": 40, "min_area": 5},
+            frames=frames,
+        )
+    )
+    clip_path = json_path.with_suffix(".mp4")
+
+    assert json_path.exists()
+    assert clip_path.exists()
+    assert json_path.stem == clip_path.stem
+    assert _count_video_frames(clip_path) == 15
+
+
+def test_save_baseline_without_frames_writes_no_clip(tmp_path):
+    record = _make_participant(tmp_path)
+    json_path = Path(
+        participants.save_baseline(
+            record,
+            locked_count=97,
+            passed=True,
+            overridden=False,
+            corners=None,
+            bands=None,
+            params={"thresh": 40, "min_area": 5},
+        )
+    )
+    assert json_path.exists()
+    assert list(json_path.parent.glob("baseline_*.mp4")) == []

@@ -22,6 +22,7 @@ tests must patch ui.session.recording.draw_overlay, not the old
 ui.session_window.draw_overlay.
 """
 import logging
+import os
 import time
 import tkinter as tk
 from datetime import datetime
@@ -30,11 +31,13 @@ from typing import Callable
 
 import cv2
 
+from core.calibration import CameraCalibration
 from core.tracker import MarkerRecord, Tracker
 from core.trial_sequence import (
     SequenceGenerationError, TrialSequence, generate_sequence, target_kg,
 )
 from output.participants import ParticipantRecord
+from output.video import VIDEO_EXT, VIDEO_FPS, VideoLogWriter
 from output.writer import (
     CSVWriter, EventLog, TrialLog, anchor_wall_clock, make_session_dir, now_ms, save_sequence,
 )
@@ -66,6 +69,8 @@ class RecordingMixin:
     _trial_max: int
     _trial_log: TrialLog | None
     _writer: CSVWriter | None
+    _video: VideoLogWriter | None
+    _cal: CameraCalibration
     _segment_id: int
     _t0_wall_ms: float
     _t0_monotonic: float
@@ -308,6 +313,19 @@ class RecordingMixin:
             frame_index_at_start=self._tracker.frame_index,
         )
         self._t0_wall_ms, self._t0_monotonic = anchor_wall_clock()
+        try:
+            self._video = VideoLogWriter(
+                os.path.join(session_dir, f"raw_video{VIDEO_EXT}"),
+                size=self._cal.image_size, fps=VIDEO_FPS,
+            )
+        except Exception as e:
+            self._video = None
+            self._event_log.append({
+                "type": "video_log_failed",
+                "error": str(e),
+                "ts": now_ms(self._t0_wall_ms, self._t0_monotonic),
+            })
+            self._show_toast("Video log failed to start — recording without raw video.")
         self._segment_id = 0
         save_sequence(
             session_dir, participant_id=self._participant.participant_id,
@@ -396,6 +414,15 @@ class RecordingMixin:
                 cv2.imwrite(self._writer.png_path, overlay)
             except Exception:
                 _log.exception("overlay.png write failed during _finalize_recording")
+
+        if self._video is not None:
+            self._event_log.append({
+                "type": "video_log",
+                "path": os.path.basename(self._video.path),
+                "frame_count": self._video.frame_count,
+            })
+            self._video.close()
+            self._video = None
 
         self._trial_log.flush()
         self._event_log.flush()

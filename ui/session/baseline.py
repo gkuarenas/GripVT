@@ -45,6 +45,7 @@ class BaselineMixin:
     # mypy resolves self.<attr> access within this mixin. No runtime effect.
     _baseline: dict
     _baseline_frames: list[np.ndarray]
+    _baseline_clip_frames: list[np.ndarray]
     _phase1_frame: tk.Frame
     _phase2_frame: tk.Frame
     _recording: bool
@@ -336,6 +337,7 @@ class BaselineMixin:
         if self._baseline["status"] == "capturing":
             return
         self._baseline_frames = []
+        self._baseline_clip_frames = []
         self._baseline = {
             "status": "capturing", "frame": 0, "count": None,
             "overridden": False, "corners": None, "bands": None, "subline": "",
@@ -346,6 +348,7 @@ class BaselineMixin:
         if self._recording_started:
             return
         self._baseline_frames = []
+        self._baseline_clip_frames = []
         self._baseline = dict(_BASELINE_IDLE)
         self._render_baseline()
 
@@ -372,6 +375,7 @@ class BaselineMixin:
 
     def _finish_baseline_capture(self) -> None:
         count = self._tracker.capture_baseline(self._baseline_frames)
+        self._baseline_clip_frames = self._baseline_frames
         self._baseline_frames = []
         passed = count >= MIN_ACCEPTABLE
 
@@ -417,4 +421,5 @@ class BaselineMixin:
             corners=b["corners"],
             bands=b["bands"],
             params=self._tracker.params,
+            frames=self._baseline_clip_frames,
         )

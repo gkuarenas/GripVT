@@ -64,6 +64,7 @@ from core.roi import DEFAULT_ALPHA, ROICrop
 from core.tracker import MarkerRecord, Tracker
 from core.trial_sequence import TRIAL_COUNT
 from output.participants import ParticipantRecord
+from output.video import VideoLogWriter
 from ui import theme
 
 from .baseline import BaselineMixin, _BASELINE_IDLE
@@ -146,6 +147,8 @@ class SessionWindow(
 
         self._baseline: dict = dict(_BASELINE_IDLE)
         self._baseline_frames: list[np.ndarray] = []
+        # Holds the winning burst until _save_baseline_record persists it (D13).
+        self._baseline_clip_frames: list[np.ndarray] = []
         self._recording_started = False
         # _recording (Phase 5, DCLogic) toggles Start<->Stop within a trial
         # block; _recording_started (D2) latches True forever on first Start
@@ -158,6 +161,10 @@ class SessionWindow(
         self._writer = None
         self._trial_log = None
         self._event_log = None
+        # Phase 4 (raw video log plan): shares self._writer's lifetime --
+        # opened in _confirm_start, closed and nulled in _finalize_recording
+        # (D9), no second "is it open" flag.
+        self._video: VideoLogWriter | None = None
         # Phase 5: the still-open camera_loss event dict, or None -- appended
         # to self._event_log in _set_camera_disconnected and closed (end_ts
         # set) in retry_camera or _finalize_recording. EventLog.append() just

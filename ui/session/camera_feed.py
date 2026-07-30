@@ -19,6 +19,7 @@ from core.calibration import CameraCalibration
 from core.detector_search import TARGET_MARKERS
 from core.roi import ROICrop
 from core.tracker import MarkerRecord, Tracker
+from output.video import VideoLogWriter
 from output.writer import CSVWriter, EventLog, now_ms
 from ui import theme
 
@@ -93,6 +94,7 @@ class CameraFeedMixin:
     _frame_tick: int
     _last_records: list[MarkerRecord] | None
     _writer: CSVWriter | None
+    _video: VideoLogWriter | None
     _tracked_label: tk.Label
     _tracked_tier: str | None
     _tracked_badge: tk.Frame
@@ -154,6 +156,8 @@ class CameraFeedMixin:
         ret, frame = self._cap.read()
         if ret:
             self._read_fail_streak = 0
+            if self._video is not None:
+                self._video.write(frame)  # raw, pre-undistortion (D7)
             if self._baseline["status"] == "capturing":
                 self._capture_baseline_frame(frame)
             display = self._tracker.undistort(frame)

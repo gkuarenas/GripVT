@@ -18,6 +18,7 @@ import json
 import os
 import time
 
+import cv2
 import numpy as np
 import pytest
 
@@ -26,9 +27,16 @@ import ui.session.camera_feed as camera_feed_module
 import ui.session.recording as recording_module
 from core.tracker import MarkerRecord
 from output.participants import ParticipantRecord
+from output.video import VIDEO_EXT
 from ui.session import SessionWindow
 
 MARKER_COUNT = 5
+
+# camera_feed_module.cv2 is the same module object as cv2 itself -- fixtures
+# below monkeypatch cv2.VideoCapture globally for the fake-camera duration,
+# which would also stub out a test's own re-read of a just-written video
+# file. Grab the real class before any monkeypatching happens.
+_REAL_VIDEO_CAPTURE = cv2.VideoCapture
 
 
 class _StubCaptureConnected:
@@ -98,6 +106,31 @@ def failable_window(root, monkeypatch):
     win.destroy()
 
 
+class _StubCaptureFullSize(_StubCaptureConnected):
+    """Same as _StubCaptureConnected, but the frame matches
+    self._cal.image_size (1024x768) rather than the 4x4 stub -- required for
+    video-log tests, since VideoLogWriter opened at that size writes an
+    undecodable (0-byte) file if the frames it receives are a different
+    size (verified empirically against this machine's MSMF backend)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._frame = np.zeros((768, 1024, 3), dtype=np.uint8)
+
+
+@pytest.fixture
+def video_window(root, monkeypatch):
+    stub = _StubCaptureFullSize()
+    monkeypatch.setattr(camera_feed_module.cv2, "VideoCapture", lambda index: stub)
+    monkeypatch.setattr(camera_feed_module.Tracker, "undistort", lambda self, frame: frame)
+    monkeypatch.setattr(camera_feed_module.ROICrop, "crop", lambda self, frame: frame)
+    win = SessionWindow(root)
+    assert win._cap is not None, "stubbed VideoCapture.isOpened() should always be True"
+    yield win
+    win.release_camera()
+    win.destroy()
+
+
 def _make_participant(tmp_path) -> ParticipantRecord:
     folder = tmp_path / "participant999_test"
     folder.mkdir()
@@ -116,7 +149,8 @@ def _lock_baseline(win: SessionWindow, count: int = 97) -> None:
     win._tracker.capture_baseline = lambda frames: count
     win._on_capture_baseline_click()
     for _ in range(baseline_module.BASELINE_FRAMES):
-        win._capture_baseline_frame(object())
+        frame = np.random.randint(0, 256, (48, 64, 3), dtype=np.uint8)
+        win._capture_baseline_frame(frame)
     assert win._baseline["status"] == "pass"
     win._tracker.baseline_set = True
 
@@ -759,3 +793,131 @@ def test_finalize_survives_overlay_failure(connected_window, tmp_path, monkeypat
 
     with open(events_json) as f:
         json.load(f)  # parses cleanly
+
+
+# ── Phase 4: session video (docs/logs/20260730_110247_raw_video_log_plan.md) ─
+
+def test_confirm_start_creates_session_video(video_window, tmp_path):
+    win = video_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+
+    assert win._video is not None
+    video_path = os.path.join(session_dir, f"raw_video{VIDEO_EXT}")
+    assert win._video.path == video_path
+    assert os.path.exists(video_path)
+
+    win._confirm_stop()
+
+
+def test_finalize_closes_video_and_rereads_expected_frame_count(video_window, tmp_path):
+    win = video_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    video_path = os.path.join(session_dir, f"raw_video{VIDEO_EXT}")
+
+    n_polls = 5
+    for _ in range(n_polls):
+        win._poll()
+
+    win._confirm_stop()
+
+    assert win._video is None  # closed and nulled by _finalize_recording
+
+    cap = _REAL_VIDEO_CAPTURE(video_path)
+    decoded = 0
+    for _ in range(n_polls + 5):  # bounded: a stuck backend must not hang the suite
+        ok, _frame = cap.read()
+        if not ok:
+            break
+        decoded += 1
+    cap.release()
+    assert decoded == n_polls
+
+    with open(os.path.join(session_dir, "events.json")) as f:
+        envelope = json.load(f)
+    video_events = [e for e in envelope["events"] if e["type"] == "video_log"]
+    assert len(video_events) == 1
+    assert video_events[0]["path"] == f"raw_video{VIDEO_EXT}"
+    assert video_events[0]["frame_count"] == n_polls
+
+
+def test_video_log_open_failure_degrades_to_no_video(connected_window, tmp_path, monkeypatch):
+    """D10: a VideoLogWriter that raises on construction must never block the
+    session -- markers.csv/trials.csv/events.json still get written normally,
+    and a video_log_failed event records the failure."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("no codec available")
+
+    monkeypatch.setattr(recording_module, "VideoLogWriter", _boom)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    assert win._video is None
+
+    win._poll()
+    win._confirm_stop()
+
+    markers_csv = os.path.join(session_dir, "markers.csv")
+    trials_csv = os.path.join(session_dir, "trials.csv")
+    events_json = os.path.join(session_dir, "events.json")
+    for path in (markers_csv, trials_csv, events_json):
+        assert os.path.exists(path), path
+
+    with open(events_json) as f:
+        envelope = json.load(f)
+    failures = [e for e in envelope["events"] if e["type"] == "video_log_failed"]
+    assert len(failures) == 1
+    assert failures[0]["error"] == "no codec available"
+    assert win._video is None
+
+
+def test_video_survives_overlay_failure(video_window, tmp_path, monkeypatch):
+    """Mirrors test_finalize_survives_overlay_failure: a draw_overlay failure
+    during _finalize_recording must not leave the video writer unclosed --
+    an unfinalized H.264 container may not decode at all (D8)."""
+    win = video_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+
+    def _boom(*args, **kwargs):
+        raise ValueError("simulated overlay failure")
+
+    monkeypatch.setattr(recording_module, "draw_overlay", _boom)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    video_path = os.path.join(session_dir, f"raw_video{VIDEO_EXT}")
+
+    n_polls = 3
+    for _ in range(n_polls):
+        win._poll()
+
+    win._handle_back()  # must not raise, despite draw_overlay blowing up
+
+    assert win._video is None
+
+    cap = _REAL_VIDEO_CAPTURE(video_path)
+    decoded = 0
+    for _ in range(n_polls + 5):  # bounded: a stuck backend must not hang the suite
+        ok, _frame = cap.read()
+        if not ok:
+            break
+        decoded += 1
+    cap.release()
+    assert decoded == n_polls  # closed cleanly, not left as a corrupt container

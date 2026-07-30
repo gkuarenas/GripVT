@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 
 from core.detector_search import MIN_ACCEPTABLE, TARGET_MARKERS, SearchResult
+from output.video import VIDEO_EXT, VideoLogWriter
 
 RECORDINGS_DIR = "recordings"
 KEY_PATH = Path(r"C:\Users\Guillaume\Documents\DLSU\THESIS\GripVT_keys\participant_key.json")
@@ -143,6 +144,7 @@ def save_baseline(
     corners: dict[str, int] | None,
     bands: dict[str, int] | None,
     params: dict,
+    frames: list[np.ndarray] | None = None,
 ) -> str:
     """Persist one session's Capture Baseline lock into the participant's folder.
 
@@ -150,6 +152,11 @@ def save_baseline(
     override of a below-threshold capture (`overridden=True`, so the record is
     auditable). Lands beside `calibration_<ts>.json`, not in a session dir --
     a baseline is captured once per session, before trial 1 exists.
+
+    `frames`, if non-empty, is the winning burst's raw frames -- written as
+    `baseline_<ts>.<VIDEO_EXT>` under the same `ts` as the JSON (D4 of
+    docs/logs/20260730_110247_raw_video_log_plan.md), so the clip and its
+    record can never drift apart in time.
     """
     now = datetime.now()
     ts = now.strftime("%Y%m%d_%H%M%S")
@@ -170,6 +177,15 @@ def save_baseline(
     path = os.path.join(record.folder, f"baseline_{ts}.json")
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
+
+    if frames:
+        h, w = frames[0].shape[:2]
+        clip_path = os.path.join(record.folder, f"baseline_{ts}{VIDEO_EXT}")
+        writer = VideoLogWriter(clip_path, size=(w, h))
+        for frame in frames:
+            writer.write(frame)
+        writer.close()
+
     return path
 
 
