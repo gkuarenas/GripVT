@@ -45,9 +45,11 @@ MEASUREMENTS = [
 ]
 
 # "Load MVC File" (not the longer "Load MVC Recording File") -- measured via
-# tkfont.measure() against the real 5-up 134.4px column at body-12: 81px,
-# comfortable margin. See docs/logs/20260730_150048_mvc_file_load_plan.md
-# Phase 3 (the prior MVC-field plan hit this exact fit problem once already).
+# tkfont.measure() against the real 5-up 134.4px column, at the same font as
+# the button it's styled to match (heading-14, Archivo ExtraBold, see
+# _f_button): 102px, comfortable margin. See
+# docs/logs/20260730_150048_mvc_file_load_plan.md Phase 3 (the prior
+# MVC-field plan hit this exact fit problem once already).
 MVC_BUTTON_LABEL = "Load MVC File"
 
 
@@ -407,7 +409,7 @@ class NewParticipantWindow(tk.Toplevel):
         )
         self._mvc_box.pack(fill="x", ipady=6)
         mvc_text = tk.Label(
-            self._mvc_box, text=MVC_BUTTON_LABEL, bg=theme.ACCENT, fg=theme.BG, font=self._f_label,
+            self._mvc_box, text=MVC_BUTTON_LABEL, bg=theme.ACCENT, fg=theme.BG, font=self._f_button,
         )
         mvc_text.pack()
 
