@@ -249,7 +249,6 @@ class NewParticipantWindow(tk.Toplevel):
             # record behind the mvc_kg just computed, not a fallback artifact.
             self._mvc_status.configure(text=f"Could not save MVC file: {exc}", fg=theme.ACCENT_700)
             self._mvc_status.pack(fill="x", anchor="w", pady=(4, 0))
-            self._mvc_box.configure(highlightbackground=theme.ACCENT)
             return
         self._on_save(record)
 
@@ -305,14 +304,17 @@ class NewParticipantWindow(tk.Toplevel):
         for _label, entry in self._labeled_entries():
             entry.configure(highlightbackground=theme.DIVIDER)
             self._field_errors[entry].pack_forget()
-        self._mvc_box.configure(highlightbackground=theme.DIVIDER)
         self._hide_banner()
 
     def _set_mvc_error(self, bad: bool) -> None:
         """Toggle the MVC cell's "Required." state, parallel to the Entry fields'
         _show_field_errors branch above but keyed on self._mvc_kg, not a widget dict
-        (D9, mvc_file_load_plan -- MVC has no Entry to key an error dict on)."""
-        self._mvc_box.configure(highlightbackground=theme.ACCENT if bad else theme.DIVIDER)
+        (D9, mvc_file_load_plan -- MVC has no Entry to key an error dict on).
+
+        No border toggle here: the button is always accent-red (Phase 5), so a
+        "turn it red" error signal would be indistinguishable from its resting
+        state. The status label's text/color is the sole error signal.
+        """
         if bad:
             self._mvc_status.configure(text="Required.", fg=theme.ACCENT_700)
             self._mvc_status.pack(fill="x", anchor="w", pady=(4, 0))
@@ -394,13 +396,18 @@ class NewParticipantWindow(tk.Toplevel):
         tk.Label(row, text="MVC (kg)", bg=theme.BG, fg=theme.INK_70, font=self._f_label).pack(side="left")
         tk.Label(row, text=" *", bg=theme.BG, fg=theme.ACCENT_700, font=self._f_label).pack(side="left")
 
+        # Styled to match the footer's primary "Save & Continue" button (accent fill,
+        # BG text) rather than an Entry-style neutral box -- this is an action the
+        # operator takes, not a value they type, so it should read as a button.
+        # Border fixed at ACCENT, never toggled by hover/press -- mirrors
+        # _wire_button's primary-button behavior below, where only bg cycles.
         self._mvc_box = tk.Frame(
-            field, bg=theme.SURFACE, highlightthickness=1,
-            highlightbackground=theme.DIVIDER, highlightcolor=theme.ACCENT,
+            field, bg=theme.ACCENT, highlightthickness=1,
+            highlightbackground=theme.ACCENT, highlightcolor=theme.ACCENT,
         )
         self._mvc_box.pack(fill="x", ipady=6)
         mvc_text = tk.Label(
-            self._mvc_box, text=MVC_BUTTON_LABEL, bg=theme.SURFACE, fg=theme.INK, font=self._f_label,
+            self._mvc_box, text=MVC_BUTTON_LABEL, bg=theme.ACCENT, fg=theme.BG, font=self._f_label,
         )
         mvc_text.pack()
 
@@ -418,13 +425,13 @@ class NewParticipantWindow(tk.Toplevel):
             still_over = hovered is not None and (
                 hovered is self._mvc_box or str(hovered).startswith(str(self._mvc_box))
             )
-            paint(theme.HOVER if still_over else theme.SURFACE)
+            paint(theme.ACCENT_600 if still_over else theme.ACCENT)
 
         for w in (self._mvc_box, mvc_text):
             w.configure(cursor="hand2")
-            w.bind("<Enter>", lambda _e: paint(theme.HOVER))
-            w.bind("<Leave>", lambda _e: paint(theme.SURFACE))
-            w.bind("<ButtonPress-1>", lambda _e: paint(theme.ACTIVE))
+            w.bind("<Enter>", lambda _e: paint(theme.ACCENT_600))
+            w.bind("<Leave>", lambda _e: paint(theme.ACCENT))
+            w.bind("<ButtonPress-1>", lambda _e: paint(theme.ACCENT_700))
             w.bind("<ButtonRelease-1>", on_release)
 
         # Not packed initially -- matches the other fields' hidden "Required."
@@ -447,14 +454,12 @@ class NewParticipantWindow(tk.Toplevel):
         except MvcParseError as exc:
             self._mvc_kg = None
             self._mvc_source_path = None
-            self._mvc_box.configure(highlightbackground=theme.ACCENT)
             self._mvc_status.configure(text=str(exc), fg=theme.ACCENT_700)
             self._mvc_status.pack(fill="x", anchor="w", pady=(4, 0))
             return
 
         self._mvc_kg = result.mvc_kg
         self._mvc_source_path = path
-        self._mvc_box.configure(highlightbackground=theme.DIVIDER)
         self._mvc_status.configure(text=f"{result.mvc_kg:.2f} kg loaded (3 clenches).", fg=theme.INK_70)
         self._mvc_status.pack(fill="x", anchor="w", pady=(4, 0))
 
