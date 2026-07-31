@@ -220,13 +220,23 @@ class RecordingMixin:
         self._refresh_transport()
 
     # ── bookend confirm modals (Phase 5) ────────────────────────────────────
+    # The two modals instruct OPPOSITE tap orders, and that asymmetry is real:
+    # _confirm_start opens the writers (nothing is recorded before Confirm), while
+    # _confirm_stop closes them (recording is still live while the modal is up).
+    # The original Start copy said "before recording begins", which is literally
+    # backwards -- following it put the taps outside the camera span entirely.
+    # That is the confirmed root cause of participant001/session1 (2026-07-30)
+    # having no usable start bookend: Biopac saw taps at t~3.5-5.5s, the camera's
+    # first frame was t~9.65s. Keep both bodies explicit about which side of
+    # Confirm the taps belong on.
     def _open_start_bookend_modal(self) -> None:
         def build(parent: tk.Frame) -> None:
             self._build_bookend_content(
                 parent,
                 title="Confirm Start Bookend",
-                body="Perform the triple-tap bookend on the dynamometer now, "
-                     "before recording begins.",
+                body="Recording starts when you press Confirm. Perform the "
+                     "triple-tap bookend immediately AFTER confirming — taps "
+                     "before Confirm are not recorded.",
                 on_confirm=self._confirm_start,
             )
 
@@ -237,8 +247,9 @@ class RecordingMixin:
             self._build_bookend_content(
                 parent,
                 title="Confirm End Bookend",
-                body="Perform the closing triple-tap bookend on the dynamometer "
-                     "now, before ending the session.",
+                body="Perform the closing triple-tap bookend NOW, while recording "
+                     "is still running. Press Confirm only after the taps — "
+                     "confirming ends the recording.",
                 on_confirm=self._confirm_stop,
             )
 
