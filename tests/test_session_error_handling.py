@@ -286,7 +286,7 @@ def test_tracker_survives_disconnect_reconnect(connected_window, monkeypatch):
     win, stub = connected_window
     # Keep the throttled tracked-marker indicator out of the picture -- this
     # test is about _tracker/kalman.states identity, not detection.
-    monkeypatch.setattr(win, "_update_tracked_indicator", lambda frame: None)
+    monkeypatch.setattr(win, "_update_tracked_indicator", lambda frame, undistorted=None: None)
 
     win._tracker.baseline_set = True
     win._tracker.kalman.init_state(0, 10.0, 20.0, 5.0)

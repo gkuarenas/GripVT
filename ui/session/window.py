@@ -140,6 +140,10 @@ class SessionWindow(
         # exception disables further attempts (_tracking_disabled) rather
         # than risking the poll loop.
         self._frame_tick = 0
+        # Phase 4 (framerate spike plan, D6/D7): counts every poll (not just
+        # tracked ones, unlike _frame_tick) so the display-repaint throttle
+        # in camera_feed.py's _poll() has its own reliable counter.
+        self._display_tick = 0
         self._tracking_disabled = False
         self._tracked_tier: str | None = None
         self._tracked_blink_after: str | None = None

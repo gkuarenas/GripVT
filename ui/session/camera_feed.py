@@ -17,6 +17,7 @@ from PIL import Image, ImageTk
 
 from core.calibration import CameraCalibration
 from core.detector_search import TARGET_MARKERS
+from core.profiling import PROFILE, mark_period, maybe_report_every, report, stage
 from core.roi import ROICrop
 from core.tracker import MarkerRecord, Tracker
 from output.video import VideoLogWriter
@@ -29,11 +30,27 @@ FEED_W = 450
 FEED_H = 600
 
 CAMERA_INDEX = 1
-POLL_MS = 33  # ~30 fps, matching viewer_window
+# Target period / rate ceiling (D3, docs/logs/20260731_152249_framerate_spike_
+# plan.md) -- NOT a trailing sleep added on top of the work. _poll() computes
+# whatever budget is left of this after the frame's real work and schedules
+# only that; when the work exceeds POLL_MS, the loop runs as fast as the work
+# allows instead of the true period being work + POLL_MS.
+POLL_MS = 33
+# D2: floor for the remaining-budget computation below -- never schedule
+# after(0). The Tk event loop still needs a turn to process button presses,
+# the REC timer, and modals even when the frame work eats the whole budget;
+# a busy loop that starves the UI is worse than a slow one.
+MIN_POLL_MS = 1
 
 # A single dropped read at 30fps is normal jitter, not a disconnection --
 # only a sustained streak means the USB device actually went away (E9).
 CAMERA_FAIL_POLLS = 15  # ~0.5s at POLL_MS
+
+# D7 (framerate spike plan): the PIL/Tk repaint (cvtColor -> Image.fromarray
+# -> letterbox resize -> PhotoImage -> configure) costs real time but a human
+# eye can't tell a 30Hz repaint from a 15Hz one -- skipping every other poll
+# halves that cost while detection/tracking still runs on every poll (D6).
+DISPLAY_EVERY = 2
 
 # Full detect+Kalman+Hungarian per frame at 30fps is more work than the
 # indicator needs -- ~10Hz is well past human-perceptible for a count badge.
@@ -92,6 +109,7 @@ class CameraFeedMixin:
     _open_camera_loss_event: dict | None
     _tracking_disabled: bool
     _frame_tick: int
+    _display_tick: int
     _last_records: list[MarkerRecord] | None
     _writer: CSVWriter | None
     _video: VideoLogWriter | None
@@ -153,30 +171,65 @@ class CameraFeedMixin:
         # capture must never reschedule itself (Phase 6).
         if self._cap is None:
             return
-        ret, frame = self._cap.read()
-        if ret:
-            self._read_fail_streak = 0
-            if self._video is not None:
-                ts = now_ms(self._t0_wall_ms, self._t0_monotonic)
-                self._video.write(frame, ts)  # raw, pre-undistortion (D7)
-            if self._baseline["status"] == "capturing":
-                self._capture_baseline_frame(frame)
-            display = self._tracker.undistort(frame)
-            display = self._roi.crop(display)
-            rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-            img = _fit_letterbox(Image.fromarray(rgb), FEED_W, FEED_H)
-            photo = ImageTk.PhotoImage(img)
-            self._feed_label.configure(image=photo)
-            self._current_img = photo  # plain tk.Label drops the image without this ref
-            self._update_tracked_indicator(frame)
-        else:
-            # E9: a lone dropped read is normal 30fps jitter -- only a
-            # sustained streak means the camera actually disconnected.
-            self._read_fail_streak += 1
-            if self._read_fail_streak >= CAMERA_FAIL_POLLS:
-                self._set_camera_disconnected()
-                return  # disconnected state owns rescheduling from here (none, until retry)
-        self._after_id = self.after(POLL_MS, self._poll)
+        # Phase 2 (framerate spike plan): the real work's duration is what's
+        # left over from POLL_MS's budget, computed below instead of always
+        # sleeping the full POLL_MS on top of it (D3).
+        t_start = time.perf_counter()
+        # Phase 1 (framerate spike, see docs/logs/20260731_152249_
+        # framerate_spike_plan.md): mark_period() is the real achieved-fps
+        # measure, and the stage() wraps below are pure instrumentation --
+        # both are no-ops unless GRIPVT_PROFILE=1, so this changes nothing
+        # about the loop's behaviour or timing.
+        mark_period()
+        with stage("poll_total"):
+            with stage("read"):
+                ret, frame = self._cap.read()
+            if ret:
+                self._read_fail_streak = 0
+                if self._video is not None:
+                    ts = now_ms(self._t0_wall_ms, self._t0_monotonic)
+                    with stage("video_write"):
+                        self._video.write(frame, ts)  # raw, pre-undistortion (D7)
+                if self._baseline["status"] == "capturing":
+                    self._capture_baseline_frame(frame)
+                # Phase 3 (framerate spike plan, D4/D5): undistort the full
+                # frame once and hand the same array to both the display crop
+                # and the tracker's math -- previously Tracker.process_frame
+                # undistorted this identical frame a second time internally.
+                with stage("undistort_display"):
+                    undistorted = self._tracker.undistort(frame)
+                    display = self._roi.crop(undistorted)
+                # Phase 4 (framerate spike plan, D6/D7): before the baseline
+                # is locked the operator needs a smooth feed to position the
+                # sleeve (and the loop is cheap then anyway), so repaint every
+                # poll. Once locked, throttle to every DISPLAY_EVERY polls --
+                # a count badge/feed doesn't need to redraw faster than a
+                # human eye can tell.
+                self._display_tick += 1
+                should_repaint = (
+                    not self._tracker.baseline_set
+                    or self._display_tick % DISPLAY_EVERY == 0
+                )
+                if should_repaint:
+                    with stage("display_paint"):
+                        rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+                        img = _fit_letterbox(Image.fromarray(rgb), FEED_W, FEED_H)
+                        photo = ImageTk.PhotoImage(img)
+                        self._feed_label.configure(image=photo)
+                        self._current_img = photo  # plain tk.Label drops the image without this ref
+                with stage("track"):
+                    self._update_tracked_indicator(frame, undistorted)
+                maybe_report_every(100)
+            else:
+                # E9: a lone dropped read is normal 30fps jitter -- only a
+                # sustained streak means the camera actually disconnected.
+                self._read_fail_streak += 1
+                if self._read_fail_streak >= CAMERA_FAIL_POLLS:
+                    self._set_camera_disconnected()
+                    return  # disconnected state owns rescheduling from here (none, until retry)
+            elapsed_ms = (time.perf_counter() - t_start) * 1000
+            remaining_ms = max(MIN_POLL_MS, POLL_MS - elapsed_ms)
+            self._after_id = self.after(int(remaining_ms), self._poll)
 
     def _set_camera_disconnected(self) -> None:
         """E9: fires only after CAMERA_FAIL_POLLS consecutive failed reads.
@@ -230,7 +283,9 @@ class CameraFeedMixin:
         self._poll()
 
     # ── tracked-marker indicator (Phase 7, E2/E3) ───────────────────────────
-    def _update_tracked_indicator(self, raw_frame: np.ndarray) -> None:
+    def _update_tracked_indicator(
+        self, raw_frame: np.ndarray, undistorted: np.ndarray | None = None,
+    ) -> None:
         """Throttled Tracker.process_frame() driving the {n}/99 TRACKED
         badge. E2: gated on baseline_set -- before Capture Baseline there
         are no Kalman states and process_frame() raises RuntimeError. Any
@@ -242,6 +297,12 @@ class CameraFeedMixin:
         instead of throttled at TRACK_EVERY, so no frame is lost to the CSV
         -- but the badge repaint stays throttled at TRACK_EVERY regardless,
         since a count label doesn't need to redraw at 30Hz.
+
+        undistorted (Phase 3, framerate spike plan D4): _poll() already
+        undistorted raw_frame once for the display crop -- pass that same
+        array through to Tracker.process_frame() so it isn't undistorted a
+        second time. None (the default) preserves today's behaviour, e.g.
+        for any other caller that hasn't already undistorted the frame.
         """
         if not self._tracker.baseline_set or self._tracking_disabled:
             return
@@ -252,7 +313,7 @@ class CameraFeedMixin:
         if not should_process and not should_repaint:
             return
         try:
-            records = self._tracker.process_frame(raw_frame)
+            records = self._tracker.process_frame(raw_frame, undistorted)
         except Exception as e:
             _log.exception("process_frame failed -- disabling tracked-marker indicator")
             self._tracking_disabled = True
@@ -356,6 +417,10 @@ class CameraFeedMixin:
         if self._cap is not None:
             self._cap.release()
             self._cap = None
+        # Phase 1 (framerate spike): print the final table even if the
+        # session ended before hitting a 100-frame maybe_report_every boundary.
+        if PROFILE:
+            print(report())
 
 
 def _fit_letterbox(img: Image.Image, box_w: int, box_h: int) -> Image.Image:

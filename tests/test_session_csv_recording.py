@@ -160,7 +160,7 @@ def _install_fake_process_frame(win: SessionWindow, marker_count: int) -> None:
     deterministic MarkerRecord list -- this suite is about the CSV-writing
     plumbing downstream of process_frame(), not real detection."""
 
-    def fake_process_frame(raw_frame):
+    def fake_process_frame(raw_frame, undistorted=None):
         win._tracker.frame_index += 1
         win._tracker._last_undistorted = np.zeros((8, 8, 3), dtype=np.uint8)
         return [
@@ -487,7 +487,7 @@ def test_tracking_failure_during_recording_finalizes(connected_window, tmp_path)
     win._poll()  # one good frame first, so the session isn't empty
     assert win._recording is True
 
-    def raising_process_frame(raw_frame):
+    def raising_process_frame(raw_frame, undistorted=None):
         raise RuntimeError("boom")
 
     win._tracker.process_frame = raising_process_frame

@@ -7,6 +7,7 @@ from core.calibration import CameraCalibration
 from core.detector import load_params, preprocess, denoise, detect, detection_labels
 from core.kalman import KalmanManager
 from core.hungarian import assign
+from core.profiling import stage
 from core.roi import ROICrop
 
 TARGET_MARKER_COUNT = 99
@@ -236,14 +237,30 @@ class Tracker:
                 )
         return vis
 
-    def process_frame(self, raw_frame: np.ndarray) -> list[MarkerRecord]:
+    def process_frame(
+        self, raw_frame: np.ndarray, undistorted: np.ndarray | None = None,
+    ) -> list[MarkerRecord]:
+        """undistorted (Phase 3, framerate spike plan D4/D5): pass the
+        already-undistorted frame when a caller (today, _poll()) has
+        already computed it for the display path, so the identical
+        full-frame undistort isn't repeated here. None (the default)
+        preserves today's behaviour exactly -- capture_baseline() and any
+        other caller that hasn't pre-undistorted keep working unchanged."""
         if not self.baseline_set:
             raise RuntimeError("Call capture_baseline() before process_frame()")
 
-        undistorted = self._undistort(raw_frame)
+        # Phase 1 (framerate spike, see docs/logs/20260731_152249_
+        # framerate_spike_plan.md): stage() is a no-op unless
+        # GRIPVT_PROFILE=1 -- this splits the previously opaque "track"
+        # blob into undistort/gray/detect without changing any math.
+        if undistorted is None:
+            with stage("undistort_math"):
+                undistorted = self._undistort(raw_frame)
         self._last_undistorted = undistorted
-        gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
-        _, _, dets, moments = self._detect_full_frame(gray)
+        with stage("gray"):
+            gray = cv2.cvtColor(undistorted, cv2.COLOR_BGR2GRAY)
+        with stage("detect"):
+            _, _, dets, moments = self._detect_full_frame(gray)
 
         priors = self.kalman.predict_all()
         matches, unmatched = assign(priors, dets, self.gate_px)
