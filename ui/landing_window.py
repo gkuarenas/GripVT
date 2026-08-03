@@ -1,10 +1,10 @@
 """Landing window for the GripVT desktop app.
 
 First screen shown when the app is launched. Asks whether the operator is
-setting up a **new** participant or resuming an **existing** one, then routes
-to the appropriate flow (wired later -- for now the two buttons call the
-``on_new_participant`` / ``on_existing_participant`` hooks, defaulting to a
-print stub).
+setting up a **new** participant or resuming a session after an app crash,
+then routes to the appropriate flow (wired later -- for now the two buttons
+call the ``on_new_participant`` / ``on_resume_session`` hooks, defaulting to
+a print stub).
 
 Visual design ported from the "Modernist" design system (Claude Design:
 "GripVT Landing Window"). It is a flat aesthetic -- 0px radius, Archivo type,
@@ -13,11 +13,16 @@ themes native buttons, the two choices are built as composite frames
 (border + canvas icon + label) so the flat look is fully under our control.
 """
 import ctypes
+import os
 import sys
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
 from typing import Callable
+
+from output.participants import RECORDINGS_DIR, session_dirs
+from ui import theme
+from ui.session.progress import SESSION_COUNT
 
 # ── Modernist tokens ────────────────────────────────────────────────────────
 # tkinter has no alpha, so every colour that the design expresses as a
@@ -58,16 +63,42 @@ def _register_archivo() -> None:
         pass  # fall back to the default sans in _init_fonts
 
 
+def _has_resumable_participant() -> bool:
+    """Whether any `participantNNN_*` folder under RECORDINGS_DIR is resumable.
+
+    Resumable iff `participant.json` exists in the folder AND it has fewer
+    than SESSION_COUNT session dirs on disk (D7). Reuses the exact scan
+    helpers the session window already relies on -- `session_dirs` and
+    `SESSION_COUNT` -- rather than reimplementing the logic here. Never
+    raises: the landing window must open even if `recordings/` is missing,
+    unreadable, or malformed.
+    """
+    try:
+        if not os.path.isdir(RECORDINGS_DIR):
+            return False
+        for name in os.listdir(RECORDINGS_DIR):
+            folder = os.path.join(RECORDINGS_DIR, name)
+            if not os.path.isdir(folder):
+                continue
+            if not os.path.isfile(os.path.join(folder, "participant.json")):
+                continue
+            if len(session_dirs(folder)) < SESSION_COUNT:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 class LandingWindow(tk.Tk):
     def __init__(
         self,
         on_new_participant: Callable[[], None] | None = None,
-        on_existing_participant: Callable[[], None] | None = None,
+        on_resume_session: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         self._on_new = on_new_participant or (lambda: print("New Participant clicked"))
-        self._on_existing = on_existing_participant or (
-            lambda: print("Existing Participant clicked")
+        self._on_resume = on_resume_session or (
+            lambda: print("Resume Session clicked")
         )
 
         self.title("GripVT")
@@ -78,41 +109,16 @@ class LandingWindow(tk.Tk):
         self._center(WINDOW_W, WINDOW_H)
 
         self._init_fonts()
+        self._has_resumable = _has_resumable_participant()
         self._build_body()
-        self._apply_dark_titlebar()
+        self.update()
+        theme.apply_dark_titlebar(self)
 
     # ── window helpers ──────────────────────────────────────────────────────
     def _center(self, w: int, h: int) -> None:
         x = (self.winfo_screenwidth() - w) // 2
         y = (self.winfo_screenheight() - h) // 3  # a touch above dead-centre
         self.geometry(f"{w}x{h}+{x}+{y}")
-
-    def _apply_dark_titlebar(self) -> None:
-        # Paint the native OS title bar dark to match the flat dark-ink design.
-        # tkinter exposes no option for this; on Windows it's a DWM attribute
-        # set through ctypes. No-op (and harmless) on macOS/Linux.
-        if sys.platform != "win32":
-            return
-        try:
-            # The title bar belongs to the OS frame *around* Tk's drawing
-            # surface, so step up from winfo_id() to its parent HWND.
-            self.update_idletasks()  # ensure the native window exists first
-            hwnd = ctypes.windll.user32.GetParent(self.winfo_id())
-            enabled = ctypes.c_int(1)
-            # Attribute is 20 on Windows 10 20H1+ / Windows 11, 19 on older
-            # builds; try the modern value first, fall back to the legacy one.
-            for attr in (20, 19):
-                hresult = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                    hwnd, attr, ctypes.byref(enabled), ctypes.sizeof(enabled)
-                )
-                if hresult == 0:  # S_OK
-                    break
-            # The frame won't repaint with the new colour until it's redrawn;
-            # a withdraw/deiconify cycle forces that without moving the window.
-            self.withdraw()
-            self.deiconify()
-        except Exception:
-            pass  # DWM unavailable: fall back to the default light bar
 
     def _init_fonts(self) -> None:
         _register_archivo()
@@ -139,6 +145,7 @@ class LandingWindow(tk.Tk):
         self._font_title = tkfont.Font(family=heading, size=-45, weight=heading_weight)
         self._font_subtitle = tkfont.Font(family=semibold, size=-22, weight="normal")
         self._font_button = tkfont.Font(family=heading, size=-16, weight=heading_weight)
+        self._font_caption = tkfont.Font(family=pick("Archivo"), size=-11, weight="normal")
 
     # ── body ────────────────────────────────────────────────────────────────
     def _build_body(self) -> None:
@@ -156,7 +163,7 @@ class LandingWindow(tk.Tk):
         ).pack(fill="x")
         tk.Label(
             header,
-            text="Are you a new or existing participant?",
+            text="Start a new participant or resume a session?",
             bg=BG,
             fg=SUBTITLE,
             font=self._font_subtitle,
@@ -170,10 +177,20 @@ class LandingWindow(tk.Tk):
         row.columnconfigure(0, weight=1, uniform="btn")
         row.columnconfigure(1, weight=1, uniform="btn")
         self._build_choice(row, 0, "new", "New Participant", self._on_new)
-        self._build_choice(row, 1, "existing", "Existing Participant", self._on_existing)
+        self._build_choice(
+            row, 1, "resume", "Resume Session", self._on_resume,
+            enabled=self._has_resumable,
+        )
 
     def _build_choice(
-        self, parent: tk.Frame, col: int, icon: str, label: str, command: Callable[[], None]
+        self,
+        parent: tk.Frame,
+        col: int,
+        icon: str,
+        label: str,
+        command: Callable[[], None],
+        *,
+        enabled: bool = True,
     ) -> None:
         # Composite "button": a bordered frame holding an icon canvas + label,
         # left-aligned, 76px tall. Built by hand because native tk/ttk buttons
@@ -190,13 +207,31 @@ class LandingWindow(tk.Tk):
 
         icon_canvas = tk.Canvas(inner, width=25, height=25, bg=BG, highlightthickness=0)
         icon_canvas.pack(side="left")
-        self._draw_icon(icon_canvas, icon)
-        text = tk.Label(inner, text=label, bg=BG, fg=INK, font=self._font_button)
-        text.pack(side="left", padx=(14, 0))  # 14px icon-to-text gap
+        # Disabled tiles (D8) swap ACCENT/INK-ish colours for DIVIDER as the
+        # opacity stand-in -- tkinter has no real alpha.
+        fg = INK if enabled else DIVIDER
+        self._draw_icon(icon_canvas, icon, color=fg)
+
+        # Wrapped in its own column so the disabled "No incomplete sessions"
+        # caption can pack underneath the label without disturbing the icon.
+        text_col = tk.Frame(inner, bg=BG)
+        text_col.pack(side="left", padx=(14, 0))  # 14px icon-to-text gap
+        text = tk.Label(text_col, text=label, bg=BG, fg=fg, font=self._font_button)
+        text.pack(anchor="w")
+
+        if not enabled:
+            # No hover/press bindings, no command, default cursor (D8): the
+            # tile is inert when there is nothing to resume.
+            tk.Label(
+                text_col, text="No incomplete sessions", bg=BG, fg=DIVIDER,
+                font=self._font_caption,
+            ).pack(anchor="w")
+            btn.configure(cursor="arrow")
+            return
 
         # Every widget that shows BG must recolour together on hover, or the
         # canvas/label would punch opaque holes in the fill (no tk alpha).
-        tinted = [btn, inner, icon_canvas, text]
+        tinted = [btn, inner, icon_canvas, text_col, text]
         self._wire_hover(btn, tinted, command)
 
     def _wire_hover(
@@ -234,27 +269,31 @@ class LandingWindow(tk.Tk):
             w.bind("<ButtonRelease-1>", on_release)
             w.configure(cursor="hand2")
 
-    # ── icons (lucide user-plus / user-check, stroked) ──────────────────────
-    def _draw_icon(self, c: tk.Canvas, kind: str) -> None:
+    # ── icons (lucide user-plus / rotate-ccw, stroked) ──────────────────────
+    def _draw_icon(self, c: tk.Canvas, kind: str, color: str = INK) -> None:
         s = 25 / 24  # design icons are authored on a 24x24 grid, drawn at 25px
 
         def p(*coords: float) -> list[float]:
             return [v * s for v in coords]
 
-        # Head: circle cx9 cy7 r4.
-        c.create_oval(*p(5, 3, 13, 11), outline=INK, width=2)
-        # Shoulders: rounded path, approximated by a smooth open polyline.
-        c.create_line(
-            *p(16, 21, 16, 19, 12, 15, 6, 15, 2, 19, 2, 21),
-            fill=INK, width=2, smooth=True, capstyle="round", joinstyle="round",
-        )
         if kind == "new":
-            # user-plus: vertical + horizontal stroke.
-            c.create_line(*p(19, 8, 19, 14), fill=INK, width=2, capstyle="round")
-            c.create_line(*p(16, 11, 22, 11), fill=INK, width=2, capstyle="round")
-        else:
-            # user-check: a tick.
+            # user-plus: head + shoulders + plus, unchanged from before (D6).
+            c.create_oval(*p(5, 3, 13, 11), outline=color, width=2)
             c.create_line(
-                *p(16, 11, 18, 13, 22, 9),
-                fill=INK, width=2, capstyle="round", joinstyle="round",
+                *p(16, 21, 16, 19, 12, 15, 6, 15, 2, 19, 2, 21),
+                fill=color, width=2, smooth=True, capstyle="round", joinstyle="round",
             )
+            c.create_line(*p(19, 8, 19, 14), fill=color, width=2, capstyle="round")
+            c.create_line(*p(16, 11, 22, 11), fill=color, width=2, capstyle="round")
+            return
+
+        # resume: lucide rotate-ccw -- an open arc plus a hook at the gap,
+        # replacing the former user-check tick (D6). No head/shoulders here.
+        c.create_arc(
+            *p(3, 3, 21, 21), start=100, extent=320,
+            style=tk.ARC, outline=color, width=2,
+        )
+        c.create_line(
+            *p(3, 3, 3, 8, 8, 8),
+            fill=color, width=2, capstyle="round", joinstyle="round",
+        )
