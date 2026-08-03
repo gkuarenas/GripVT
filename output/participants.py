@@ -5,6 +5,7 @@ Enforces the URERB Form 6A data-management rule: the de-identified record
 while the participant's name is written only to an external key file, so the
 recordings tree can be backed up without leaking identities.
 """
+import csv
 import json
 import os
 import re
@@ -17,6 +18,7 @@ import cv2
 import numpy as np
 
 from core.detector_search import MIN_ACCEPTABLE, TARGET_MARKERS, SearchResult
+from core.trial_sequence import TRIAL_COUNT
 from output.video import VIDEO_EXT, VideoLogWriter
 
 RECORDINGS_DIR = "recordings"
@@ -41,6 +43,24 @@ class ParticipantRecord:
     forearm_circ_cm: float
     mvc_kg: float
     activity_level: str
+
+
+@dataclass(frozen=True)
+class ResumableParticipant:
+    """One row of the Resume Session picker (D3 of the resume-session plan).
+
+    Deliberately thin -- no anthropometrics, no name -- so the scan behind
+    `list_resumable_participants` never has to open `participant.json` (D4).
+
+    `complete_session_count` (D5 of the resume-supersede plan, renamed from
+    `session_count`) is the count of *fully recorded* (30/30 trial) sessions
+    on disk, from `count_complete_sessions` -- not a raw dir count, since a
+    partially recorded trailing session still leaves real work to resume.
+    """
+    participant_id: str
+    folder: str
+    complete_session_count: int
+    last_session_at: datetime | None
 
 
 def next_participant_number() -> int:
@@ -235,6 +255,200 @@ def session_dirs(folder: str) -> list[str]:
         if (m := _SESSION_RE.match(name)) and os.path.isdir(os.path.join(folder, name))
     ]
     return [name for _, name in sorted(named)]
+
+
+def _session_is_complete(session_dir: str) -> bool:
+    """A `sessionN_<ts>` dir is complete iff `trials.csv` has exactly
+    `TRIAL_COUNT` (30) valid rows (D1 of the resume-supersede plan).
+
+    A row is valid iff it is non-voided AND closed. `voided` is compared as
+    a literal string, not truth-tested and not compared against a Python
+    bool: `TrialLog.flush()` writes Python `True`/`False` through
+    `csv.DictWriter`, which `str()`s them, so the file on disk holds the
+    literal strings `"True"`/`"False"` -- truth-testing the raw string or
+    comparing to the Python bool reads every row as voided (or as
+    non-voided), silently and with no exception. `closed` means `end_ts` is
+    non-empty. Columns are read by name via `csv.DictReader` against
+    `output/writer.py::_TRIAL_COLUMNS` (the schema's source of truth) --
+    never by index -- so an unknown/missing column degrades via `.get`
+    rather than raising.
+
+    A missing `trials.csv` reads as 0 valid rows, i.e. incomplete, not an
+    error -- this is deliberate: a clean early Stop and a true crash (no
+    `trials.csv` at all, since `TrialLog.flush()`/`EventLog.flush()` only
+    run inside `_finalize_recording()`) are the same fact for the protocol,
+    so both are treated identically here.
+
+    Never raises: any exception (bad path, corrupt/binary CSV, encoding
+    error) degrades to `False`.
+    """
+    try:
+        csv_path = os.path.join(session_dir, "trials.csv")
+        if not os.path.isfile(csv_path):
+            return False
+        valid = 0
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                not_voided = (row.get("voided") or "").strip() not in ("True", "true", "1")
+                closed = (row.get("end_ts") or "").strip() != ""
+                if not_voided and closed:
+                    valid += 1
+        return valid == TRIAL_COUNT
+    except Exception:
+        return False
+
+
+def count_complete_sessions(folder: str) -> int:
+    """Count of `sessionN_<ts>` dirs under `folder` that are complete (D1).
+
+    Scans every session dir returned by `session_dirs` (cheap: at most
+    `SESSION_COUNT` dirs, at most `TRIAL_COUNT` rows each) even though only
+    the trailing (highest-N) dir can ever actually be incomplete --
+    `writer._next_session_number` assigns strictly increasing N from
+    existing dirs, and the resume-supersede numbering reuse guarantees at
+    most one incomplete trailing dir ever coexists with complete
+    predecessors. No caller may rely on a mid-list dir being incomplete.
+
+    Never raises: any exception degrades to `0`.
+    """
+    try:
+        return sum(
+            1 for name in session_dirs(folder)
+            if _session_is_complete(os.path.join(folder, name))
+        )
+    except Exception:
+        return 0
+
+
+def trailing_incomplete_session(folder: str) -> str | None:
+    """Bare folder name of the trailing incomplete session, if any (D4).
+
+    Returns the highest-N `sessionN_<ts>` dir's bare name (e.g.
+    `"session2_20260803_120000"`, no path prefix) when that dir is not
+    complete per `_session_is_complete`, else `None` -- including when
+    `folder` has no session dirs at all. Only the trailing dir is ever
+    considered, per the same invariant `count_complete_sessions` documents.
+
+    This exists so callers (namely `main.py`) never re-derive "which dir to
+    supersede" themselves, and so the bare-name convention that
+    `move_sessions_to_aborted` requires is enforced in exactly one place.
+
+    Never raises: any exception degrades to `None`.
+    """
+    try:
+        names = session_dirs(folder)
+        if not names:
+            return None
+        last = names[-1]
+        return last if not _session_is_complete(os.path.join(folder, last)) else None
+    except Exception:
+        return None
+
+
+def load_participant(folder: str) -> ParticipantRecord:
+    """Read `<folder>/participant.json` back into a `ParticipantRecord` (D6).
+
+    Called only when the operator commits to a folder (Continue on the
+    Resume Session picker) -- the picker's list scan itself never opens this
+    file (see `list_resumable_participants`'s docstring for why). Fields are
+    named explicitly rather than `**payload`, so `schema_version` and any
+    future extra key in the JSON can never reach the constructor. Raises
+    (OSError / ValueError / KeyError / TypeError) on a missing file, bad
+    JSON, or a missing key -- the caller is expected to catch this, since a
+    non-atomic write (`create_participant`) is exactly what can leave a
+    half-written file behind after a crash.
+    """
+    with open(os.path.join(folder, "participant.json")) as f:
+        payload = json.load(f)
+    return ParticipantRecord(
+        participant_id=payload["participant_id"],
+        folder=folder,
+        created_at=payload["created_at"],
+        age=payload["age"],
+        weight_kg=payload["weight_kg"],
+        height_cm=payload["height_cm"],
+        forearm_circ_cm=payload["forearm_circ_cm"],
+        mvc_kg=payload["mvc_kg"],
+        activity_level=payload["activity_level"],
+    )
+
+
+def _last_session_at(folder: str) -> datetime | None:
+    """Timestamp of the most recent `sessionN_<ts>` dir under `folder` (D7).
+
+    Read from the folder name itself, not `os.stat` and not `aborted.json`
+    (which is only written by the in-app Restart/Abort flow, never by a
+    crash, so it would under-report resumability -- D8). Unparseable name or
+    zero sessions both fall back to `None`.
+    """
+    sessions = session_dirs(folder)
+    if not sessions:
+        return None
+    _, _, ts = sessions[-1].partition("_")
+    try:
+        return datetime.strptime(ts, "%Y%m%d_%H%M%S")
+    except ValueError:
+        return None
+
+
+def list_resumable_participants(max_sessions: int) -> list[ResumableParticipant]:
+    """Every `participantNNN_*` folder under RECORDINGS_DIR with room for another
+    session (D2, D4).
+
+    `max_sessions` is a required positional argument -- this module must not
+    import `SESSION_COUNT` from `ui.session.progress`, or `output/` would
+    depend on `ui/`. Both callers (the landing window's gate and the picker
+    itself) pass `ui.session.progress.SESSION_COUNT`.
+
+    The predicate is **not** byte-identical to the one
+    `_has_resumable_participant` used to inline anymore (resume-supersede
+    plan D6): a directory under RECORDINGS_DIR, `participant.json` exists in
+    it (existence only -- never opened/parsed here), and it has fewer than
+    `max_sessions` *complete* sessions on disk (`count_complete_sessions`),
+    not fewer than `max_sessions` raw session dirs. A participant with a
+    partially recorded trailing session must stay resumable -- that trailing
+    session still has real work left, and the resume-supersede numbering
+    reuse (see `output/participants.py` module docs referenced from the
+    plan) means the same session number is still available to redo it.
+    `participant.json` is parsed lazily, exactly once, only when the
+    operator commits to a row via `load_participant` -- not during this
+    scan -- so a folder with a corrupt or half-written `participant.json`
+    still shows up as resumable rather than silently vanishing from the
+    list.
+
+    Never raises: returns `[]` if RECORDINGS_DIR itself can't be scanned, and
+    skips (rather than aborts on) any individual folder that raises while
+    being inspected, matching the old `_has_resumable_participant` contract
+    that the landing window depends on to open at all.
+    """
+    try:
+        if not os.path.isdir(RECORDINGS_DIR):
+            return []
+        items: list[ResumableParticipant] = []
+        for name in os.listdir(RECORDINGS_DIR):
+            try:
+                folder = os.path.join(RECORDINGS_DIR, name)
+                if not os.path.isdir(folder):
+                    continue
+                if not os.path.isfile(os.path.join(folder, "participant.json")):
+                    continue
+                if count_complete_sessions(folder) >= max_sessions:
+                    continue
+                items.append(ResumableParticipant(
+                    participant_id=name.split("_")[0],
+                    folder=folder,
+                    complete_session_count=count_complete_sessions(folder),
+                    last_session_at=_last_session_at(folder),
+                ))
+            except Exception:
+                continue
+        items.sort(
+            key=lambda item: item.last_session_at or datetime.min, reverse=True,
+        )
+        return items
+    except Exception:
+        return []
 
 
 def _aborted_dir(folder: str) -> str:

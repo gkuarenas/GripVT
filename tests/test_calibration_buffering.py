@@ -11,6 +11,8 @@ path, so nothing failed. These tests exercise the real call sites: `_continue`
 building the bundle, `main.py`'s closures threading it through, and
 `_confirm_start` flushing it into the session directory.
 """
+import csv
+import json
 import os
 
 import numpy as np
@@ -18,7 +20,10 @@ import pytest
 
 import ui.session.camera_feed as camera_feed_module
 from core.detector_search import Geometry, PoseDiagnostics, SearchResult
+from core.trial_sequence import TRIAL_COUNT
+from output import participants
 from output.participants import ParticipantRecord
+from output.writer import _TRIAL_COLUMNS
 from ui.calibration_window import CalibrationWindow
 from ui.session import SessionWindow
 
@@ -338,8 +343,10 @@ class _FakeWindow:
 class _FakeLanding(_FakeWindow):
     instances: list = []
 
-    def __init__(self, on_new_participant=None):
-        super().__init__(on_new_participant=on_new_participant)
+    def __init__(self, on_new_participant=None, on_resume_session=None):
+        super().__init__(
+            on_new_participant=on_new_participant, on_resume_session=on_resume_session,
+        )
 
 
 class _FakeNewParticipant(_FakeWindow):
@@ -347,6 +354,10 @@ class _FakeNewParticipant(_FakeWindow):
 
 
 class _FakeCalibration(_FakeWindow):
+    instances: list = []
+
+
+class _FakeResumeSession(_FakeWindow):
     instances: list = []
 
 
@@ -388,3 +399,75 @@ def test_bundle_survives_the_real_main_py_handoff_wiring(tmp_path, monkeypatch):
     assert session_win.pending_calibration is pending
     assert session_win.participant is record
     assert session_win.calibration_result is result
+
+
+# ── 6: resume-supersede plan (2026-08-03) D8/D9 -- the Resume Session path
+#       through the same real main.py closures, asserting open_calibration
+#       computes count_complete_sessions/trailing_incomplete_session and
+#       open_session threads them into SessionWindow as
+#       session_num/pending_supersede_session. ────────────────────────────
+
+def _write_trials_csv(session_dir, *, valid=30):
+    session_dir.mkdir(parents=True, exist_ok=True)
+    with open(session_dir / "trials.csv", "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_TRIAL_COLUMNS)
+        w.writeheader()
+        for trial_id in range(1, valid + 1):
+            w.writerow({
+                "trial_id": trial_id, "trial_index": trial_id, "start_ts": 0.0,
+                "end_ts": 1.0, "voided": False, "target_pct": 50, "target_kg": 5.0,
+            })
+
+
+def test_resume_flow_threads_complete_count_and_pending_supersede(tmp_path, monkeypatch):
+    for cls in (_FakeLanding, _FakeNewParticipant, _FakeCalibration, _FakeResumeSession, _FakeSession):
+        cls.instances = []
+
+    monkeypatch.setattr(main_module, "LandingWindow", _FakeLanding)
+    monkeypatch.setattr(main_module, "NewParticipantWindow", _FakeNewParticipant)
+    monkeypatch.setattr(main_module, "CalibrationWindow", _FakeCalibration)
+    monkeypatch.setattr(main_module, "ResumeSessionWindow", _FakeResumeSession)
+    monkeypatch.setattr(main_module, "SessionWindow", _FakeSession)
+
+    # Fabricate a participant folder with one complete session and one
+    # trailing incomplete session, mirroring the resume-supersede plan's
+    # end-to-end scenario.
+    folder = tmp_path / "participant001_20260803110000"
+    folder.mkdir()
+    (folder / "participant.json").write_text(json.dumps({
+        "schema_version": participants.SCHEMA_VERSION,
+        "participant_id": "participant001",
+        "created_at": "2026-08-03T11:00:00",
+        "age": 22, "weight_kg": 70.0, "height_cm": 175.0,
+        "forearm_circ_cm": 26.0, "mvc_kg": 41.719, "activity_level": "moderate",
+    }))
+    _write_trials_csv(folder / "session1_20260803110100", valid=TRIAL_COUNT)
+    _write_trials_csv(folder / "session2_20260803110200", valid=27)
+    record = ParticipantRecord(
+        participant_id="participant001", folder=str(folder),
+        created_at="2026-08-03T11:00:00", age=22, weight_kg=70.0,
+        height_cm=175.0, forearm_circ_cm=26.0, mvc_kg=41.719,
+        activity_level="moderate",
+    )
+
+    main_module.main()
+
+    landing = _FakeLanding.instances[-1]
+    landing.on_resume_session()  # simulate "Resume Session" clicked
+
+    resume_win = _FakeResumeSession.instances[-1]
+    resume_win.on_continue(record)  # simulate Continue -> open_calibration
+
+    cal_win = _FakeCalibration.instances[-1]
+    assert cal_win.args[1] is record
+
+    result = _search_result(passed=True)
+    pending = {
+        "result": result, "pose_frames": _pose_frames(), "overridden": False,
+        "roi": None, "calibration_image_size": [1024, 768],
+    }
+    cal_win.on_continue(result, pending)  # simulate Continue -> open_session
+
+    session_win = _FakeSession.instances[-1]
+    assert session_win.session_num == 1
+    assert session_win.pending_supersede_session == "session2_20260803110200"

@@ -13,14 +13,18 @@ test_session_csv_recording.py's camera_feed_module.cv2 patching), so this
 suite never touches the real gitignored recordings/ folder or the real
 external participant key file.
 """
+import csv
 import json
 import os
+from dataclasses import asdict
 
 import numpy as np
 import pytest
 
 from core.detector_search import Geometry, PoseDiagnostics, SearchResult
+from core.trial_sequence import TRIAL_COUNT
 from output import participants
+from output.writer import _TRIAL_COLUMNS
 
 
 @pytest.fixture
@@ -118,6 +122,54 @@ def _make_sessions(folder, n):
     folder.mkdir(parents=True, exist_ok=True)
     for i in range(1, n + 1):
         (folder / f"session{i}_2026080311{i:02d}00").mkdir()
+
+
+def _write_trials_csv(session_dir, *, valid=30, voided=0, open_rows=0):
+    """Write a `trials.csv` shaped exactly like `TrialLog.flush()`'s output
+    (resume-supersede plan, item 4): real `_TRIAL_COLUMNS` header via
+    `csv.DictWriter`, with Python `True`/`False` in `voided` so the file is
+    byte-shaped the same way a real recording produces it (`str()`-ed by
+    `csv.DictWriter` into the literal strings `"True"`/`"False"`).
+
+    Writes `valid` closed+non-voided rows, then `voided` closed+voided rows,
+    then `open_rows` non-voided rows with an empty `end_ts` (still open).
+    """
+    session_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = session_dir / "trials.csv"
+    rows = []
+    trial_id = 1
+    for _ in range(valid):
+        rows.append({
+            "trial_id": trial_id, "trial_index": trial_id, "start_ts": 0.0,
+            "end_ts": 1.0, "voided": False, "target_pct": 50, "target_kg": 5.0,
+        })
+        trial_id += 1
+    for _ in range(voided):
+        rows.append({
+            "trial_id": trial_id, "trial_index": trial_id, "start_ts": 0.0,
+            "end_ts": 1.0, "voided": True, "target_pct": 50, "target_kg": 5.0,
+        })
+        trial_id += 1
+    for _ in range(open_rows):
+        rows.append({
+            "trial_id": trial_id, "trial_index": trial_id, "start_ts": 0.0,
+            "end_ts": "", "voided": False, "target_pct": 50, "target_kg": 5.0,
+        })
+        trial_id += 1
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_TRIAL_COLUMNS)
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+
+
+def _make_complete_sessions(folder, n):
+    """`_make_sessions` plus a `TRIAL_COUNT`-valid-row `trials.csv` in each,
+    so every session dir made is *complete* per `_session_is_complete`."""
+    _make_sessions(folder, n)
+    for i in range(1, n + 1):
+        session_dir = folder / f"session{i}_2026080311{i:02d}00"
+        _write_trials_csv(session_dir, valid=TRIAL_COUNT)
 
 
 def test_session_dirs_are_ordered_numerically_not_lexically(tmp_path):
@@ -369,3 +421,235 @@ def test_move_sessions_to_aborted_returns_only_names_actually_moved(tmp_path):
     )
 
     assert moved == ["session1_20260803110100", "session2_20260803110200"]
+
+
+# ── Resume Session picker (2026-08-03 resume_session_window plan): D1-D9 ─────
+# docs/logs/20260803_191346_resume_session_window_plan.md. list_resumable_
+# participants/load_participant back the Resume Session picker; the scan
+# never opens participant.json (D4), never consults aborted.json (D8), and
+# sorts most-recent-session-first (D9).
+
+def _write_participant_json(folder, participant_id="participant001", **overrides):
+    folder.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": participants.SCHEMA_VERSION,
+        "participant_id": participant_id,
+        "created_at": "2026-08-03T11:32:05",
+        "age": 22,
+        "weight_kg": 70.0,
+        "height_cm": 175.0,
+        "forearm_circ_cm": 26.0,
+        "mvc_kg": 41.719,
+        "activity_level": "moderate",
+    }
+    payload.update(overrides)
+    (folder / "participant.json").write_text(json.dumps(payload))
+    return payload
+
+
+def test_list_resumable_participants_excludes_folder_without_participant_json(isolated_dirs):
+    recordings_dir, _key_path = isolated_dirs
+    folder = recordings_dir / "participant001_20260803110000"
+    folder.mkdir(parents=True)  # no participant.json inside
+
+    result = participants.list_resumable_participants(10)
+
+    assert result == []
+
+
+def test_list_resumable_participants_excludes_folder_at_max_sessions(isolated_dirs):
+    recordings_dir, _key_path = isolated_dirs
+    folder = recordings_dir / "participant001_20260803110000"
+    _write_participant_json(folder)
+    # D6: the cap now gates on *complete* sessions, so bare dirs (as the old
+    # fixture used) would stay resumable -- use complete ones to actually
+    # exercise the at-cap exclusion.
+    _make_complete_sessions(folder, 3)
+
+    result = participants.list_resumable_participants(3)
+
+    assert result == []
+    # One session short of the cap, the same folder is resumable.
+    result_below_cap = participants.list_resumable_participants(4)
+    assert [r.participant_id for r in result_below_cap] == ["participant001"]
+
+
+def test_list_resumable_participants_includes_zero_session_folder(isolated_dirs):
+    recordings_dir, _key_path = isolated_dirs
+    folder = recordings_dir / "participant001_20260803110000"
+    _write_participant_json(folder)
+
+    result = participants.list_resumable_participants(10)
+
+    assert len(result) == 1
+    assert result[0].complete_session_count == 0
+    assert result[0].last_session_at is None
+
+
+def test_list_resumable_participants_orders_most_recent_session_first(isolated_dirs):
+    recordings_dir, _key_path = isolated_dirs
+    # _last_session_at parses the "%Y%m%d_%H%M%S" suffix (D7) -- the
+    # timestamp needs its own internal underscore, matching writer.py's
+    # make_session_dir (session{n}_{ts} with ts = "%Y%m%d_%H%M%S").
+    older = recordings_dir / "participant001_20260803_110000"
+    older.mkdir(parents=True)
+    _write_participant_json(older, participant_id="participant001")
+    (older / "session1_20260803_110100").mkdir()  # 11:01:00
+
+    newer = recordings_dir / "participant002_20260803_120000"
+    newer.mkdir(parents=True)
+    _write_participant_json(newer, participant_id="participant002")
+    (newer / "session1_20260803_150000").mkdir()  # 15:00:00, well after `older`
+
+    result = participants.list_resumable_participants(10)
+
+    assert [r.participant_id for r in result] == ["participant002", "participant001"]
+    assert result[0].last_session_at > result[1].last_session_at
+
+
+def test_list_resumable_participants_skips_unmatched_entry_without_raising(isolated_dirs):
+    recordings_dir, _key_path = isolated_dirs
+    folder = recordings_dir / "participant001_20260803110000"
+    _write_participant_json(folder)
+    # A stray file sitting alongside real participant folders -- not a
+    # participantNNN_<ts> directory at all -- must be skipped, not raise.
+    recordings_dir.mkdir(parents=True, exist_ok=True)
+    (recordings_dir / "readme.txt").write_text("not a participant folder")
+
+    result = participants.list_resumable_participants(10)
+
+    assert [r.participant_id for r in result] == ["participant001"]
+
+
+def test_load_participant_round_trips_every_field(isolated_dirs, mvc_source):
+    recordings_dir, _key_path = isolated_dirs
+    record = _make_participant(mvc_source)
+    folder = str(recordings_dir / os.path.basename(record.folder))
+
+    loaded = participants.load_participant(folder)
+
+    assert loaded.folder == folder
+    assert loaded.participant_id == record.participant_id
+    assert loaded.created_at == record.created_at
+    assert loaded.age == record.age
+    assert loaded.weight_kg == record.weight_kg
+    assert loaded.height_cm == record.height_cm
+    assert loaded.forearm_circ_cm == record.forearm_circ_cm
+    assert loaded.mvc_kg == record.mvc_kg
+    assert loaded.activity_level == record.activity_level
+
+
+def test_load_participant_ignores_unknown_extra_key(isolated_dirs):
+    recordings_dir, _key_path = isolated_dirs
+    folder = recordings_dir / "participant001_20260803110000"
+    _write_participant_json(folder, some_future_field="unexpected")
+
+    loaded = participants.load_participant(str(folder))
+
+    assert loaded.participant_id == "participant001"
+    assert not hasattr(loaded, "some_future_field")
+
+
+def test_resumable_participants_and_load_participant_never_carry_a_name(isolated_dirs, mvc_source):
+    recordings_dir, key_path = isolated_dirs
+    record = _make_participant(mvc_source)  # writes the name only to KEY_PATH
+    folder = str(recordings_dir / os.path.basename(record.folder))
+
+    resumables = participants.list_resumable_participants(10)
+    loaded = participants.load_participant(folder)
+
+    resumables_dump = json.dumps(
+        [{**asdict(r), "last_session_at": str(r.last_session_at)} for r in resumables]
+    )
+    assert "Test Participant" not in resumables_dump
+    assert "Test Participant" not in json.dumps(asdict(loaded))
+    # KEY_PATH itself is untouched by either read path -- it still holds the name.
+    assert key_path.exists()
+    assert json.loads(key_path.read_text())["participant001"]["name"] == "Test Participant"
+
+
+# ── Resume-supersede plan (2026-08-03): count_complete_sessions /
+# trailing_incomplete_session, D1-D4. See
+# docs/logs/20260803_203149_resume_session_complete_count_plan.md.
+
+def test_count_complete_sessions_counts_a_fully_recorded_session(tmp_path):
+    folder = tmp_path / "participant003_x"
+    session_dir = folder / "session1_20260803110100"
+    _write_trials_csv(session_dir, valid=TRIAL_COUNT)
+
+    assert participants.count_complete_sessions(str(folder)) == 1
+
+
+def test_count_complete_sessions_no_trials_csv_counts_zero_not_an_error(tmp_path):
+    folder = tmp_path / "participant003_x"
+    _make_sessions(folder, 1)  # bare dir, no trials.csv at all
+
+    assert participants.count_complete_sessions(str(folder)) == 0
+
+
+def test_count_complete_sessions_27_valid_rows_counts_zero(tmp_path):
+    folder = tmp_path / "participant003_x"
+    session_dir = folder / "session1_20260803110100"
+    _write_trials_csv(session_dir, valid=27)
+
+    assert participants.count_complete_sessions(str(folder)) == 0
+
+
+def test_count_complete_sessions_voided_rows_dont_count_toward_30(tmp_path):
+    folder = tmp_path / "participant003_x"
+    session_dir = folder / "session1_20260803110100"
+    _write_trials_csv(session_dir, valid=27, voided=3)
+
+    assert participants.count_complete_sessions(str(folder)) == 0
+
+
+def test_count_complete_sessions_open_rows_dont_count_toward_30(tmp_path):
+    folder = tmp_path / "participant003_x"
+    session_dir = folder / "session1_20260803110100"
+    _write_trials_csv(session_dir, valid=28, open_rows=2)
+
+    assert participants.count_complete_sessions(str(folder)) == 0
+
+
+def test_count_and_trailing_incomplete_mixed_folder(tmp_path):
+    folder = tmp_path / "participant003_x"
+    _write_trials_csv(folder / "session1_20260803110100", valid=TRIAL_COUNT)
+    _write_trials_csv(folder / "session2_20260803110200", valid=27)
+
+    assert participants.count_complete_sessions(str(folder)) == 1
+    assert participants.trailing_incomplete_session(str(folder)) == "session2_20260803110200"
+
+
+def test_trailing_incomplete_session_is_none_when_every_session_is_complete(tmp_path):
+    folder = tmp_path / "participant003_x"
+    _make_complete_sessions(folder, 2)
+
+    assert participants.trailing_incomplete_session(str(folder)) is None
+
+
+def test_zero_sessions_folder_counts_and_trailing_are_both_empty(tmp_path):
+    folder = tmp_path / "participant003_x"
+    folder.mkdir()
+
+    assert participants.count_complete_sessions(str(folder)) == 0
+    assert participants.trailing_incomplete_session(str(folder)) is None
+
+
+def test_corrupt_trials_csv_counts_zero_not_an_error(tmp_path):
+    folder = tmp_path / "participant003_x"
+    session_dir = folder / "session1_20260803110100"
+    session_dir.mkdir(parents=True)
+    (session_dir / "trials.csv").write_bytes(b"\x00\x01\xffnot,a,real,csv\xfe\xfd")
+
+    assert participants.count_complete_sessions(str(folder)) == 0
+
+    # Header-only (no data rows) is likewise 0, not an error.
+    (session_dir / "trials.csv").write_text(",".join(_TRIAL_COLUMNS) + "\n")
+    assert participants.count_complete_sessions(str(folder)) == 0
+
+
+def test_missing_folder_counts_and_trailing_are_both_empty(tmp_path):
+    missing = tmp_path / "does_not_exist"
+
+    assert participants.count_complete_sessions(str(missing)) == 0
+    assert participants.trailing_incomplete_session(str(missing)) is None

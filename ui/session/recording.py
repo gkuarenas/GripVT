@@ -80,7 +80,9 @@ class RecordingMixin:
     _participant: ParticipantRecord | None
     _pending_calibration: dict | None
     _pending_baseline: dict | None
+    _pending_supersede_session: str | None
     _session_num: int
+    _session_num_at_open: int
     _strip_recapture_btn: tk.Frame | None
     _event_log: EventLog | None
     _tracker: Tracker
@@ -384,6 +386,42 @@ class RecordingMixin:
         # never crash, never write to the project root.
         if self._participant is None:
             return
+
+        # Resume-supersede plan D11: consume the trailing incomplete session
+        # (if any) before make_session_dir() runs -- moving it out of the
+        # participant folder first is what lets _next_session_number()
+        # reissue the same N for the fresh recording (D13), rather than
+        # leaving the incomplete dir squatting in the numbering space.
+        if self._pending_supersede_session is not None:
+            name = self._pending_supersede_session
+            # Null the attribute before any I/O, not after -- so a raising
+            # path below can never re-enter this block on a retry (e.g. a
+            # Restart-Session round trip landing back on _confirm_start).
+            self._pending_supersede_session = None
+            try:
+                # Before the move, so the audit entry's abandoned_sessions
+                # (derived from session_dirs, scope=="session" -> last dir)
+                # still names the dir that's about to be relocated.
+                # session_num_at_abort is the pre-Start snapshot D8 computed
+                # (what SESSION displayed before Start), not self._session_num
+                # -- that was already incremented above.
+                participants.record_abort(
+                    self._participant, scope="session", reason="resume_supersede",
+                    note="", session_num_at_abort=self._session_num_at_open,
+                )
+            except Exception:
+                _log.exception("record_abort failed during resume supersede")
+                self._show_toast("Supersede record failed to save — session continues.")
+            try:
+                # A failed record_abort must not skip the move -- the two
+                # are decoupled (unlike modals.py::record_abandonment, which
+                # reads the file back): the name is already known
+                # independently here.
+                participants.move_sessions_to_aborted(self._participant, [name])
+            except Exception:
+                _log.exception("move_sessions_to_aborted failed during resume supersede")
+                self._show_toast("Could not move the incomplete session — session continues.")
+
         session_dir = make_session_dir(self._participant.folder)
         # F6a (D3): flush the buffered calibration bundle now that the session
         # directory exists -- this is the only place it ever reaches disk.
