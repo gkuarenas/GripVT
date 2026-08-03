@@ -52,9 +52,11 @@ class BaselineMixin:
     _recording_started: bool
     _trial: int
     _trial_max: int
+    _grip_marked: bool
     _start_btn: tk.Frame
     _stop_btn: tk.Frame
     _next_btn: tk.Frame
+    _grip_btn: tk.Frame
     _restart_btn: tk.Frame
     _session_num: int
     _gate_box: tk.Frame
@@ -127,9 +129,14 @@ class BaselineMixin:
         start_disabled = not locked or self._recording
         stop_disabled = not self._recording
         next_trial_disabled = not locked or not self._recording or self._trial >= self._trial_max
+        # F2: one grip mark per segment -- greys out once pressed, returns
+        # when Next Trial or Undo opens a fresh segment. Deliberately NOT a
+        # precondition of anything else (D4).
+        grip_disabled = not locked or not self._recording or self._grip_marked
         self._start_btn.set_enabled(not start_disabled)
         self._stop_btn.set_enabled(not stop_disabled)
         self._next_btn.set_enabled(not next_trial_disabled)
+        self._grip_btn.set_enabled(not grip_disabled)
         # D7: flips on the instant the first Start of a window is confirmed.
         self._restart_btn.set_enabled(self._session_num >= 1)
 

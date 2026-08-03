@@ -196,6 +196,10 @@ class SessionWindow(
         # Phase 8 (E7): set True by Next Trial, False by Undo -- drives the
         # Undo button's own enabled state, independent of the transport rules.
         self._undo_available = False
+        # F2: True once this segment's grip boundary has been marked. Reset at
+        # confirmed Start and on every Next Trial / Undo, since each opens a
+        # fresh segment with its own unmarked boundary.
+        self._grip_marked = False
         self._strip_recapture_btn: tk.Frame | None = None
         self._capture_frame_label: tk.Label | None = None
         self._capture_fill: tk.Frame | None = None
@@ -456,6 +460,14 @@ class SessionWindow(
             panel, "Next Trial", "secondary", "arrow-right", self._on_next_trial, enabled=False,
         )
         self._next_btn.pack(fill="x", pady=(12, 0))
+
+        # F2: marks where rest ends and grip begins inside the current
+        # segment. "dot" rather than a transport icon -- it marks an instant,
+        # it does not move the session forward.
+        self._grip_btn = self._build_button(
+            panel, "Grip Start", "secondary", "dot", self._on_grip_start, enabled=False,
+        )
+        self._grip_btn.pack(fill="x", pady=(8, 0))
 
         self._render_baseline()
 

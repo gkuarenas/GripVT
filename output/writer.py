@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+from collections.abc import Callable
 from datetime import datetime
 
 from core.tracker import MarkerRecord
@@ -188,6 +189,21 @@ class EventLog:
 
     def append(self, event: dict) -> None:
         self._envelope["events"].append(event)
+
+    def drop(self, predicate: Callable[[dict], bool]) -> int:
+        """Remove already-appended events matching `predicate`; returns the
+        count removed.
+
+        Generic for the same reason append() is. The one caller today is Undo
+        discarding its segment's grip_start mark: Undo re-opens the *same*
+        segment_id and discards that segment's buffered marker rows, so an
+        event describing those frames would otherwise survive alongside the
+        redo's, indistinguishable from it.
+        """
+        events = self._envelope["events"]
+        before = len(events)
+        self._envelope["events"] = [e for e in events if not predicate(e)]
+        return before - len(self._envelope["events"])
 
     def flush(self) -> None:
         # Same atomic-write idiom as output/participants.py's _append_key:

@@ -950,3 +950,183 @@ def test_video_survives_overlay_failure(video_window, tmp_path, monkeypatch):
         decoded += 1
     cap.release()
     assert decoded == n_polls  # closed cleanly, not left as a corrupt container
+
+
+# ── F2: Grip Start marker (2026-08-03) ──────────────────────────────────────
+# Marks where rest ends and grip begins inside a segment. trials.csv cannot
+# supply this: trials are contiguous (end_ts[n] == start_ts[n+1]), so rest
+# lives inside a segment and is otherwise invisible.
+
+def _grip_events(session_dir: str) -> list[dict]:
+    with open(os.path.join(session_dir, "events.json")) as f:
+        return [e for e in json.load(f)["events"] if e["type"] == "grip_start"]
+
+
+def test_grip_start_writes_one_well_formed_event(connected_window, tmp_path):
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._poll()
+    win._on_grip_start()
+    win._poll()
+    win._confirm_stop()
+
+    events = _grip_events(session_dir)
+    assert len(events) == 1
+    assert events[0]["trial_id"] == 0
+    assert events[0]["trial_index"] == 1
+    assert isinstance(events[0]["ts"], float)
+
+
+def test_grip_start_timestamp_falls_inside_its_own_trial_window(connected_window, tmp_path):
+    """The event is only meaningful if it shares markers.csv's clock -- a
+    different time source would put it outside the segment it splits."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._poll()
+    win._on_grip_start()
+    win._poll()
+    win._confirm_stop()
+
+    event = _grip_events(session_dir)[0]
+    with open(os.path.join(session_dir, "trials.csv"), newline="") as f:
+        trial = next(r for r in csv.DictReader(f) if int(r["trial_id"]) == event["trial_id"])
+    # All three timestamps are quantized to 3dp (1us). This test compresses
+    # into microseconds an interval that is seconds long in real use, so the
+    # bounds are compared at that quantum rather than exactly -- a tie at the
+    # closing boundary is a test artifact, not a clock mismatch.
+    quantum = 0.001
+    assert float(trial["start_ts"]) - quantum <= event["ts"] <= float(trial["end_ts"]) + quantum
+
+
+def test_second_grip_press_in_the_same_trial_is_ignored(connected_window, tmp_path):
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._on_grip_start()
+    win._on_grip_start()
+    win._on_grip_start()
+    win._confirm_stop()
+
+    assert len(_grip_events(session_dir)) == 1
+
+
+def test_next_trial_re_arms_grip_start(connected_window, tmp_path):
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._on_grip_start()
+    win._on_next_trial()
+    assert win._grip_marked is False
+    win._on_grip_start()
+    win._confirm_stop()
+
+    events = _grip_events(session_dir)
+    assert [(e["trial_id"], e["trial_index"]) for e in events] == [(0, 1), (1, 2)]
+
+
+def test_undo_re_arms_grip_start_and_drops_the_discarded_segments_mark(
+    connected_window, tmp_path,
+):
+    """Undo voids the trial it just completed (segment_id - 1) and re-opens
+    the SAME segment_id for the redo, discarding that segment's buffered
+    marker rows. The grip mark describes those discarded frames, so it goes
+    with them -- otherwise the redo's mark and the stale one share a trial_id
+    and nothing downstream can tell them apart.
+
+    This corrects D6 of the plan, which assumed segment_id is never reused.
+    Undo reuses it; only Next Trial advances it."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._on_grip_start()          # marks segment 0
+    win._on_next_trial()          # commits segment 0, opens segment 1
+    win._on_grip_start()          # marks segment 1
+    win._on_undo_trial()          # voids segment 0, re-opens segment 1
+    assert win._grip_marked is False
+    win._on_grip_start()          # marks the re-opened segment 1
+    win._confirm_stop()
+
+    events = _grip_events(session_dir)
+    # One mark per surviving segment -- the stale segment-1 mark is gone, not
+    # duplicated alongside the redo's.
+    assert [e["trial_id"] for e in events] == [0, 1]
+    assert len([e for e in events if e["trial_id"] == 1]) == 1
+
+    with open(os.path.join(session_dir, "trials.csv"), newline="") as f:
+        voided = {int(r["trial_id"]): r["voided"] == "True" for r in csv.DictReader(f)}
+    assert voided[0] is True      # the mark survives on the voided trial it describes
+    assert voided[1] is False
+
+
+def test_undo_without_a_grip_mark_leaves_other_events_untouched(
+    connected_window, tmp_path,
+):
+    """drop() must be surgical -- it filters grip_start for one segment, not
+    the envelope."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._on_grip_start()          # segment 0
+    win._on_next_trial()
+    win._on_undo_trial()          # segment 1 had no mark; segment 0's must stay
+    win._confirm_stop()
+
+    assert [e["trial_id"] for e in _grip_events(session_dir)] == [0]
+    with open(os.path.join(session_dir, "events.json")) as f:
+        assert any(e["type"] == "video_log" for e in json.load(f)["events"])
+
+
+def test_session_finalizes_normally_with_no_grip_start_events(connected_window, tmp_path):
+    """D4: a missed press must never block Next Trial, Stop, or finalization."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._poll()
+    win._on_next_trial()
+    win._poll()
+    win._confirm_stop()
+
+    assert _grip_events(session_dir) == []
+    for name in ("markers.csv", "trials.csv", "events.json", "overlay.png"):
+        assert os.path.exists(os.path.join(session_dir, name)), name
+
+
+def test_grip_start_before_recording_writes_nothing(connected_window, tmp_path):
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._on_grip_start()          # no recording open yet
+    assert win._grip_marked is False
+    assert win._event_log is None

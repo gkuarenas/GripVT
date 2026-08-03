@@ -103,6 +103,7 @@ class RecordingMixin:
     _refresh_trial_block: Callable[[], None]
     _refresh_target_block: Callable[[], None]
     _refresh_session_block: Callable[[], None]
+    _grip_marked: bool
     _refresh_transport: Callable[[], None]
     _locked: Callable[[], bool]
     _open_modal: Callable[..., None]
@@ -164,8 +165,49 @@ class RecordingMixin:
                 target_kg=self._target_kg_for_trial(),
             )
         self._undo_available = True
+        # A fresh segment gets a fresh grip boundary to mark (D4).
+        self._grip_marked = False
         self._refresh_trial_block()
         self._refresh_target_block()
+        self._refresh_transport()
+
+    def _on_grip_start(self) -> None:
+        """Marks the instant the participant's grip begins (F2).
+
+        Next Trial is pressed the moment a rep *ends*, so each segment spans
+        [end of previous rep .. end of this rep] -- rest first, then grip. The
+        segment's start_ts already brackets rest on the left; this press
+        supplies the only missing boundary, where rest stops and grip starts.
+        Verified 2026-08-03 that trials.csv cannot supply it: every trial is
+        contiguous with its neighbour (end_ts[n] == start_ts[n+1], all 29 gaps
+        exactly 0.0ms), so rest lives *inside* a segment and is invisible.
+
+        D4: advisory. A trial with no grip_start simply has an unknown rest
+        boundary -- this must never gate Next Trial, Stop, or finalization.
+        """
+        grip_disabled = (
+            not self._locked() or not self._recording or self._grip_marked
+        )
+        if grip_disabled:
+            return
+        if self._event_log is not None:
+            # Guard on _event_log, not self._recording, for the same reason
+            # _on_next_trial guards on _trial_log: the two can never disagree.
+            # Same clock call as open_trial/close_trial -- a different time
+            # source here would make the rest window unmeasurable, which is
+            # the whole point of the event (D5).
+            self._event_log.append({
+                "type": "grip_start",
+                "trial_id": self._segment_id,
+                "trial_index": self._trial,
+                # Rounded to 3dp like every other timestamp the session
+                # writes (markers.csv timestamp_ms, trials.csv start/end_ts).
+                # A downstream tool compares this against those directly, so
+                # they must share a quantum; sub-microsecond precision is
+                # meaningless against a 37ms frame anyway.
+                "ts": round(now_ms(self._t0_wall_ms, self._t0_monotonic), 3),
+            })
+        self._grip_marked = True
         self._refresh_transport()
 
     def _on_undo_trial(self) -> None:
@@ -193,6 +235,18 @@ class RecordingMixin:
             # sequence[trial_index - 1] target (D2) -- Undo re-shows
             # exactly what it just left.
             self._writer.discard_window()
+            # F2: the discarded segment's grip mark describes frames that no
+            # longer exist, and Undo re-opens this same segment_id -- keeping
+            # it would leave two grip_start events sharing one trial_id with
+            # no way to tell the stale one from the redo's. Dropped for the
+            # same reason discard_window() drops the marker rows.
+            if self._event_log is not None:
+                self._event_log.drop(
+                    lambda e: (
+                        e.get("type") == "grip_start"
+                        and e.get("trial_id") == self._segment_id
+                    )
+                )
             redo_trial_index = max(1, self._trial - 1)
             # self._trial is not decremented until below, so the bare
             # _target_pct_for_trial()/_target_kg_for_trial() helpers would
@@ -215,6 +269,11 @@ class RecordingMixin:
             )
         self._trial = max(1, self._trial - 1)
         self._undo_available = False
+        # The redo re-opens a segment, so the grip boundary is markable again.
+        # The mark for the segment Undo *voided* (segment_id - 1) stays put --
+        # it describes frames that are still on disk. Only the re-opened
+        # segment's own mark was dropped above, with its discarded rows.
+        self._grip_marked = False
         self._refresh_trial_block()
         self._refresh_target_block()
         self._refresh_transport()
@@ -229,6 +288,12 @@ class RecordingMixin:
     # having no usable start bookend: Biopac saw taps at t~3.5-5.5s, the camera's
     # first frame was t~9.65s. Keep both bodies explicit about which side of
     # Confirm the taps belong on.
+    #
+    # 2026-08-03 (F3): the Stop body also asks for firmness. On the canonical
+    # session (participant001_20260731_101501) the end taps peaked at 22.6
+    # %MVC against start taps at 38-50%, faint enough that a first-pass
+    # detector missed them entirely. The taps are what make a session's force
+    # labels recoverable, so a soft closing bookend is a silent data loss.
     def _open_start_bookend_modal(self) -> None:
         def build(parent: tk.Frame) -> None:
             self._build_bookend_content(
@@ -249,7 +314,9 @@ class RecordingMixin:
                 title="Confirm End Bookend",
                 body="Perform the closing triple-tap bookend NOW, while recording "
                      "is still running. Press Confirm only after the taps — "
-                     "confirming ends the recording.",
+                     "confirming ends the recording. Tap firmly — match the "
+                     "strength of your opening taps. Soft taps may be "
+                     "undetectable.",
                 on_confirm=self._confirm_stop,
             )
 
@@ -338,6 +405,8 @@ class RecordingMixin:
             })
             self._show_toast("Video log failed to start — recording without raw video.")
         self._segment_id = 0
+        # Trial 1's segment opens below -- its grip boundary is unmarked (D4).
+        self._grip_marked = False
         save_sequence(
             session_dir, participant_id=self._participant.participant_id,
             sequence=seq, mvc_kg=self._participant.mvc_kg,
