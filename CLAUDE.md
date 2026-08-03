@@ -76,7 +76,8 @@ pip install -r requirements.txt
 ## Conventions
 - **Displacement is always baseline-relative.** `dx = x_current - x_baseline`. Never frame[k] − frame[k-1].
 - **Kalman states are initialised once at Capture Baseline and never added or removed during a session.** Markers are fixed on the sensor.
-- **Undistortion = points for math, remap for display only.** Camera loads raw. Undistort the ~99 marker centroids per frame with `cv2.fisheye.undistortPoints` (cheap, points only) for all measurement/geometry math. Full-frame `remap` is for the **live display only** — never in the detection/tracking math path. Maps are precomputed once from `K, D` in `core/calibration.py`; never recompute them inside the frame loop.
+- **Detection runs on the undistorted frame, not raw.** Camera loads raw. `core/tracker.py::process_frame` applies the precomputed fisheye `remap` to the full frame *first*, then detects marker blobs on that rectified image — so `x`, `y`, and `area` (and everything derived from them: `dx`, `dy`, `dA`, `magnitude`) are already geometrically corrected at the point of measurement. This corrects blob *area* as well as position, which a points-only undistortion (`cv2.fisheye.undistortPoints` on raw-frame detections) would not, since fisheye distortion stretches area non-uniformly across the frame. One remap serves both this math path and the live display — never two. Maps are precomputed once from `K, D` in `core/calibration.py`; never recompute them inside the frame loop.
+  (Changed 2026-08-03, see `docs/logs/20260731_152249_framerate_spike_plan.md` — this de-duplicated a redundant per-frame undistort, and detection has run on the rectified frame since. This note replaces an earlier points-for-math/remap-for-display split that no longer reflects the code.)
 - **All participant/session output goes to `recordings/participantNNN_<ts>/sessionN_<ts>/`.** Never write to the project root. (`output/sessions/` is retired; `output/writer.make_session_dir` still points there and is retargeted in the session recording pass.)
 - **De-identify at the source.** Never write a participant's name into `recordings/`; it belongs only in the external key file. See `output/participants.py`.
 
@@ -89,7 +90,7 @@ pip install -r requirements.txt
 | Anti-pattern | Do this instead |
 |---|---|
 | Spawn new Kalman states mid-session | Initialise all states at Capture Baseline only |
-| Full-frame `remap` in the math path, or recomputing maps per frame | Undistort **points** (`cv2.fisheye.undistortPoints`) per frame for math; `remap` for display only; precompute maps once at startup |
+| Recomputing undistortion maps per frame, or a second redundant `remap` call per frame | One full-frame `remap` per frame, precomputed maps from startup, shared by detection and display |
 | Use optical flow for tracking | Threshold + connected-component centroid + Hungarian assignment only |
 | Set `GATE_PX` below 80 px | Default 100 px; retune for GripVT footage but keep ≥ 80 |
 | Write output to project root | Write to `recordings/participantNNN_<ts>/…` always |
