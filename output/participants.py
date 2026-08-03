@@ -24,8 +24,10 @@ KEY_PATH = Path(r"C:\Users\Guillaume\Documents\DLSU\THESIS\GripVT_keys\participa
 SCHEMA_VERSION = 1
 CALIBRATION_SCHEMA_VERSION = 1
 BASELINE_SCHEMA_VERSION = 1
+ABORTED_SCHEMA_VERSION = 1
 
 _FOLDER_RE = re.compile(r"participant(\d+)_")
+_SESSION_RE = re.compile(r"session(\d+)_")
 
 
 @dataclass(frozen=True)
@@ -194,6 +196,81 @@ def save_baseline(
             writer.write(frame)
         writer.close()
 
+    return path
+
+
+def session_dirs(folder: str) -> list[str]:
+    """Every `sessionN_<ts>` directory in a participant folder, ordered by N.
+
+    Scanned from disk rather than read off the in-memory session counter: the
+    counter deliberately diverges from folder numbering after a Restart (see
+    the SESSION x/10 indicator notes in the session-recording checklist), so it
+    cannot answer "what is actually on disk".
+    """
+    if not os.path.isdir(folder):
+        return []
+    named = [
+        (int(m.group(1)), name)
+        for name in os.listdir(folder)
+        if (m := _SESSION_RE.match(name)) and os.path.isdir(os.path.join(folder, name))
+    ]
+    return [name for _, name in sorted(named)]
+
+
+def record_abort(
+    record: ParticipantRecord,
+    *,
+    scope: str,
+    reason: str,
+    note: str,
+    session_num_at_abort: int,
+) -> str:
+    """Record that the operator walked away from one session, or a whole visit.
+
+    Written to `aborted.json` in the participant folder, **unconditionally** --
+    the in-session `session_aborted` event in `events.json` only exists when a
+    recording was open at the moment Restart was pressed, which is not the
+    common case. Pressing Restart between sessions previously left no trace at
+    all, making an abandoned visit indistinguishable from a real multi-session
+    one after the fact.
+
+    Nothing is deleted. The abandoned session directories stay exactly where
+    they are; this file is what lets analysis (and a later, deliberate purge
+    tool) tell them apart from real data.
+
+    De-identified per URERB Form 6A: coded ID, directory names, timestamps,
+    the reason chip, and the operator's note only -- never a participant name.
+    """
+    sessions = session_dirs(record.folder)
+    if scope == "session":
+        sessions = sessions[-1:]
+
+    path = os.path.join(record.folder, "aborted.json")
+    payload = {"schema_version": ABORTED_SCHEMA_VERSION,
+               "participant_id": record.participant_id,
+               "aborts": []}
+    if os.path.exists(path):
+        # Append, never truncate -- a visit can be restarted more than once
+        # and each abandonment is its own fact (D6).
+        with open(path) as f:
+            payload = json.load(f)
+        payload.setdefault("aborts", [])
+
+    payload["aborts"].append({
+        "scope": scope,
+        "reason": reason,
+        "note": note,
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "session_num_at_abort": session_num_at_abort,
+        "abandoned_sessions": sessions,
+    })
+
+    # Same atomic idiom as _append_key and EventLog.flush: a crash mid-write
+    # cannot leave a half-written aborted.json.
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, path)
     return path
 
 

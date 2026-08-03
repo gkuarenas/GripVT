@@ -24,6 +24,7 @@ import pytest
 
 import ui.session.baseline as baseline_module
 import ui.session.camera_feed as camera_feed_module
+import ui.session.modals as modals_module
 import ui.session.recording as recording_module
 from core.tracker import MarkerRecord
 from output.participants import ParticipantRecord
@@ -682,9 +683,14 @@ def test_restart_all_aborts_open_segment_with_scope_all(connected_window, tmp_pa
     assert win._event_log is None
 
 
-def test_restart_before_start_is_noop(connected_window, tmp_path):
-    """D6: a Restart pressed before any confirmed Start has no event_log --
-    nothing was ever recorded, so there is nothing to abort or persist."""
+def test_restart_before_start_records_no_session_data(connected_window, tmp_path):
+    """D6: a Restart pressed before any confirmed Start has no event_log, so
+    no session_aborted event and no session dir are produced.
+
+    Renamed from ..._is_noop 2026-08-03: it is no longer a full no-op. F4's
+    participant-level `aborted.json` is written unconditionally, precisely
+    because this path has no event_log to write into. What stays true, and is
+    what this test guards, is that no *session* artifacts appear."""
     win = connected_window
     win._participant = _make_participant(tmp_path)
     _lock_baseline(win)
@@ -1130,3 +1136,110 @@ def test_grip_start_before_recording_writes_nothing(connected_window, tmp_path):
     win._on_grip_start()          # no recording open yet
     assert win._grip_marked is False
     assert win._event_log is None
+
+
+# ── F4: participant-level abandonment record (2026-08-03) ───────────────────
+# docs/logs/20260803_session_abandonment_record_plan.md. The in-session
+# session_aborted event only exists while a recording is open; aborted.json
+# covers the common case of Restart pressed between sessions.
+
+def _aborted_json(win) -> dict:
+    with open(os.path.join(win._participant.folder, "aborted.json")) as f:
+        return json.load(f)
+
+
+def test_restart_between_sessions_still_records_the_abandonment(
+    connected_window, tmp_path,
+):
+    """The gap F4 closes: no recording is open, so there is no event_log and
+    the old code recorded nothing anywhere."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+
+    win._confirm_start()
+    win._poll()
+    win._confirm_stop()                      # session on disk, event_log closed
+    assert win._event_log is None
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Entire Testing"]()
+
+    aborts = _aborted_json(win)["aborts"]
+    assert len(aborts) == 1
+    assert aborts[0]["scope"] == "all"
+    assert len(aborts[0]["abandoned_sessions"]) == 1
+
+
+def test_restart_while_recording_writes_both_records(connected_window, tmp_path):
+    """aborted.json and the in-session session_aborted event are
+    complementary, not duplicates -- one names the abandoned directories, the
+    other captures the in-progress segment's abort."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._poll()
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Session"]()
+
+    with open(os.path.join(session_dir, "events.json")) as f:
+        in_session = [e for e in json.load(f)["events"] if e["type"] == "session_aborted"]
+    assert len(in_session) == 1
+    assert _aborted_json(win)["aborts"][0]["scope"] == "session"
+
+
+def test_restart_deletes_no_session_directory(connected_window, tmp_path):
+    """D1 at the integration level: the recovery path must never destroy
+    collected data. This is the invariant the whole design turns on."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+
+    win._confirm_start()
+    first_dir = win._writer.session_dir
+    win._poll()
+    win._confirm_stop()
+    rows_before = open(os.path.join(first_dir, "markers.csv")).read()
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Entire Testing"]()
+
+    assert os.path.isdir(first_dir)
+    assert open(os.path.join(first_dir, "markers.csv")).read() == rows_before
+
+
+def test_a_failed_abort_record_does_not_block_restart(
+    connected_window, tmp_path, monkeypatch,
+):
+    """D8: Restart is the recovery path. Losing the record is bad; being stuck
+    in a broken session with a participant waiting is worse."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    backs: list = []
+    win._on_back = lambda message=None: backs.append(message)
+
+    monkeypatch.setattr(
+        modals_module, "record_abort",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Entire Testing"]()      # must not raise
+
+    assert len(backs) == 1                    # navigation still happened

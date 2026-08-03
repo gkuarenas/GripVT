@@ -6,10 +6,12 @@ for the package overview). Split out of the former ui/session_window.py
 verbatim (mechanical move, no logic changes) -- see
 docs/logs/20260729_141951_codebase_reorg_and_session_split_plan.md, D8.
 """
+import logging
 import tkinter as tk
 from tkinter import font as tkfont
 from typing import Callable
 
+from output.participants import ParticipantRecord, record_abort
 from output.writer import EventLog, now_ms
 from ui import theme
 
@@ -29,6 +31,7 @@ class ModalMixin:
     # -- declared here only so mypy resolves self.<attr> access within this
     # mixin. No runtime effect.
     _event_log: EventLog | None
+    _participant: ParticipantRecord | None
     _t0_wall_ms: float
     _t0_monotonic: float
     _session_num: int
@@ -115,6 +118,34 @@ class ModalMixin:
                 return ""
             return entry.get()
 
+        def record_abandonment(scope: str) -> None:
+            """F4: persist the abandonment at the *participant* level.
+
+            Deliberately outside the `_event_log is not None` guard below.
+            `_event_log` exists only between a confirmed Start and
+            finalization, so the in-session `session_aborted` event misses the
+            common case entirely -- Restart pressed between sessions, with
+            nothing recording, previously left no trace anywhere and made an
+            abandoned visit indistinguishable from a real multi-session one.
+
+            Nothing is deleted; this only records which session directories
+            were walked away from. Failures are logged and swallowed: Restart
+            is the recovery path, and being stuck in a broken session with a
+            participant waiting is worse than losing the record (D8).
+            """
+            if self._participant is None:
+                return
+            try:
+                record_abort(
+                    self._participant,
+                    scope=scope,
+                    reason=state["reason"],
+                    note=note_text(),
+                    session_num_at_abort=self._session_num,
+                )
+            except Exception:
+                logging.exception("failed to write aborted.json; continuing with Restart")
+
         def confirm_session() -> None:
             # D6: Restart aborts the in-progress segment -- log the reason/
             # note as a session_aborted event, then discard the uncommitted
@@ -130,6 +161,9 @@ class ModalMixin:
                     "ts": now_ms(self._t0_wall_ms, self._t0_monotonic),
                 })
                 self._finalize_recording("restart", discard_open_segment=True)
+            # After finalize, so the session dir this abandons is on disk and
+            # gets named in aborted.json.
+            record_abandonment("session")
             self._close_modal()
             self.release_camera()
             message = (
@@ -153,6 +187,7 @@ class ModalMixin:
                     "ts": now_ms(self._t0_wall_ms, self._t0_monotonic),
                 })
                 self._finalize_recording("restart", discard_open_segment=True)
+            record_abandonment("all")
             self._close_modal()
             self.release_camera()
             message = (
