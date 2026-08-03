@@ -10,7 +10,7 @@ import tkinter as tk
 from tkinter import font as tkfont
 from typing import Callable
 
-from core.trial_sequence import TRIAL_COUNT, TrialSequence, target_kg
+from core.trial_sequence import TRIAL_COUNT, TrialSequence, accept_band_kg, target_kg
 from output.participants import ParticipantRecord
 from ui import theme
 
@@ -35,9 +35,11 @@ class ProgressMixin:
     _participant: ParticipantRecord | None
     _target_num_label: tk.Label
     _target_sub_label: tk.Label
+    _target_band_label: tk.Label
     _f_kicker: tkfont.Font
     _f_progress_value: tkfont.Font
     _f_strip_tag: tkfont.Font
+    _f_small: tkfont.Font
 
     # Cross-group methods (D2): plain self.method() calls into the scaffold
     # group (window.py) and the recording group, declared the same way.
@@ -179,6 +181,15 @@ class ProgressMixin:
         pct = self._target_pct_for_trial()
         return f"{pct}% MVC" if pct is not None else "AWAITING START"
 
+    def _target_band_text(self) -> str:
+        """The protocol's advisory accept range, for the operator to eyeball
+        against the Biopac readout. Display only -- nothing reads this back."""
+        pct = self._target_pct_for_trial()
+        if pct is None or self._participant is None:
+            return "—"
+        lo, hi = accept_band_kg(pct, self._participant.mvc_kg)
+        return f"OK {lo:.1f} – {hi:.1f} kg"
+
     def _target_color(self) -> str:
         return theme.INK if self._target_pct_for_trial() is not None else theme.INK_55
 
@@ -188,3 +199,4 @@ class ProgressMixin:
         color = self._target_color()
         self._target_num_label.configure(text=self._target_num_text(), fg=color)
         self._target_sub_label.configure(text=self._target_sub_text(), fg=color)
+        self._target_band_label.configure(text=self._target_band_text())

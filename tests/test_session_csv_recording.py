@@ -24,10 +24,12 @@ import pytest
 
 import ui.session.baseline as baseline_module
 import ui.session.camera_feed as camera_feed_module
+import ui.session.modals as modals_module
 import ui.session.recording as recording_module
 from core.tracker import MarkerRecord
 from output.participants import ParticipantRecord
 from output.video import VIDEO_EXT
+from output.writer import make_session_dir
 from ui.session import SessionWindow
 
 MARKER_COUNT = 5
@@ -599,6 +601,12 @@ def _capture_restart_buttons(win: SessionWindow) -> dict:
     return captured
 
 
+def _moved_dir(win, session_dir: str) -> str:
+    """F7: Restart moves the just-finalized session dir into aborted/, under
+    its original (unrenamed) name -- see move_sessions_to_aborted."""
+    return os.path.join(win._participant.folder, "aborted", os.path.basename(session_dir))
+
+
 def test_restart_session_aborts_open_segment_keeps_committed_trial(connected_window, tmp_path):
     win = connected_window
     win._participant = _make_participant(tmp_path)
@@ -608,7 +616,6 @@ def test_restart_session_aborts_open_segment_keeps_committed_trial(connected_win
 
     win._confirm_start()
     session_dir = win._writer.session_dir
-    markers_csv = os.path.join(session_dir, "markers.csv")
 
     n_committed = 3
     for _ in range(n_committed):
@@ -623,13 +630,17 @@ def test_restart_session_aborts_open_segment_keeps_committed_trial(connected_win
     win._open_restart_modal()
     captured["Restart Session"]()
 
-    with open(markers_csv, newline="") as f:
+    moved_dir = _moved_dir(win, session_dir)
+    assert not os.path.isdir(session_dir)  # moved, not left in place
+    assert os.path.isdir(moved_dir)
+
+    with open(os.path.join(moved_dir, "markers.csv"), newline="") as f:
         rows = list(csv.DictReader(f))
     # segment 0's n_committed rows survive; segment 1's n_open buffered rows
     # were discarded, never reaching disk (D6).
     assert len(rows) == n_committed * MARKER_COUNT
 
-    with open(os.path.join(session_dir, "trials.csv"), newline="") as f:
+    with open(os.path.join(moved_dir, "trials.csv"), newline="") as f:
         trial_rows = {r["trial_id"]: r for r in csv.DictReader(f)}
     assert trial_rows["0"]["voided"] == "False"
     assert trial_rows["0"]["end_ts"] != ""
@@ -640,7 +651,7 @@ def test_restart_session_aborts_open_segment_keeps_committed_trial(connected_win
     assert trial_rows["1"]["voided"] == "True"
     assert trial_rows["1"]["end_ts"] != ""
 
-    with open(os.path.join(session_dir, "events.json")) as f:
+    with open(os.path.join(moved_dir, "events.json")) as f:
         envelope = json.load(f)
     aborts = [e for e in envelope["events"] if e["type"] == "session_aborted"]
     assert len(aborts) == 1
@@ -667,13 +678,16 @@ def test_restart_all_aborts_open_segment_with_scope_all(connected_window, tmp_pa
     win._open_restart_modal()
     captured["Restart Entire Testing"]()
 
-    with open(os.path.join(session_dir, "events.json")) as f:
+    moved_dir = _moved_dir(win, session_dir)
+    assert not os.path.isdir(session_dir)  # moved, not left in place
+
+    with open(os.path.join(moved_dir, "events.json")) as f:
         envelope = json.load(f)
     aborts = [e for e in envelope["events"] if e["type"] == "session_aborted"]
     assert len(aborts) == 1
     assert aborts[0]["scope"] == "all"
 
-    with open(os.path.join(session_dir, "trials.csv"), newline="") as f:
+    with open(os.path.join(moved_dir, "trials.csv"), newline="") as f:
         trial_rows = {r["trial_id"]: r for r in csv.DictReader(f)}
     assert trial_rows["0"]["voided"] == "True"
 
@@ -682,9 +696,14 @@ def test_restart_all_aborts_open_segment_with_scope_all(connected_window, tmp_pa
     assert win._event_log is None
 
 
-def test_restart_before_start_is_noop(connected_window, tmp_path):
-    """D6: a Restart pressed before any confirmed Start has no event_log --
-    nothing was ever recorded, so there is nothing to abort or persist."""
+def test_restart_before_start_records_no_session_data(connected_window, tmp_path):
+    """D6: a Restart pressed before any confirmed Start has no event_log, so
+    no session_aborted event and no session dir are produced.
+
+    Renamed from ..._is_noop 2026-08-03: it is no longer a full no-op. F4's
+    participant-level `aborted.json` is written unconditionally, precisely
+    because this path has no event_log to write into. What stays true, and is
+    what this test guards, is that no *session* artifacts appear."""
     win = connected_window
     win._participant = _make_participant(tmp_path)
     _lock_baseline(win)
@@ -950,3 +969,547 @@ def test_video_survives_overlay_failure(video_window, tmp_path, monkeypatch):
         decoded += 1
     cap.release()
     assert decoded == n_polls  # closed cleanly, not left as a corrupt container
+
+
+# ── F2: Grip Start marker (2026-08-03) ──────────────────────────────────────
+# Marks where rest ends and grip begins inside a segment. trials.csv cannot
+# supply this: trials are contiguous (end_ts[n] == start_ts[n+1]), so rest
+# lives inside a segment and is otherwise invisible.
+
+def _grip_events(session_dir: str) -> list[dict]:
+    with open(os.path.join(session_dir, "events.json")) as f:
+        return [e for e in json.load(f)["events"] if e["type"] == "grip_start"]
+
+
+def test_grip_start_writes_one_well_formed_event(connected_window, tmp_path):
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._poll()
+    win._on_grip_start()
+    win._poll()
+    win._confirm_stop()
+
+    events = _grip_events(session_dir)
+    assert len(events) == 1
+    assert events[0]["trial_id"] == 0
+    assert events[0]["trial_index"] == 1
+    assert isinstance(events[0]["ts"], float)
+
+
+def test_grip_start_timestamp_falls_inside_its_own_trial_window(connected_window, tmp_path):
+    """The event is only meaningful if it shares markers.csv's clock -- a
+    different time source would put it outside the segment it splits."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._poll()
+    win._on_grip_start()
+    win._poll()
+    win._confirm_stop()
+
+    event = _grip_events(session_dir)[0]
+    with open(os.path.join(session_dir, "trials.csv"), newline="") as f:
+        trial = next(r for r in csv.DictReader(f) if int(r["trial_id"]) == event["trial_id"])
+    # All three timestamps are quantized to 3dp (1us). This test compresses
+    # into microseconds an interval that is seconds long in real use, so the
+    # bounds are compared at that quantum rather than exactly -- a tie at the
+    # closing boundary is a test artifact, not a clock mismatch.
+    quantum = 0.001
+    assert float(trial["start_ts"]) - quantum <= event["ts"] <= float(trial["end_ts"]) + quantum
+
+
+def test_second_grip_press_in_the_same_trial_is_ignored(connected_window, tmp_path):
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._on_grip_start()
+    win._on_grip_start()
+    win._on_grip_start()
+    win._confirm_stop()
+
+    assert len(_grip_events(session_dir)) == 1
+
+
+def test_next_trial_re_arms_grip_start(connected_window, tmp_path):
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._on_grip_start()
+    win._on_next_trial()
+    assert win._grip_marked is False
+    win._on_grip_start()
+    win._confirm_stop()
+
+    events = _grip_events(session_dir)
+    assert [(e["trial_id"], e["trial_index"]) for e in events] == [(0, 1), (1, 2)]
+
+
+def test_undo_re_arms_grip_start_and_drops_the_discarded_segments_mark(
+    connected_window, tmp_path,
+):
+    """Undo voids the trial it just completed (segment_id - 1) and re-opens
+    the SAME segment_id for the redo, discarding that segment's buffered
+    marker rows. The grip mark describes those discarded frames, so it goes
+    with them -- otherwise the redo's mark and the stale one share a trial_id
+    and nothing downstream can tell them apart.
+
+    This corrects D6 of the plan, which assumed segment_id is never reused.
+    Undo reuses it; only Next Trial advances it."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._on_grip_start()          # marks segment 0
+    win._on_next_trial()          # commits segment 0, opens segment 1
+    win._on_grip_start()          # marks segment 1
+    win._on_undo_trial()          # voids segment 0, re-opens segment 1
+    assert win._grip_marked is False
+    win._on_grip_start()          # marks the re-opened segment 1
+    win._confirm_stop()
+
+    events = _grip_events(session_dir)
+    # One mark per surviving segment -- the stale segment-1 mark is gone, not
+    # duplicated alongside the redo's.
+    assert [e["trial_id"] for e in events] == [0, 1]
+    assert len([e for e in events if e["trial_id"] == 1]) == 1
+
+    with open(os.path.join(session_dir, "trials.csv"), newline="") as f:
+        voided = {int(r["trial_id"]): r["voided"] == "True" for r in csv.DictReader(f)}
+    assert voided[0] is True      # the mark survives on the voided trial it describes
+    assert voided[1] is False
+
+
+def test_undo_without_a_grip_mark_leaves_other_events_untouched(
+    connected_window, tmp_path,
+):
+    """drop() must be surgical -- it filters grip_start for one segment, not
+    the envelope."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._on_grip_start()          # segment 0
+    win._on_next_trial()
+    win._on_undo_trial()          # segment 1 had no mark; segment 0's must stay
+    win._confirm_stop()
+
+    assert [e["trial_id"] for e in _grip_events(session_dir)] == [0]
+    with open(os.path.join(session_dir, "events.json")) as f:
+        assert any(e["type"] == "video_log" for e in json.load(f)["events"])
+
+
+def test_session_finalizes_normally_with_no_grip_start_events(connected_window, tmp_path):
+    """D4: a missed press must never block Next Trial, Stop, or finalization."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._poll()
+    win._on_next_trial()
+    win._poll()
+    win._confirm_stop()
+
+    assert _grip_events(session_dir) == []
+    for name in ("markers.csv", "trials.csv", "events.json", "overlay.png"):
+        assert os.path.exists(os.path.join(session_dir, name)), name
+
+
+def test_grip_start_before_recording_writes_nothing(connected_window, tmp_path):
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+
+    win._on_grip_start()          # no recording open yet
+    assert win._grip_marked is False
+    assert win._event_log is None
+
+
+# ── F4: participant-level abandonment record (2026-08-03) ───────────────────
+# docs/logs/20260803_session_abandonment_record_plan.md. The in-session
+# session_aborted event only exists while a recording is open; aborted.json
+# covers the common case of Restart pressed between sessions.
+
+def _aborted_json(win) -> dict:
+    # F7 (docs/logs/20260803_per_wear_session_folder_plan.md, D5): aborted.json
+    # moved from the participant root into <participant>/aborted/.
+    with open(os.path.join(win._participant.folder, "aborted", "aborted.json")) as f:
+        return json.load(f)
+
+
+def test_restart_between_sessions_still_records_the_abandonment(
+    connected_window, tmp_path,
+):
+    """The gap F4 closes: no recording is open, so there is no event_log and
+    the old code recorded nothing anywhere."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+
+    win._confirm_start()
+    win._poll()
+    win._confirm_stop()                      # session on disk, event_log closed
+    assert win._event_log is None
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Entire Testing"]()
+
+    aborts = _aborted_json(win)["aborts"]
+    assert len(aborts) == 1
+    assert aborts[0]["scope"] == "all"
+    assert len(aborts[0]["abandoned_sessions"]) == 1
+
+
+def test_restart_while_recording_writes_both_records(connected_window, tmp_path):
+    """aborted.json and the in-session session_aborted event are
+    complementary, not duplicates -- one names the abandoned directories, the
+    other captures the in-progress segment's abort.
+
+    F7: the session dir is finalized, recorded in aborted.json, then MOVED
+    into aborted/ by the same Restart -- so events.json is read back from its
+    post-move location, not the original session_dir path.
+    """
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._poll()
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Session"]()
+
+    assert not os.path.isdir(session_dir)  # moved, not left in place
+    moved_dir = os.path.join(win._participant.folder, "aborted", os.path.basename(session_dir))
+    with open(os.path.join(moved_dir, "events.json")) as f:
+        in_session = [e for e in json.load(f)["events"] if e["type"] == "session_aborted"]
+    assert len(in_session) == 1
+    assert _aborted_json(win)["aborts"][0]["scope"] == "session"
+
+
+def test_restart_deletes_no_session_directory(connected_window, tmp_path):
+    """D1/D8 at the integration level: the recovery path must never destroy
+    collected data. F7 relocates the abandoned session into aborted/ rather
+    than leaving it in place, but every byte must survive the move
+    byte-identical -- this is the invariant the whole design turns on."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+
+    win._confirm_start()
+    first_dir = win._writer.session_dir
+    win._poll()
+    win._confirm_stop()
+    rows_before = open(os.path.join(first_dir, "markers.csv")).read()
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Entire Testing"]()
+
+    moved_dir = _moved_dir(win, first_dir)
+    assert not os.path.isdir(first_dir)  # gone from its original location...
+    assert os.path.isdir(moved_dir)  # ...because it was moved, not deleted
+    assert open(os.path.join(moved_dir, "markers.csv")).read() == rows_before
+
+
+def test_a_failed_abort_record_does_not_block_restart(
+    connected_window, tmp_path, monkeypatch,
+):
+    """D8: Restart is the recovery path. Losing the record is bad; being stuck
+    in a broken session with a participant waiting is worse."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    backs: list = []
+    win._on_back = lambda message=None: backs.append(message)
+
+    monkeypatch.setattr(
+        modals_module, "record_abort",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Entire Testing"]()      # must not raise
+
+    assert len(backs) == 1                    # navigation still happened
+
+
+# ── F7: move abandoned sessions on Restart (2026-08-03) ─────────────────────
+# docs/logs/20260803_per_wear_session_folder_plan.md, D7/D9, Phase 5. Restart
+# already recorded which sessions were abandoned in aborted.json (F4); this
+# closes the loop by relocating those same directories into aborted/, which
+# is what makes _next_session_number (and the SESSION x/10 indicator) agree
+# with what is actually on disk after a restart.
+
+def _write_participant_root_files(win) -> None:
+    """F7 D4: the participant root should hold exactly participant.json and
+    mvc.txt alongside session/aborted dirs. _make_participant only creates the
+    bare folder, so tests asserting the exact root listing write these two
+    stand-ins themselves."""
+    folder = win._participant.folder
+    with open(os.path.join(folder, "participant.json"), "w") as f:
+        json.dump({"participant_id": win._participant.participant_id}, f)
+    with open(os.path.join(folder, "mvc.txt"), "w") as f:
+        f.write("40.0\n")
+
+
+def test_restart_all_moves_every_session_and_renumbers_from_one(
+    connected_window, tmp_path,
+):
+    """D7: Restart Entire Testing moves ALL session dirs into aborted/, so
+    the next make_session_dir() call -- exactly what the next SessionWindow
+    performs at Start -- goes back to session1_*, matching the reset SESSION
+    x/10 indicator."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+
+    win._confirm_start()
+    first_dir = win._writer.session_dir
+    win._poll()
+    win._confirm_stop()
+
+    win._confirm_start()
+    second_dir = win._writer.session_dir
+    win._poll()
+    win._confirm_stop()
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Entire Testing"]()
+
+    assert not os.path.isdir(first_dir)
+    assert not os.path.isdir(second_dir)
+    assert os.path.isdir(_moved_dir(win, first_dir))
+    assert os.path.isdir(_moved_dir(win, second_dir))
+
+    next_dir = make_session_dir(win._participant.folder)
+    assert os.path.basename(next_dir).startswith("session1_")
+
+
+def test_restart_session_moves_only_current_and_reuses_same_number(
+    connected_window, tmp_path,
+):
+    """D7: Restart Session moves only the current session, leaving earlier
+    ones in place, and the next make_session_dir() call reuses the SAME
+    number -- exactly what the shipped modal's prose already promises
+    ("the next attempt is still session N of 10")."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+
+    win._confirm_start()
+    first_dir = win._writer.session_dir
+    win._poll()
+    win._confirm_stop()
+
+    win._confirm_start()  # session 2, in progress -- never stopped
+    second_dir = win._writer.session_dir
+    win._poll()
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Session"]()
+
+    assert os.path.isdir(first_dir)  # earlier session untouched
+    assert not os.path.isdir(second_dir)  # only the current one moved
+    assert os.path.isdir(_moved_dir(win, second_dir))
+
+    next_dir = make_session_dir(win._participant.folder)
+    assert os.path.basename(next_dir).startswith("session2_")  # same number, reused
+
+
+def test_moved_session_markers_csv_is_byte_identical(connected_window, tmp_path):
+    """D8: moving is not deleting -- the moved markers.csv must be exactly
+    the bytes it was before the move, not a copy that could subtly differ."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    for _ in range(4):
+        win._poll()
+    win._confirm_stop()
+
+    markers_path = os.path.join(session_dir, "markers.csv")
+    with open(markers_path, "rb") as f:
+        bytes_before = f.read()
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Entire Testing"]()
+
+    moved_markers_path = os.path.join(_moved_dir(win, session_dir), "markers.csv")
+    with open(moved_markers_path, "rb") as f:
+        bytes_after = f.read()
+    assert bytes_after == bytes_before
+
+
+def test_participant_root_holds_only_expected_entries_after_restart_all(
+    connected_window, tmp_path,
+):
+    """D4: after Restart Entire Testing moves every session away, the
+    participant root holds exactly participant.json, mvc.txt, and aborted/ --
+    no stray sessionN_<ts>/ dirs left behind."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+    _write_participant_root_files(win)
+
+    win._confirm_start()
+    win._poll()
+    win._confirm_stop()
+
+    win._confirm_start()
+    win._poll()
+    win._confirm_stop()
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Entire Testing"]()
+
+    root_entries = set(os.listdir(win._participant.folder))
+    assert root_entries == {"participant.json", "mvc.txt", "aborted"}
+
+
+def test_participant_root_keeps_surviving_session_after_restart_session(
+    connected_window, tmp_path,
+):
+    """D4: Restart Session only moves the current session, so a prior
+    session dir legitimately survives in the root alongside aborted/."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+    _write_participant_root_files(win)
+
+    win._confirm_start()
+    win._poll()
+    win._confirm_stop()
+
+    win._confirm_start()
+    win._poll()
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Session"]()
+
+    root_entries = set(os.listdir(win._participant.folder))
+    session_entries = {e for e in root_entries if e.startswith("session")}
+    assert len(session_entries) == 1  # session 1 survives, session 2 moved
+    assert root_entries == {"participant.json", "mvc.txt", "aborted"} | session_entries
+
+
+def test_aborted_json_named_sessions_agree_with_actually_moved_dirs(
+    connected_window, tmp_path,
+):
+    """The core F7 guarantee: aborted.json naming a directory that wasn't
+    actually moved (or vice versa) would be worse than either failing alone
+    -- the two records must always agree exactly."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    win._on_back = lambda message=None: None
+
+    win._confirm_start()
+    win._poll()
+    win._confirm_stop()
+
+    win._confirm_start()
+    win._poll()
+    win._confirm_stop()
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Entire Testing"]()
+
+    named = set(_aborted_json(win)["aborts"][-1]["abandoned_sessions"])
+    aborted_dir = os.path.join(win._participant.folder, "aborted")
+    actually_moved = {
+        name for name in os.listdir(aborted_dir)
+        if name.startswith("session") and os.path.isdir(os.path.join(aborted_dir, name))
+    }
+    assert named == actually_moved
+    assert len(named) == 2  # both sessions were named and moved
+
+
+def test_move_failure_does_not_block_restart(connected_window, tmp_path, monkeypatch):
+    """D9: same reasoning as the aborted.json write -- a failure to move must
+    not leave the operator stuck in a broken session with a participant
+    waiting. Restart still navigates away even if the move raises."""
+    win = connected_window
+    win._participant = _make_participant(tmp_path)
+    _lock_baseline(win)
+    _install_fake_process_frame(win, MARKER_COUNT)
+    backs: list = []
+    win._on_back = lambda message=None: backs.append(message)
+
+    win._confirm_start()
+    session_dir = win._writer.session_dir
+    win._poll()
+    win._confirm_stop()
+
+    monkeypatch.setattr(
+        modals_module, "move_sessions_to_aborted",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("cross-device move failed")),
+    )
+
+    captured = _capture_restart_buttons(win)
+    win._open_restart_modal()
+    captured["Restart Entire Testing"]()  # must not raise
+
+    assert len(backs) == 1  # navigation still happened
+    # aborted.json was still written -- only the move failed.
+    assert len(_aborted_json(win)["aborts"]) == 1
+    # The session dir is left exactly where it was -- a failed move must not
+    # half-move or otherwise corrupt it.
+    assert os.path.isdir(session_dir)
+    assert os.path.exists(os.path.join(session_dir, "markers.csv"))

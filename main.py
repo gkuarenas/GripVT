@@ -4,11 +4,25 @@ from ui.landing_window import LandingWindow
 from ui.new_participant_window import NewParticipantWindow
 from ui.session import SessionWindow
 
+RECAL_TOAST = "Sensor remounted — recalibrate before the next session."
+
+
+def _should_invalidate(message: str | None, recording_started: bool) -> bool:
+    """F5/D2: one wear = one calibration.
+
+    Either Restart scope always invalidates (message is not None -- both
+    confirm_session and confirm_all in ui/session/modals.py always build a
+    message before calling on_back). A bare Back carries no message, so it
+    only invalidates if Start was ever confirmed for that session -- a bare
+    Back before Start ended no wear, and forcing a redo would be pointless
+    friction (D2's most regression-prone case)."""
+    return message is not None or recording_started
+
 
 def main():
     holder = {}
 
-    def open_session(cal_win, record, result):
+    def open_session(cal_win, record, result, pending_calibration):
         app = holder["app"]
         holder["participant"] = record  # consumed by the session recording pass
         # The camera at CAMERA_INDEX is exclusive, so calibration must let go of
@@ -19,17 +33,24 @@ def main():
         def restore_cal(message: str | None = None):
             # D3: read before destroy() -- session_win is still alive here.
             holder["session_num"] = session_win._session_num
+            recording_started = session_win._recording_started
             session_win.destroy()
             cal_win.deiconify()
             cal_win.retry_camera()
-            if message is not None:
-                cal_win.show_toast(message)
+            if _should_invalidate(message, recording_started):
+                # F5/D2: this wear ended (a recorded session or either
+                # Restart) -- force a fresh calibration before Continue.
+                # message is not None on both Restart paths (D2), so this
+                # always fires there; recording_started covers the ordinary
+                # Back after a confirmed Start, which carries no message.
+                cal_win.invalidate()
+                cal_win.show_toast(f"{message} {RECAL_TOAST}" if message else RECAL_TOAST)
 
         session_num = holder["session_num"]
         session_win = SessionWindow(
             app, on_back=restore_cal, detector_params=result.params,
             calibration_result=result, participant=record,
-            session_num=session_num,
+            session_num=session_num, pending_calibration=pending_calibration,
         )
         # Titlebar X quits the whole program, same as every other window in
         # this flow -- but unlike New Participant/Calibration, Session may
@@ -60,7 +81,9 @@ def main():
         cal_win = CalibrationWindow(
             app, record,
             on_back=restore_np,
-            on_continue=lambda result: open_session(cal_win, record, result),
+            on_continue=lambda result, pending: open_session(
+                cal_win, record, result, pending
+            ),
         )
         cal_win.protocol(
             "WM_DELETE_WINDOW", lambda: (cal_win.release_camera(), app.destroy())

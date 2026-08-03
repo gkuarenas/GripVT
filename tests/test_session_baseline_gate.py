@@ -10,6 +10,7 @@ CAMERA_INDEX). Tracker.capture_baseline() is separately monkeypatched so the
 marker count is controlled directly rather than depending on real detection
 against synthetic frames.
 """
+import json
 import tkinter as tk
 from pathlib import Path
 
@@ -137,22 +138,21 @@ def test_start_enabled_after_override(window):
     assert window._start_btn.enabled is True
 
 
-def test_override_flag_reaches_saved_payload(window, tmp_path, monkeypatch):
-    saved = {}
-
-    def fake_save_baseline(record, **kwargs):
-        saved.update(kwargs)
-        return "fake/path.json"
-
-    monkeypatch.setattr(baseline_module.participants, "save_baseline", fake_save_baseline)
+def test_override_flag_reaches_saved_payload(window, tmp_path):
+    """F6b (D3): _save_baseline_record no longer writes -- it buffers the
+    save_baseline() kwargs into window._pending_baseline, which
+    _confirm_start later flushes. Nothing reaches disk from the gate alone."""
     window._participant = _make_participant(tmp_path)
 
     _finish_burst(window, 60)
-    assert saved == {}  # not saved yet -- only on pass or override
+    assert window._pending_baseline is None  # not buffered yet -- only on pass or override
     window._on_override_baseline_click()
+    saved = window._pending_baseline
+    assert saved is not None
     assert saved["overridden"] is True
     assert saved["passed"] is False
     assert saved["locked_count"] == 60
+    assert list(Path(window._participant.folder).glob("baseline_*")) == []
 
 
 def test_recapture_disabled_after_start(window):
@@ -174,16 +174,25 @@ def test_recapture_click_ignored_after_start(window):
 
 
 def test_pass_path_writes_matching_baseline_clip(window, tmp_path):
+    """F6b: nothing lands on disk until Start flushes the buffered baseline
+    -- so it must appear in the SESSION dir, not the participant root."""
     window._participant = _make_participant(tmp_path)
     _finish_burst_with_video(window, 97)
 
-    folder = Path(window._participant.folder)
-    jsons = list(folder.glob("baseline_*.json"))
-    clips = list(folder.glob("baseline_*.mp4"))
+    root_before = Path(window._participant.folder)
+    assert list(root_before.glob("baseline_*")) == []
+
+    window._confirm_start()
+    session_dir = Path(window._writer.session_dir)
+
+    jsons = list(session_dir.glob("baseline_*.json"))
+    clips = list(session_dir.glob("baseline_*.mp4"))
     assert len(jsons) == 1
     assert len(clips) == 1
     assert jsons[0].stem == clips[0].stem
     assert _count_video_frames(clips[0]) == baseline_module.BASELINE_FRAMES
+    assert list(root_before.glob("baseline_*")) == []
+    window._confirm_stop()
 
 
 def test_override_path_writes_matching_baseline_clip(window, tmp_path):
@@ -192,34 +201,55 @@ def test_override_path_writes_matching_baseline_clip(window, tmp_path):
     assert window._baseline["status"] == "fail"
     window._on_override_baseline_click()
 
-    folder = Path(window._participant.folder)
-    jsons = list(folder.glob("baseline_*.json"))
-    clips = list(folder.glob("baseline_*.mp4"))
+    root_before = Path(window._participant.folder)
+    assert list(root_before.glob("baseline_*")) == []
+
+    window._confirm_start()
+    session_dir = Path(window._writer.session_dir)
+
+    jsons = list(session_dir.glob("baseline_*.json"))
+    clips = list(session_dir.glob("baseline_*.mp4"))
     assert len(jsons) == 1
     assert len(clips) == 1
     assert jsons[0].stem == clips[0].stem
     assert _count_video_frames(clips[0]) == baseline_module.BASELINE_FRAMES
+    assert list(root_before.glob("baseline_*")) == []
+    window._confirm_stop()
 
 
 def test_fail_recapture_pass_writes_exactly_one_clip(window, tmp_path):
+    """The subtle F6b requirement: a fail -> recapture -> fail -> recapture
+    -> pass sequence must flush EXACTLY ONE baseline JSON and ONE clip at
+    Start, and its content must be the WINNING (97-count) attempt's, not
+    either discarded one."""
     window._participant = _make_participant(tmp_path)
 
     _finish_burst_with_video(window, 50)  # fail, discarded
     assert window._baseline["status"] == "fail"
+    assert window._pending_baseline is None  # a bare fail is never buffered
     window._on_recapture_baseline_click()
 
     _finish_burst_with_video(window, 55)  # fail again, discarded
     assert window._baseline["status"] == "fail"
+    assert window._pending_baseline is None
     window._on_recapture_baseline_click()
 
     _finish_burst_with_video(window, 97)  # winning attempt
+    assert window._pending_baseline["locked_count"] == 97
 
-    folder = Path(window._participant.folder)
-    jsons = list(folder.glob("baseline_*.json"))
-    clips = list(folder.glob("baseline_*.mp4"))
+    window._confirm_start()
+    session_dir = Path(window._writer.session_dir)
+
+    jsons = list(session_dir.glob("baseline_*.json"))
+    clips = list(session_dir.glob("baseline_*.mp4"))
     assert len(jsons) == 1
     assert len(clips) == 1
     assert jsons[0].stem == clips[0].stem
+
+    payload = json.loads(jsons[0].read_text())
+    assert payload["locked_count"] == 97  # the winning attempt, not 50 or 55
+    assert _count_video_frames(clips[0]) == baseline_module.BASELINE_FRAMES
+    window._confirm_stop()
 
 
 def test_save_baseline_writes_clip_under_json_ts(tmp_path):
@@ -231,6 +261,7 @@ def test_save_baseline_writes_clip_under_json_ts(tmp_path):
     json_path = Path(
         participants.save_baseline(
             record,
+            dest_dir=record.folder,
             locked_count=97,
             passed=True,
             overridden=False,
@@ -253,6 +284,7 @@ def test_save_baseline_without_frames_writes_no_clip(tmp_path):
     json_path = Path(
         participants.save_baseline(
             record,
+            dest_dir=record.folder,
             locked_count=97,
             passed=True,
             overridden=False,

@@ -6,10 +6,13 @@ for the package overview). Split out of the former ui/session_window.py
 verbatim (mechanical move, no logic changes) -- see
 docs/logs/20260729_141951_codebase_reorg_and_session_split_plan.md, D8.
 """
+import json
+import logging
 import tkinter as tk
 from tkinter import font as tkfont
 from typing import Callable
 
+from output.participants import ParticipantRecord, move_sessions_to_aborted, record_abort
 from output.writer import EventLog, now_ms
 from ui import theme
 
@@ -29,6 +32,7 @@ class ModalMixin:
     # -- declared here only so mypy resolves self.<attr> access within this
     # mixin. No runtime effect.
     _event_log: EventLog | None
+    _participant: ParticipantRecord | None
     _t0_wall_ms: float
     _t0_monotonic: float
     _session_num: int
@@ -115,6 +119,61 @@ class ModalMixin:
                 return ""
             return entry.get()
 
+        def record_abandonment(scope: str) -> None:
+            """F4: persist the abandonment at the *participant* level, then
+            F7: relocate exactly the session directories that record just
+            named into `aborted/`.
+
+            Deliberately outside the `_event_log is not None` guard below.
+            `_event_log` exists only between a confirmed Start and
+            finalization, so the in-session `session_aborted` event misses the
+            common case entirely -- Restart pressed between sessions, with
+            nothing recording, previously left no trace anywhere and made an
+            abandoned visit indistinguishable from a real multi-session one.
+
+            Nothing is deleted; this only records which session directories
+            were walked away from, then moves those same directories (D8).
+            Failures are logged and swallowed: Restart is the recovery path,
+            and being stuck in a broken session with a participant waiting is
+            worse than losing the record or the move (D8/D9).
+
+            The move uses the *exact* `abandoned_sessions` list just written
+            to `aborted.json` (read back from disk, not recomputed) so the
+            record and the moved directories can never disagree -- naming a
+            directory in aborted.json that wasn't actually moved would be
+            worse than either failing alone.
+            """
+            if self._participant is None:
+                return
+            try:
+                path = record_abort(
+                    self._participant,
+                    scope=scope,
+                    reason=state["reason"],
+                    note=note_text(),
+                    session_num_at_abort=self._session_num,
+                )
+            except Exception:
+                logging.exception("failed to write aborted.json; continuing with Restart")
+                return
+
+            try:
+                with open(path) as f:
+                    payload = json.load(f)
+                session_names = payload["aborts"][-1]["abandoned_sessions"]
+            except Exception:
+                logging.exception(
+                    "failed to read back aborted.json; skipping session move"
+                )
+                return
+
+            try:
+                move_sessions_to_aborted(self._participant, session_names)
+            except Exception:
+                logging.exception(
+                    "failed to move abandoned sessions into aborted/; continuing with Restart"
+                )
+
         def confirm_session() -> None:
             # D6: Restart aborts the in-progress segment -- log the reason/
             # note as a session_aborted event, then discard the uncommitted
@@ -130,6 +189,9 @@ class ModalMixin:
                     "ts": now_ms(self._t0_wall_ms, self._t0_monotonic),
                 })
                 self._finalize_recording("restart", discard_open_segment=True)
+            # After finalize, so the session dir this abandons is on disk and
+            # gets named in aborted.json.
+            record_abandonment("session")
             self._close_modal()
             self.release_camera()
             message = (
@@ -153,6 +215,7 @@ class ModalMixin:
                     "ts": now_ms(self._t0_wall_ms, self._t0_monotonic),
                 })
                 self._finalize_recording("restart", discard_open_segment=True)
+            record_abandonment("all")
             self._close_modal()
             self.release_camera()
             message = (

@@ -88,6 +88,7 @@ class SessionWindow(
         calibration_result: SearchResult | None = None,
         participant: ParticipantRecord | None = None,
         session_num: int = 0,
+        pending_calibration: dict | None = None,
     ) -> None:
         super().__init__(master)
         # E1: on_back now takes an optional post-navigation toast message --
@@ -96,6 +97,11 @@ class SessionWindow(
         self._on_back = on_back or (lambda message=None: print("Back clicked"))
         self._calibration_result = calibration_result
         self._participant = participant
+        # F6a (D3): the calibration bundle built in CalibrationWindow._continue
+        # -- held in memory, never written, until _confirm_start (recording.py)
+        # flushes it into the session directory. None in the headless/test
+        # fixture path, same as self._participant.
+        self._pending_calibration = pending_calibration
         # D2 (session-indicator plan): _session_num is mutable and live;
         # _session_num_at_open is a frozen snapshot Restart Session rolls
         # back to -- see _confirm_start's single increment site.
@@ -153,6 +159,14 @@ class SessionWindow(
         self._baseline_frames: list[np.ndarray] = []
         # Holds the winning burst until _save_baseline_record persists it (D13).
         self._baseline_clip_frames: list[np.ndarray] = []
+        # F6b (D3): the save_baseline() kwargs bundle built by
+        # _save_baseline_record -- held in memory, never written, until
+        # _confirm_start (recording.py) flushes it into the session
+        # directory. A later _save_baseline_record call (pass, or override,
+        # possibly after a recapture) simply overwrites this dict, so only
+        # the winning attempt is ever flushed (same guarantee the .mp4 path
+        # already gave). None until a baseline capture locks.
+        self._pending_baseline: dict | None = None
         self._recording_started = False
         # _recording (Phase 5, DCLogic) toggles Start<->Stop within a trial
         # block; _recording_started (D2) latches True forever on first Start
@@ -196,6 +210,10 @@ class SessionWindow(
         # Phase 8 (E7): set True by Next Trial, False by Undo -- drives the
         # Undo button's own enabled state, independent of the transport rules.
         self._undo_available = False
+        # F2: True once this segment's grip boundary has been marked. Reset at
+        # confirmed Start and on every Next Trial / Undo, since each opens a
+        # fresh segment with its own unmarked boundary.
+        self._grip_marked = False
         self._strip_recapture_btn: tk.Frame | None = None
         self._capture_frame_label: tk.Label | None = None
         self._capture_fill: tk.Frame | None = None
@@ -457,6 +475,14 @@ class SessionWindow(
         )
         self._next_btn.pack(fill="x", pady=(12, 0))
 
+        # F2: marks where rest ends and grip begins inside the current
+        # segment. "dot" rather than a transport icon -- it marks an instant,
+        # it does not move the session forward.
+        self._grip_btn = self._build_button(
+            panel, "Grip Start", "secondary", "dot", self._on_grip_start, enabled=False,
+        )
+        self._grip_btn.pack(fill="x", pady=(8, 0))
+
         self._render_baseline()
 
     # ── phase 1: baseline gate box ─────────────────────────────────────────
@@ -504,6 +530,12 @@ class SessionWindow(
             font=self._f_small,
         )
         self._target_sub_label.pack(pady=(4, 0))
+        # Advisory accept range (F1) -- display only, never gates or scores.
+        self._target_band_label = tk.Label(
+            target, text=self._target_band_text(), bg=theme.BG, fg=theme.INK_60,
+            font=self._f_small,
+        )
+        self._target_band_label.pack(pady=(2, 0))
 
         tk.Frame(self._phase2_frame, bg=theme.DIVIDER, height=2).pack(fill="x", pady=(18, 0))
 

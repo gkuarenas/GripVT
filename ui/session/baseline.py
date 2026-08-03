@@ -25,7 +25,6 @@ import numpy as np
 from core.detector_search import MIN_ACCEPTABLE, TARGET_MARKERS, SearchResult, region_counts
 from core.roi import ROICrop
 from core.tracker import BASELINE_FRAMES, Tracker
-from output import participants
 from output.participants import ParticipantRecord
 from ui import theme
 
@@ -46,15 +45,18 @@ class BaselineMixin:
     _baseline: dict
     _baseline_frames: list[np.ndarray]
     _baseline_clip_frames: list[np.ndarray]
+    _pending_baseline: dict | None
     _phase1_frame: tk.Frame
     _phase2_frame: tk.Frame
     _recording: bool
     _recording_started: bool
     _trial: int
     _trial_max: int
+    _grip_marked: bool
     _start_btn: tk.Frame
     _stop_btn: tk.Frame
     _next_btn: tk.Frame
+    _grip_btn: tk.Frame
     _restart_btn: tk.Frame
     _session_num: int
     _gate_box: tk.Frame
@@ -127,9 +129,14 @@ class BaselineMixin:
         start_disabled = not locked or self._recording
         stop_disabled = not self._recording
         next_trial_disabled = not locked or not self._recording or self._trial >= self._trial_max
+        # F2: one grip mark per segment -- greys out once pressed, returns
+        # when Next Trial or Undo opens a fresh segment. Deliberately NOT a
+        # precondition of anything else (D4).
+        grip_disabled = not locked or not self._recording or self._grip_marked
         self._start_btn.set_enabled(not start_disabled)
         self._stop_btn.set_enabled(not stop_disabled)
         self._next_btn.set_enabled(not next_trial_disabled)
+        self._grip_btn.set_enabled(not grip_disabled)
         # D7: flips on the instant the first Start of a window is confirmed.
         self._restart_btn.set_enabled(self._session_num >= 1)
 
@@ -410,16 +417,23 @@ class BaselineMixin:
         self._render_baseline()
 
     def _save_baseline_record(self) -> None:
+        """F6b (D3): buffers the save_baseline() kwargs bundle instead of
+        writing -- _confirm_start (recording.py) flushes it into the session
+        directory once one exists. Called on a pass, or on an operator
+        override of a below-threshold capture; either overwrites whatever was
+        previously buffered, so a fail -> recapture -> pass sequence (or a
+        pass -> recapture -> pass one) only ever leaves the winning attempt
+        buffered -- the same guarantee the .mp4 path already gave when this
+        wrote straight to disk."""
         if self._participant is None:
             return
         b = self._baseline
-        participants.save_baseline(
-            self._participant,
-            locked_count=b["count"],
-            passed=b["status"] == "pass",
-            overridden=b["overridden"],
-            corners=b["corners"],
-            bands=b["bands"],
-            params=self._tracker.params,
-            frames=self._baseline_clip_frames,
-        )
+        self._pending_baseline = {
+            "locked_count": b["count"],
+            "passed": b["status"] == "pass",
+            "overridden": b["overridden"],
+            "corners": b["corners"],
+            "bands": b["bands"],
+            "params": self._tracker.params,
+            "frames": self._baseline_clip_frames,
+        }

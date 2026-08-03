@@ -24,8 +24,10 @@ KEY_PATH = Path(r"C:\Users\Guillaume\Documents\DLSU\THESIS\GripVT_keys\participa
 SCHEMA_VERSION = 1
 CALIBRATION_SCHEMA_VERSION = 1
 BASELINE_SCHEMA_VERSION = 1
+ABORTED_SCHEMA_VERSION = 1
 
 _FOLDER_RE = re.compile(r"participant(\d+)_")
+_SESSION_RE = re.compile(r"session(\d+)_")
 
 
 @dataclass(frozen=True)
@@ -102,11 +104,18 @@ def save_calibration(
     result: SearchResult,
     pose_frames: dict[str, np.ndarray],
     *,
+    dest_dir: str,
     overridden: bool = False,
     roi: dict | None = None,
     calibration_image_size: list[int] | None = None,
 ) -> str:
-    """Persist one wear's calibration into the participant's folder, de-identified.
+    """Persist one wear's calibration into `dest_dir`, de-identified.
+
+    `dest_dir` is keyword-only with no default (per
+    docs/logs/20260803_per_wear_session_folder_plan.md Phase 1): every caller
+    must state where it writes, so a future caller cannot silently re-litter
+    the participant root. Callers pass the session directory once F6a buffers
+    calibration until Start (Phase 2); until then callers pass `record.folder`.
 
     The three median pose frames go alongside the JSON so the search can be
     re-run offline without the rig -- the per-pose diagnostics are the study's
@@ -135,17 +144,18 @@ def save_calibration(
         "calibration_image_size": calibration_image_size,
     }
 
-    path = os.path.join(record.folder, f"calibration_{ts}.json")
+    path = os.path.join(dest_dir, f"calibration_{ts}.json")
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
     for key, frame in pose_frames.items():
-        cv2.imwrite(os.path.join(record.folder, f"pose_{key}_{ts}.png"), frame)
+        cv2.imwrite(os.path.join(dest_dir, f"pose_{key}_{ts}.png"), frame)
     return path
 
 
 def save_baseline(
     record: ParticipantRecord,
     *,
+    dest_dir: str,
     locked_count: int,
     passed: bool,
     overridden: bool,
@@ -154,12 +164,17 @@ def save_baseline(
     params: dict,
     frames: list[np.ndarray] | None = None,
 ) -> str:
-    """Persist one session's Capture Baseline lock into the participant's folder.
+    """Persist one session's Capture Baseline lock into `dest_dir`.
+
+    `dest_dir` is keyword-only with no default (per
+    docs/logs/20260803_per_wear_session_folder_plan.md Phase 1): every caller
+    must state where it writes. Once F6b buffers the baseline until Start
+    (Phase 3), callers pass the session directory; until then callers pass
+    `record.folder`.
 
     Written once, when the baseline locks -- on a pass, or on an operator
     override of a below-threshold capture (`overridden=True`, so the record is
-    auditable). Lands beside `calibration_<ts>.json`, not in a session dir --
-    a baseline is captured once per session, before trial 1 exists.
+    auditable).
 
     `frames`, if non-empty, is the winning burst's raw frames -- written as
     `baseline_<ts>.<VIDEO_EXT>` under the same `ts` as the JSON (D4 of
@@ -182,18 +197,141 @@ def save_baseline(
         "params_thresh": params.get("thresh"),
         "params_min_area": params.get("min_area"),
     }
-    path = os.path.join(record.folder, f"baseline_{ts}.json")
+    path = os.path.join(dest_dir, f"baseline_{ts}.json")
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
 
     if frames:
         h, w = frames[0].shape[:2]
-        clip_path = os.path.join(record.folder, f"baseline_{ts}{VIDEO_EXT}")
+        clip_path = os.path.join(dest_dir, f"baseline_{ts}{VIDEO_EXT}")
         writer = VideoLogWriter(clip_path, size=(w, h))
         for frame in frames:
             writer.write(frame)
         writer.close()
 
+    return path
+
+
+def session_dirs(folder: str) -> list[str]:
+    """Every `sessionN_<ts>` directory in a participant folder, ordered by N.
+
+    Scanned from disk rather than read off the in-memory session counter,
+    which tracks the operator's progress through the visit and cannot answer
+    "what is actually on disk".
+
+    Only the participant root is scanned, so sessions that F7 moved into
+    `aborted/` are correctly invisible here -- the same reason
+    `writer._next_session_number` stops counting them, which is what lets
+    folder numbering agree with the SESSION x/10 indicator again (D7).
+    The old display-vs-folder divergence, documented as deliberate on
+    2026-07-29, was caused solely by abandoned folders squatting in the
+    numbering space; F7 relocates them, so it no longer arises.
+    """
+    if not os.path.isdir(folder):
+        return []
+    named = [
+        (int(m.group(1)), name)
+        for name in os.listdir(folder)
+        if (m := _SESSION_RE.match(name)) and os.path.isdir(os.path.join(folder, name))
+    ]
+    return [name for _, name in sorted(named)]
+
+
+def _aborted_dir(folder: str) -> str:
+    """`<participant>/aborted/`, creating it if absent (D5/D6).
+
+    Abandoned wears -- failed calibrations, moved session dirs, and the
+    `aborted.json` record explaining them -- all live here, keeping the
+    participant root down to exactly `participant.json`, `mvc.txt`,
+    `sessionN_<ts>/` dirs, and this one directory (D4).
+    """
+    path = os.path.join(folder, "aborted")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def move_sessions_to_aborted(record: ParticipantRecord, session_names: list[str]) -> list[str]:
+    """Relocate named `sessionN_<ts>` dirs into `<participant>/aborted/` (D8, D9).
+
+    Used by Restart (Phase 5) to move exactly the sessions it just recorded in
+    `aborted.json`. `os.replace` on a whole directory is atomic on the same
+    volume and never copies, so a move cannot half-succeed.
+
+    Never deletes anything -- a name that no longer exists under the
+    participant folder is skipped rather than raised, since Restart is a
+    recovery path and must not be broken by a second attempt to move a name
+    that was already relocated (D9). Session dirs keep their original
+    timestamped names, so repeated restarts cannot collide inside `aborted/`.
+
+    Returns the names actually moved, in the order given.
+    """
+    dest_dir = _aborted_dir(record.folder)
+    moved = []
+    for name in session_names:
+        src = os.path.join(record.folder, name)
+        if not os.path.isdir(src):
+            continue
+        dst = os.path.join(dest_dir, name)
+        os.replace(src, dst)
+        moved.append(name)
+    return moved
+
+
+def record_abort(
+    record: ParticipantRecord,
+    *,
+    scope: str,
+    reason: str,
+    note: str,
+    session_num_at_abort: int,
+) -> str:
+    """Record that the operator walked away from one session, or a whole visit.
+
+    Written to `aborted.json` in `<participant>/aborted/` (D5),
+    **unconditionally** -- the in-session `session_aborted` event in
+    `events.json` only exists when a recording was open at the moment Restart
+    was pressed, which is not the common case. Pressing Restart between
+    sessions previously left no trace at all, making an abandoned visit
+    indistinguishable from a real multi-session one after the fact.
+
+    Nothing is deleted. The abandoned session directories stay exactly where
+    they are (Phase 5 moves them into `aborted/` too, but that is a separate
+    call); this file is what lets analysis (and a later, deliberate purge
+    tool) tell them apart from real data.
+
+    De-identified per URERB Form 6A: coded ID, directory names, timestamps,
+    the reason chip, and the operator's note only -- never a participant name.
+    """
+    sessions = session_dirs(record.folder)
+    if scope == "session":
+        sessions = sessions[-1:]
+
+    path = os.path.join(_aborted_dir(record.folder), "aborted.json")
+    payload = {"schema_version": ABORTED_SCHEMA_VERSION,
+               "participant_id": record.participant_id,
+               "aborts": []}
+    if os.path.exists(path):
+        # Append, never truncate -- a visit can be restarted more than once
+        # and each abandonment is its own fact (D6).
+        with open(path) as f:
+            payload = json.load(f)
+        payload.setdefault("aborts", [])
+
+    payload["aborts"].append({
+        "scope": scope,
+        "reason": reason,
+        "note": note,
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "session_num_at_abort": session_num_at_abort,
+        "abandoned_sessions": sessions,
+    })
+
+    # Same atomic idiom as _append_key and EventLog.flush: a crash mid-write
+    # cannot leave a half-written aborted.json.
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp_path, path)
     return path
 
 
@@ -205,8 +343,11 @@ def save_calibration_failure(
 ) -> str:
     """Dump the frames and detected centroids when calibration cannot even anchor.
 
-    Without this the operator sees only a toast and the geometry that defeated the
-    search is gone with the frames, so the failure cannot be reproduced off-rig.
+    Written into `<participant>/aborted/` (D6): a calibration that never
+    converged is an abandoned wear attempt, and it is Gap 3 evidence --
+    sensitivity to mounting is precisely what a failure records. Without this
+    the operator sees only a toast and the geometry that defeated the search
+    is gone with the frames, so the failure cannot be reproduced off-rig.
     """
     now = datetime.now()
     ts = now.strftime("%Y%m%d_%H%M%S")
@@ -221,11 +362,12 @@ def save_calibration_failure(
             for key, dets in detections.items()
         },
     }
-    path = os.path.join(record.folder, f"calibration_failed_{ts}.json")
+    dest_dir = _aborted_dir(record.folder)
+    path = os.path.join(dest_dir, f"calibration_failed_{ts}.json")
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
     for key, frame in pose_frames.items():
-        cv2.imwrite(os.path.join(record.folder, f"failed_{key}_{ts}.png"), frame)
+        cv2.imwrite(os.path.join(dest_dir, f"failed_{key}_{ts}.png"), frame)
     return path
 
 
