@@ -69,13 +69,17 @@ class CalibrationWindow(tk.Toplevel):
         master: tk.Misc,
         record: ParticipantRecord,
         on_back: Callable[[], None] | None = None,
-        on_continue: Callable[[SearchResult], None] | None = None,
+        on_continue: Callable[[SearchResult, dict], None] | None = None,
     ) -> None:
         super().__init__(master)
         self._record = record
         self._on_back = on_back or (lambda: print("Back clicked"))
+        # F6a: on_continue now also receives the pending-calibration bundle
+        # (see _continue below) -- nothing is written to disk here anymore,
+        # so the caller (main.open_session) is responsible for flushing it
+        # into the session directory once one exists (D3).
         self._on_continue = on_continue or (
-            lambda result: print(f"Continue {result.params['thresh']}")
+            lambda result, pending: print(f"Continue {result.params['thresh']}")
         )
 
         self.title("GripVT — Sensor Calibration")
@@ -607,6 +611,16 @@ class CalibrationWindow(tk.Toplevel):
         self._refresh()
         self._paint_review()
 
+    def invalidate(self) -> None:
+        """F5/D2: force a fresh calibration before Continue re-enables.
+
+        Called from main.py's restore_cal when the wear that just ended
+        either recorded a session or was abandoned via Restart -- either
+        invalidates a per-wear calibration (D2). Reuses _recapture's reset
+        so the two paths can't drift apart; a bare Back with no Start never
+        reaches this method at all."""
+        self._recapture()
+
     def _recapture(self) -> None:
         self._pose_state = {key: "pending" for key in POSE_KEYS}
         self._pose_counts = {}
@@ -628,17 +642,24 @@ class CalibrationWindow(tk.Toplevel):
             return
         self._overridden = not result.passed
         roi_config = self._roi.config
-        participants.save_calibration(
-            self._record, result, self._pose_frames,
-            overridden=self._overridden,
-            roi=(
+        # F6a (D3): nothing is written here anymore -- calibration is held in
+        # memory and only reaches disk once a session directory exists
+        # (SessionWindow._confirm_start calls save_calibration with
+        # dest_dir=session_dir). This bundle carries everything that call
+        # needs; it must stay in sync with save_calibration's signature in
+        # output/participants.py.
+        pending_calibration = {
+            "result": result,
+            "pose_frames": dict(self._pose_frames),
+            "overridden": self._overridden,
+            "roi": (
                 {"x": roi_config.x, "y": roi_config.y, "w": roi_config.w,
                  "h": roi_config.h, "alpha": roi_config.alpha}
                 if roi_config is not None else None
             ),
-            calibration_image_size=list(self._cal.image_size),
-        )
-        self._on_continue(result)
+            "calibration_image_size": list(self._cal.image_size),
+        }
+        self._on_continue(result, pending_calibration)
 
     # ── toast ───────────────────────────────────────────────────────────────
     def show_toast(self, message: str) -> None:

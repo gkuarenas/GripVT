@@ -88,6 +88,7 @@ class SessionWindow(
         calibration_result: SearchResult | None = None,
         participant: ParticipantRecord | None = None,
         session_num: int = 0,
+        pending_calibration: dict | None = None,
     ) -> None:
         super().__init__(master)
         # E1: on_back now takes an optional post-navigation toast message --
@@ -96,6 +97,11 @@ class SessionWindow(
         self._on_back = on_back or (lambda message=None: print("Back clicked"))
         self._calibration_result = calibration_result
         self._participant = participant
+        # F6a (D3): the calibration bundle built in CalibrationWindow._continue
+        # -- held in memory, never written, until _confirm_start (recording.py)
+        # flushes it into the session directory. None in the headless/test
+        # fixture path, same as self._participant.
+        self._pending_calibration = pending_calibration
         # D2 (session-indicator plan): _session_num is mutable and live;
         # _session_num_at_open is a frozen snapshot Restart Session rolls
         # back to -- see _confirm_start's single increment site.
@@ -153,6 +159,14 @@ class SessionWindow(
         self._baseline_frames: list[np.ndarray] = []
         # Holds the winning burst until _save_baseline_record persists it (D13).
         self._baseline_clip_frames: list[np.ndarray] = []
+        # F6b (D3): the save_baseline() kwargs bundle built by
+        # _save_baseline_record -- held in memory, never written, until
+        # _confirm_start (recording.py) flushes it into the session
+        # directory. A later _save_baseline_record call (pass, or override,
+        # possibly after a recapture) simply overwrites this dict, so only
+        # the winning attempt is ever flushed (same guarantee the .mp4 path
+        # already gave). None until a baseline capture locks.
+        self._pending_baseline: dict | None = None
         self._recording_started = False
         # _recording (Phase 5, DCLogic) toggles Start<->Stop within a trial
         # block; _recording_started (D2) latches True forever on first Start

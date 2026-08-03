@@ -36,6 +36,7 @@ from core.tracker import MarkerRecord, Tracker
 from core.trial_sequence import (
     SequenceGenerationError, TrialSequence, generate_sequence, target_kg,
 )
+from output import participants
 from output.participants import ParticipantRecord
 from output.video import VIDEO_EXT, VIDEO_FPS, VideoLogWriter
 from output.writer import (
@@ -77,6 +78,8 @@ class RecordingMixin:
     _undo_available: bool
     _sequence: TrialSequence | None
     _participant: ParticipantRecord | None
+    _pending_calibration: dict | None
+    _pending_baseline: dict | None
     _session_num: int
     _strip_recapture_btn: tk.Frame | None
     _event_log: EventLog | None
@@ -382,6 +385,41 @@ class RecordingMixin:
         if self._participant is None:
             return
         session_dir = make_session_dir(self._participant.folder)
+        # F6a (D3): flush the buffered calibration bundle now that the session
+        # directory exists -- this is the only place it ever reaches disk.
+        # Best-effort: Start is the critical path (the 30 trials matter more
+        # than the calibration record), so a write failure here degrades to a
+        # toast, mirroring the D5/D8 no-op idiom above.
+        if self._pending_calibration is not None:
+            try:
+                participants.save_calibration(
+                    self._participant,
+                    self._pending_calibration["result"],
+                    self._pending_calibration["pose_frames"],
+                    dest_dir=session_dir,
+                    overridden=self._pending_calibration["overridden"],
+                    roi=self._pending_calibration["roi"],
+                    calibration_image_size=self._pending_calibration["calibration_image_size"],
+                )
+            except Exception:
+                _log.exception("calibration write failed during _confirm_start")
+                self._show_toast("Calibration record failed to save — session continues.")
+        # F6b (D3): flush the buffered baseline bundle the same way -- only
+        # the winning capture attempt was ever buffered (see
+        # BaselineMixin._save_baseline_record), so exactly one baseline_*.json
+        # and one baseline_*.<ext> clip land here, never more. Best-effort,
+        # same idiom as the calibration flush above: a write failure must not
+        # block the 30 trials that matter more.
+        if self._pending_baseline is not None:
+            try:
+                participants.save_baseline(
+                    self._participant,
+                    dest_dir=session_dir,
+                    **self._pending_baseline,
+                )
+            except Exception:
+                _log.exception("baseline write failed during _confirm_start")
+                self._show_toast("Baseline record failed to save — session continues.")
         self._writer = CSVWriter(session_dir)
         self._trial_log = TrialLog(session_dir)
         self._event_log = EventLog(

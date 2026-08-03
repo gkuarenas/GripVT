@@ -25,7 +25,6 @@ import numpy as np
 from core.detector_search import MIN_ACCEPTABLE, TARGET_MARKERS, SearchResult, region_counts
 from core.roi import ROICrop
 from core.tracker import BASELINE_FRAMES, Tracker
-from output import participants
 from output.participants import ParticipantRecord
 from ui import theme
 
@@ -46,6 +45,7 @@ class BaselineMixin:
     _baseline: dict
     _baseline_frames: list[np.ndarray]
     _baseline_clip_frames: list[np.ndarray]
+    _pending_baseline: dict | None
     _phase1_frame: tk.Frame
     _phase2_frame: tk.Frame
     _recording: bool
@@ -417,16 +417,23 @@ class BaselineMixin:
         self._render_baseline()
 
     def _save_baseline_record(self) -> None:
+        """F6b (D3): buffers the save_baseline() kwargs bundle instead of
+        writing -- _confirm_start (recording.py) flushes it into the session
+        directory once one exists. Called on a pass, or on an operator
+        override of a below-threshold capture; either overwrites whatever was
+        previously buffered, so a fail -> recapture -> pass sequence (or a
+        pass -> recapture -> pass one) only ever leaves the winning attempt
+        buffered -- the same guarantee the .mp4 path already gave when this
+        wrote straight to disk."""
         if self._participant is None:
             return
         b = self._baseline
-        participants.save_baseline(
-            self._participant,
-            locked_count=b["count"],
-            passed=b["status"] == "pass",
-            overridden=b["overridden"],
-            corners=b["corners"],
-            bands=b["bands"],
-            params=self._tracker.params,
-            frames=self._baseline_clip_frames,
-        )
+        self._pending_baseline = {
+            "locked_count": b["count"],
+            "passed": b["status"] == "pass",
+            "overridden": b["overridden"],
+            "corners": b["corners"],
+            "bands": b["bands"],
+            "params": self._tracker.params,
+            "frames": self._baseline_clip_frames,
+        }
