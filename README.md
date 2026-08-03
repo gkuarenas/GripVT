@@ -13,7 +13,7 @@ Each frame goes through four stages, run in `core/tracker.py`, then loops back t
 3. **Assign** (`core/hungarian.py`) - detections are matched to predicted states with `scipy.optimize.linear_sum_assignment`, gated at 100 px so a marker can't jump to a neighbor's position.
 4. **Correct** (`core/kalman.py`) - each matched detection updates its Kalman state. A predicted state with no match this frame keeps its predicted position and is flagged as autofilled instead of corrected.
 
-Displacement is always measured against the baseline frame (`dx = x_current - x_baseline`), not frame to frame. Marker centroids are undistorted as points (`cv2.fisheye.undistortPoints`) for this math; a separate full-frame remap exists only for the live display.
+Displacement is always measured against the baseline frame (`dx = x_current - x_baseline`), not frame to frame. `core/tracker.py::process_frame` applies one precomputed fisheye remap to the full frame before detection, so `x`, `y`, and `area` are already geometrically corrected at the point of measurement — the same rectified frame is reused for the live display, with no second undistort pass.
 
 ![Detect, predict, assign, correct loop](docs/images/marker-tracking-loop.png)
 
@@ -21,9 +21,12 @@ Displacement is always measured against the baseline frame (`dx = x_current - x_
 
 ```
 LandingWindow -> NewParticipantWindow -> CalibrationWindow -> SessionWindow
+                \-> ResumeSessionWindow -> CalibrationWindow -^
 ```
 
-`SessionWindow` covers the live camera feed, baseline capture, and trial recording, split into mixins under `ui/session/` (`baseline.py`, `recording.py`, `camera_feed.py`, `progress.py`, `modals.py`).
+`LandingWindow` offers Resume Session when a participant has an interrupted visit; picking one opens `ResumeSessionWindow`, which skips anthropometrics entry (already on disk) and continues straight to calibration for that participant.
+
+`SessionWindow` covers the live camera feed, baseline capture, and trial recording, split into mixins under `ui/session/` (`baseline.py`, `recording.py`, `camera_feed.py`, `progress.py`, `modals.py`). Once a session reaches 30/30 trials, a post-session unmount/rest modal (`ui/session/modals.py`) prompts the operator with a soft-paced break before the next session.
 
 ## Running it
 
