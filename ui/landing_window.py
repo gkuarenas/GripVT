@@ -13,14 +13,13 @@ themes native buttons, the two choices are built as composite frames
 (border + canvas icon + label) so the flat look is fully under our control.
 """
 import ctypes
-import os
 import sys
 import tkinter as tk
 import tkinter.font as tkfont
 from pathlib import Path
 from typing import Callable
 
-from output.participants import RECORDINGS_DIR, session_dirs
+from output.participants import list_resumable_participants
 from ui import theme
 from ui.session.progress import SESSION_COUNT
 
@@ -66,25 +65,16 @@ def _register_archivo() -> None:
 def _has_resumable_participant() -> bool:
     """Whether any `participantNNN_*` folder under RECORDINGS_DIR is resumable.
 
-    Resumable iff `participant.json` exists in the folder AND it has fewer
-    than SESSION_COUNT session dirs on disk (D7). Reuses the exact scan
-    helpers the session window already relies on -- `session_dirs` and
-    `SESSION_COUNT` -- rather than reimplementing the logic here. Never
-    raises: the landing window must open even if `recordings/` is missing,
-    unreadable, or malformed.
+    Delegates to `output.participants.list_resumable_participants`, which owns
+    the scan (folder under RECORDINGS_DIR, `participant.json` exists, fewer
+    than SESSION_COUNT session dirs on disk). Never raises: the landing
+    window must open even if `recordings/` is missing, unreadable, or
+    malformed -- `list_resumable_participants` already guarantees this, but
+    the try/except is kept here too so a future change to that contract can't
+    silently break landing-window startup.
     """
     try:
-        if not os.path.isdir(RECORDINGS_DIR):
-            return False
-        for name in os.listdir(RECORDINGS_DIR):
-            folder = os.path.join(RECORDINGS_DIR, name)
-            if not os.path.isdir(folder):
-                continue
-            if not os.path.isfile(os.path.join(folder, "participant.json")):
-                continue
-            if len(session_dirs(folder)) < SESSION_COUNT:
-                return True
-        return False
+        return any(list_resumable_participants(SESSION_COUNT))
     except Exception:
         return False
 

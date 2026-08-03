@@ -89,6 +89,7 @@ class SessionWindow(
         participant: ParticipantRecord | None = None,
         session_num: int = 0,
         pending_calibration: dict | None = None,
+        pending_supersede_session: str | None = None,
     ) -> None:
         super().__init__(master)
         # E1: on_back now takes an optional post-navigation toast message --
@@ -102,6 +103,11 @@ class SessionWindow(
         # flushes it into the session directory. None in the headless/test
         # fixture path, same as self._participant.
         self._pending_calibration = pending_calibration
+        # D10 (resume-supersede plan): bare folder name of the trailing
+        # incomplete session to supersede on the first confirmed Start,
+        # consumed exactly once in _confirm_start (recording.py) and set to
+        # None there.
+        self._pending_supersede_session = pending_supersede_session
         # D2 (session-indicator plan): _session_num is mutable and live;
         # _session_num_at_open is a frozen snapshot Restart Session rolls
         # back to -- see _confirm_start's single increment site.
