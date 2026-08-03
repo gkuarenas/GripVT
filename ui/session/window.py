@@ -141,6 +141,11 @@ class SessionWindow(
         # Rig-feedback correction (2026-07-27): pointer offset from the
         # panel's top-left at drag start, re-applied on every <B1-Motion>.
         self._modal_drag_offset: tuple[int, int] = (0, 0)
+        # Post-session unmount/rest modal (docs/logs/20260803_post_session_
+        # unmount_rest_modal_plan.md, D10): owned solely by the modal's own
+        # Continue handler in modals.py -- no other close path starts this
+        # timer, so no other close path needs to cancel it.
+        self._rest_after_id: str | None = None
 
         # Phase 6 (E9): consecutive failed cap.read()s since the last good
         # frame; _set_camera_disconnected fires once this hits
@@ -803,6 +808,9 @@ class SessionWindow(
 
     # ── lifecycle ────────────────────────────────────────────────────────────
     def _handle_back(self) -> None:
+        self._cancel_rest_timer()  # D10: the post-session modal's grab does
+        # not reliably block every exit path -- guard against a dangling
+        # after() callback on a window this is about to leave/destroy.
         self._close_modal()  # E5: never leave a grab held by a dead widget
         self._finalize_recording("closed")  # D8: every exit path finalizes
         self.release_camera()
@@ -816,7 +824,18 @@ class SessionWindow(
         _finalize_recording entirely, since Tk keeps only one handler per
         protocol name and the later registration wins) -- see landing.py's
         open_session() for the real X-button path."""
+        self._cancel_rest_timer()  # D10: see _handle_back
         self._close_modal()  # E5: same guard as _handle_back
         self._finalize_recording("closed")  # D8: every exit path finalizes
         self.release_camera()
         self.destroy()
+
+    def _cancel_rest_timer(self) -> None:
+        """D10: the post-session modal's rest countdown is owned by its own
+        Continue handler (modals.py), but a WM_DELETE_WINDOW close (or Back,
+        should the window manager ever deliver one past the modal's grab)
+        must not leave a self.after() callback scheduled against a window
+        that is about to be destroyed."""
+        if self._rest_after_id is not None:
+            self.after_cancel(self._rest_after_id)
+            self._rest_after_id = None

@@ -515,6 +515,11 @@ class RecordingMixin:
         self._refresh_transport()
         print("Stop clicked")
         self._finalize_recording("stopped")
+        # D1 (post-session unmount/rest modal plan): fires only when the
+        # operator ran the full 30-trial sequence to completion, regardless
+        # of Resume-supersede (D2) -- no branch on _pending_supersede_session.
+        if self._trial >= self._trial_max:
+            self._open_post_session_modal()
 
     def _buffer_recording_frame(self, records: list[MarkerRecord]) -> None:
         """D7: appends one frame to the CSVWriter's in-RAM buffer and force-

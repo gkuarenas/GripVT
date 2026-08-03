@@ -22,6 +22,10 @@ _TOAST_TIMEOUT_MS = 5000
 _FADE_STEPS = 8
 _FADE_INTERVAL_MS = 50
 
+# Post-session unmount/rest modal (docs/logs/20260803_post_session_unmount_
+# rest_modal_plan.md, D7): 3-minute soft pacing timer, not a hard gate.
+REST_DURATION_S = 180
+
 
 class ModalMixin:
     """Modal/toast plumbing + Restart modal. Composed into SessionWindow
@@ -43,6 +47,7 @@ class ModalMixin:
     _modal_panel: tk.Toplevel | None
     _modal_configure_id: str | None
     _modal_drag_offset: tuple[int, int]
+    _rest_after_id: str | None
     _f_gate_heading: tkfont.Font
     _f_gate_body: tkfont.Font
     _f_restart_row_heading: tkfont.Font
@@ -50,6 +55,7 @@ class ModalMixin:
     _f_small: tkfont.Font
     _f_toast: tkfont.Font
     _f_kicker: tkfont.Font
+    _f_bookend_heading: tkfont.Font
 
     # Cross-group methods (D2): plain self.method() calls into the recording,
     # progress, scaffold, and camera groups, declared the same way for mypy.
@@ -339,6 +345,102 @@ class ModalMixin:
 
         self._open_modal(build)
 
+    # ── post-session unmount/rest modal ─────────────────────────────────────
+    # docs/logs/20260803_post_session_unmount_rest_modal_plan.md. Fires from
+    # RecordingMixin._confirm_stop once a session reaches 30/30 trials,
+    # regardless of whether it started fresh or superseded a trailing
+    # incomplete session on Resume (D2 -- no branch on
+    # _pending_supersede_session here or at the call site).
+    def _open_post_session_modal(self) -> None:
+        if self._session_num >= SESSION_COUNT:
+            self._open_modal(self._build_visit_complete_content)
+        else:
+            self._open_modal(self._build_unmount_rest_content)
+
+    def _continue_from_post_session(self) -> None:
+        # D8: cancel the countdown (a no-op/guarded call on the visit-complete
+        # branch, which never starts one), close the modal, release the
+        # camera (this modal's Continue is the only place in the Stop flow
+        # that does so today), then take the same path plain Back already
+        # uses.
+        if self._rest_after_id is not None:
+            self.after_cancel(self._rest_after_id)
+            self._rest_after_id = None
+        self._close_modal()
+        self.release_camera()
+        self._on_back(None)
+
+    def _build_unmount_rest_content(self, parent: tk.Frame) -> None:
+        wrap = tk.Frame(parent, bg=theme.BG)
+        wrap.pack(padx=28, pady=24)
+        tk.Frame(wrap, bg=theme.BG, width=364, height=1).pack()
+
+        tk.Label(
+            wrap, text=f"Session {self._session_num} of {SESSION_COUNT} Complete",
+            bg=theme.BG, fg=theme.INK, font=self._f_bookend_heading,
+            anchor="w", justify="left",
+        ).pack(fill="x", pady=(4, 12))
+        tk.Label(
+            wrap,
+            text="Unmount the GripVT sensor from the participant's forearm "
+                 "and let them rest before the next wear. The countdown "
+                 "below is a pacing aid only -- Continue is never blocked.",
+            bg=theme.BG, fg=theme.INK_70, font=self._f_gate_body, wraplength=364,
+            justify="left", anchor="w",
+        ).pack(fill="x")
+
+        self._rest_label = tk.Label(
+            wrap, text=_format_rest_mmss(REST_DURATION_S), bg=theme.BG,
+            fg=theme.INK, font=self._f_bookend_heading, anchor="w", justify="left",
+        )
+        self._rest_label.pack(fill="x", pady=(16, 20))
+
+        btn_row = tk.Frame(wrap, bg=theme.BG)
+        btn_row.pack(fill="x")
+        self._build_button(
+            btn_row, "Continue to Calibration", "primary", None,
+            self._continue_from_post_session,
+        ).pack(side="right")
+
+        # Label already shows REST_DURATION_S (03:00) from construction above
+        # -- the first tick, one second later, is the first decrement.
+        self._rest_remaining_s = REST_DURATION_S
+        self._rest_after_id = self.after(1000, self._tick_rest_timer)
+
+    def _build_visit_complete_content(self, parent: tk.Frame) -> None:
+        wrap = tk.Frame(parent, bg=theme.BG)
+        wrap.pack(padx=28, pady=24)
+        tk.Frame(wrap, bg=theme.BG, width=364, height=1).pack()
+
+        tk.Label(
+            wrap, text="Visit Complete", bg=theme.BG, fg=theme.INK,
+            font=self._f_bookend_heading, anchor="w", justify="left",
+        ).pack(fill="x", pady=(4, 12))
+        tk.Label(
+            wrap,
+            text=f"All {SESSION_COUNT} sessions for this participant's visit "
+                 "are done -- no more wears remain. Unmount the GripVT "
+                 "sensor and thank the participant.",
+            bg=theme.BG, fg=theme.INK_70, font=self._f_gate_body, wraplength=364,
+            justify="left", anchor="w",
+        ).pack(fill="x", pady=(0, 20))
+
+        btn_row = tk.Frame(wrap, bg=theme.BG)
+        btn_row.pack(fill="x")
+        self._build_button(
+            btn_row, "Continue to Calibration", "primary", None,
+            self._continue_from_post_session,
+        ).pack(side="right")
+
+        # D6b/D7: no countdown on this branch.
+
+    def _tick_rest_timer(self) -> None:
+        self._rest_remaining_s = max(0, self._rest_remaining_s - 1)
+        self._rest_label.configure(text=_format_rest_mmss(self._rest_remaining_s))
+        # D9: never auto-closes/navigates at zero -- soft reminder only, kept
+        # ticking (clamped) so the label stays accurate if the operator lingers.
+        self._rest_after_id = self.after(1000, self._tick_rest_timer)
+
     # ── toast (copied from calibration_window, not imported, so the windows
     #    stay independent) ────────────────────────────────────────────────────
     def _show_toast(self, message: str) -> None:
@@ -519,6 +621,11 @@ def _add_placeholder(entry: tk.Entry, text: str) -> dict:
     entry.bind("<FocusIn>", on_focus_in)
     entry.bind("<FocusOut>", on_focus_out)
     return state
+
+
+def _format_rest_mmss(remaining_s: int) -> str:
+    minutes, seconds = divmod(max(0, remaining_s), 60)
+    return f"{minutes:02d}:{seconds:02d}"
 
 
 def _lerp(from_hex: str, to_hex: str, t: float) -> str:
