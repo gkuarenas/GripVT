@@ -3,7 +3,10 @@
 Implements the shuffle-and-reject rule in
 docs/testing-protocol-files/mvc-trial-randomization-protocol.md: six reps of
 each of the five %MVC levels per session, rejecting and reshuffling any
-sequence that places a forbidden pair adjacent.
+sequence that places a forbidden pair adjacent. Forbidden pairs are the
+80/80 and 80/50 fatigue rule plus 0/0 -- two 0% (rest) reps back to back
+waste a periodic baseline-drift check on the same instant; 50/50 stays
+legal.
 
 `TrialSequence.levels_pct` is 0-indexed but the display's trial number is
 1-based: trial N's target is `sequence[N - 1]`, i.e. `levels_pct[0]` is trial
@@ -16,9 +19,9 @@ import random
 LEVELS_PCT = (0, 5, 20, 50, 80)
 REPS_PER_LEVEL = 6
 TRIAL_COUNT = 30
-FORBIDDEN_ADJACENT = frozenset({(80, 80), (80, 50), (50, 80)})
+FORBIDDEN_ADJACENT = frozenset({(80, 80), (80, 50), (50, 80), (0, 0)})
 MAX_SHUFFLE_ATTEMPTS = 10_000
-GENERATOR_VERSION = "balanced_multiset_rejection_v1"
+GENERATOR_VERSION = "balanced_multiset_rejection_v2"
 BAND_FRAC_OF_TARGET = 0.15
 BAND_FLOOR_FRAC_OF_MVC = 0.01
 

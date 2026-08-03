@@ -407,7 +407,7 @@ def test_save_sequence_envelope_has_all_schema_keys(tmp_path):
     assert payload["schema_version"] == SEQUENCE_SCHEMA_VERSION
     assert payload["participant_id"] == "participant007"
     assert payload["session_dir"] == session_dir
-    assert payload["generator"] == "balanced_multiset_rejection_v1"
+    assert payload["generator"] == "balanced_multiset_rejection_v2"
     assert payload["seed"] == seq.seed
     assert payload["attempts"] == seq.attempts
     assert payload["levels_pct"] == list(LEVELS_PCT)
@@ -415,6 +415,7 @@ def test_save_sequence_envelope_has_all_schema_keys(tmp_path):
     assert sorted(tuple(p) for p in payload["forbidden_adjacent_pairs"]) == sorted(
         {tuple(sorted(p, reverse=True)) for p in FORBIDDEN_ADJACENT}
     )
+    assert [0, 0] in payload["forbidden_adjacent_pairs"]
 
 
 def test_save_sequence_has_thirty_pct_and_kg_entries(tmp_path):

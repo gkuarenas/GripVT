@@ -20,20 +20,30 @@ from core.trial_sequence import (
 def test_generated_sequences_are_balanced_and_valid_over_many_seeds():
     expected = Counter({pct: REPS_PER_LEVEL for pct in LEVELS_PCT})
     saw_50_50 = False
+    saw_0_0 = False
     for seed in range(200):
         seq = generate_sequence(seed=seed)
         assert len(seq.levels_pct) == TRIAL_COUNT
         assert Counter(seq.levels_pct) == expected
         assert is_valid(seq.levels_pct)
-        if (50, 50) in zip(seq.levels_pct, seq.levels_pct[1:]):
+        pairs = list(zip(seq.levels_pct, seq.levels_pct[1:]))
+        if (50, 50) in pairs:
             saw_50_50 = True
+        if (0, 0) in pairs:
+            saw_0_0 = True
+    # 50-50 must stay legal (deliberate); 0-0 must never appear (F8/D10).
     assert saw_50_50
+    assert not saw_0_0
 
 
 def test_is_valid_rejects_80_80_and_80_50_adjacency():
     assert not is_valid([80, 80])
     assert not is_valid([80, 50])
     assert not is_valid([50, 80])
+
+
+def test_is_valid_rejects_0_0_adjacency():
+    assert not is_valid([0, 0])
 
 
 def test_is_valid_accepts_50_50_adjacency():
@@ -136,13 +146,19 @@ def test_exhaustion_raises_sequence_generation_error(monkeypatch):
 
 
 def test_empirical_acceptance_rate_matches_the_exact_probability(capsys):
-    """D3's Poisson approximation estimates ~3% acceptance. The exact value,
-    computed by DP over the multiset-with-forbidden-adjacency arrangements,
-    is ~0.63% -- the Poisson model undercounts because forbidden pairs
-    cluster (e.g. all six 80s landing consecutively kills many arrangements
-    at once), which D3 itself flagged as "indicative, not exact." Either way
-    the 10,000-attempt cap stays safe: even at 0.63%, exhausting it has
-    probability ~(1-0.0063)**10000, i.e. effectively zero."""
+    """v1 (forbidding only (80,80)/(80,50)) had an exact accept rate of ~0.63%,
+    computed by DP over the multiset-with-forbidden-adjacency arrangements
+    (D3's Poisson approximation of ~3% undercounts because forbidden pairs
+    cluster, e.g. all six 80s landing consecutively kills many arrangements
+    at once).
+
+    F8/D10 adds (0,0) to the forbidden set (v2), which roughly quarters the
+    accept rate again: a 200,000-shuffle measurement in the F8 plan
+    (docs/logs/20260803_per_wear_session_folder_plan.md ss2b) puts it at
+    ~0.24%. This test's own 20,000-shuffle sample lands near there too. Either
+    way the 10,000-attempt cap stays safe -- at 0.24% exhausting it has
+    probability ~(1-0.0024)**10000 ~= 3.7e-11; even at this test's loosened
+    floor of 0.1% the probability is ~4.5e-5, still vanishing."""
     rng = random.Random(20260728)
     pool = [pct for pct in LEVELS_PCT for _ in range(REPS_PER_LEVEL)]
     trials = 20_000
@@ -155,6 +171,6 @@ def test_empirical_acceptance_rate_matches_the_exact_probability(capsys):
     with capsys.disabled():
         print(
             f"\n  empirical acceptance rate: {rate:.4f} over {trials} shuffles "
-            "(exact: 0.0063, D3's Poisson estimate: ~0.03)"
+            "(v1 exact: 0.0063, v2 (+ (0,0)) empirical: ~0.0024)"
         )
-    assert rate > 0.002
+    assert rate > 0.001
