@@ -19,6 +19,8 @@ TRIAL_COUNT = 30
 FORBIDDEN_ADJACENT = frozenset({(80, 80), (80, 50), (50, 80)})
 MAX_SHUFFLE_ATTEMPTS = 10_000
 GENERATOR_VERSION = "balanced_multiset_rejection_v1"
+BAND_FRAC_OF_TARGET = 0.15
+BAND_FLOOR_FRAC_OF_MVC = 0.01
 
 
 class SequenceGenerationError(RuntimeError):
@@ -46,6 +48,24 @@ def is_valid(levels_pct: Sequence[int]) -> bool:
 
 def target_kg(pct: int, mvc_kg: float) -> float:
     return round(pct / 100 * mvc_kg, 3)
+
+
+def accept_band_kg(pct: int, mvc_kg: float) -> tuple[float, float]:
+    """The protocol's advisory acceptance band around a trial's target, in kg.
+
+    Half-width is `max(15% of target, 1% of MVC)`. The floor governs the low
+    targets -- 15% of a 5% target is only +-0.31kg at a 41.7kg MVC, tighter
+    than deliberate control allows -- and the 15% rule governs everything from
+    ~6.67% upward. The lower bound clamps at zero, which only bites the 0%
+    target, where the band is the floor alone.
+
+    Advisory only: nothing gates, scores, or persists on this. Computed from
+    `target_kg()` rather than from `pct * mvc` directly, so the band always
+    brackets the same rounded figure the UI displays.
+    """
+    target = target_kg(pct, mvc_kg)
+    half = max(BAND_FRAC_OF_TARGET * target, BAND_FLOOR_FRAC_OF_MVC * mvc_kg)
+    return round(max(0.0, target - half), 3), round(target + half, 3)
 
 
 def generate_sequence(seed: int | None = None) -> TrialSequence:

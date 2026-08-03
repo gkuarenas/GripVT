@@ -10,6 +10,7 @@ from core.trial_sequence import (
     TRIAL_COUNT,
     SequenceGenerationError,
     TrialSequence,
+    accept_band_kg,
     generate_sequence,
     is_valid,
     target_kg,
@@ -74,6 +75,57 @@ def test_target_kg_rounds_to_three_decimals():
     assert target_kg(50, 40.0) == 20.0
     assert target_kg(0, 40.0) == 0.0
     assert target_kg(5, 33.333) == round(5 / 100 * 33.333, 3)
+
+
+def test_accept_band_matches_the_protocol_table_at_the_real_mvc():
+    """The band table from the 2026-07-31 sync plan section 9, computed at
+    participant001's real MVC. These are the numbers the operator reads off the
+    UI, so they are pinned against the doc rather than recomputed from the
+    formula (which would make the test tautological)."""
+    mvc = 41.719
+    assert accept_band_kg(0, mvc) == (0.0, 0.417)
+    assert accept_band_kg(5, mvc) == (1.669, 2.503)
+    assert accept_band_kg(20, mvc) == (7.092, 9.596)
+    assert accept_band_kg(50, mvc) == (17.731, 23.989)
+    assert accept_band_kg(80, mvc) == (28.369, 38.381)
+
+
+def test_accept_band_lower_bound_never_goes_negative():
+    """Only the 0% target can drive it negative -- its band is the 1%MVC floor
+    alone, with no target to subtract it from."""
+    lo, hi = accept_band_kg(0, 41.719)
+    assert lo == 0.0
+    assert hi == pytest.approx(0.01 * 41.719, abs=1e-3)
+
+
+def test_accept_band_brackets_its_own_displayed_target():
+    """A band that didn't contain its target would be incoherent on screen."""
+    for mvc in (20.0, 41.719, 60.5):
+        for pct in LEVELS_PCT:
+            lo, hi = accept_band_kg(pct, mvc)
+            assert lo <= target_kg(pct, mvc) <= hi
+
+
+def test_floor_governs_below_the_crossover_and_the_15pct_rule_above_it():
+    """15% of target overtakes the 1%MVC floor at pct = 100 * 0.01 / 0.15
+    = 6.67%. Pinning the crossover stops a future MVC or constant change from
+    silently flipping which rule governs a given target."""
+    mvc = 41.719
+    floor = 0.01 * mvc
+    for pct in (1, 5, 6):
+        lo, hi = accept_band_kg(pct, mvc)
+        assert (hi - lo) / 2 == pytest.approx(floor, abs=1e-3)
+    for pct in (7, 20, 50, 80):
+        lo, hi = accept_band_kg(pct, mvc)
+        assert (hi - lo) / 2 == pytest.approx(0.15 * target_kg(pct, mvc), abs=1e-3)
+
+
+def test_accept_band_scales_with_mvc_not_with_a_hardcoded_kg():
+    """Doubling MVC doubles both bounds -- catches any absolute-kg constant
+    creeping into the formula."""
+    lo1, hi1 = accept_band_kg(20, 30.0)
+    lo2, hi2 = accept_band_kg(20, 60.0)
+    assert (lo2, hi2) == pytest.approx((lo1 * 2, hi1 * 2), abs=1e-3)
 
 
 def test_exhaustion_raises_sequence_generation_error(monkeypatch):

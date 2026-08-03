@@ -504,6 +504,12 @@ class SessionWindow(
             font=self._f_small,
         )
         self._target_sub_label.pack(pady=(4, 0))
+        # Advisory accept range (F1) -- display only, never gates or scores.
+        self._target_band_label = tk.Label(
+            target, text=self._target_band_text(), bg=theme.BG, fg=theme.INK_60,
+            font=self._f_small,
+        )
+        self._target_band_label.pack(pady=(2, 0))
 
         tk.Frame(self._phase2_frame, bg=theme.DIVIDER, height=2).pack(fill="x", pady=(18, 0))
 
