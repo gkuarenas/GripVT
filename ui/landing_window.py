@@ -1,10 +1,10 @@
 """Landing window for the GripVT desktop app.
 
 First screen shown when the app is launched. Asks whether the operator is
-setting up a **new** participant or resuming an **existing** one, then routes
-to the appropriate flow (wired later -- for now the two buttons call the
-``on_new_participant`` / ``on_existing_participant`` hooks, defaulting to a
-print stub).
+setting up a **new** participant or resuming a session after an app crash,
+then routes to the appropriate flow (wired later -- for now the two buttons
+call the ``on_new_participant`` / ``on_resume_session`` hooks, defaulting to
+a print stub).
 
 Visual design ported from the "Modernist" design system (Claude Design:
 "GripVT Landing Window"). It is a flat aesthetic -- 0px radius, Archivo type,
@@ -62,12 +62,12 @@ class LandingWindow(tk.Tk):
     def __init__(
         self,
         on_new_participant: Callable[[], None] | None = None,
-        on_existing_participant: Callable[[], None] | None = None,
+        on_resume_session: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         self._on_new = on_new_participant or (lambda: print("New Participant clicked"))
-        self._on_existing = on_existing_participant or (
-            lambda: print("Existing Participant clicked")
+        self._on_resume = on_resume_session or (
+            lambda: print("Resume Session clicked")
         )
 
         self.title("GripVT")
@@ -156,7 +156,7 @@ class LandingWindow(tk.Tk):
         ).pack(fill="x")
         tk.Label(
             header,
-            text="Are you a new or existing participant?",
+            text="Start a new participant, or resume after a crash?",
             bg=BG,
             fg=SUBTITLE,
             font=self._font_subtitle,
@@ -170,7 +170,7 @@ class LandingWindow(tk.Tk):
         row.columnconfigure(0, weight=1, uniform="btn")
         row.columnconfigure(1, weight=1, uniform="btn")
         self._build_choice(row, 0, "new", "New Participant", self._on_new)
-        self._build_choice(row, 1, "existing", "Existing Participant", self._on_existing)
+        self._build_choice(row, 1, "resume", "Resume Session", self._on_resume)
 
     def _build_choice(
         self, parent: tk.Frame, col: int, icon: str, label: str, command: Callable[[], None]
@@ -253,7 +253,7 @@ class LandingWindow(tk.Tk):
             c.create_line(*p(19, 8, 19, 14), fill=INK, width=2, capstyle="round")
             c.create_line(*p(16, 11, 22, 11), fill=INK, width=2, capstyle="round")
         else:
-            # user-check: a tick.
+            # user-check (resume): a tick.
             c.create_line(
                 *p(16, 11, 18, 13, 22, 9),
                 fill=INK, width=2, capstyle="round", joinstyle="round",
