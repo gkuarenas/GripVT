@@ -80,6 +80,7 @@ class RecordingMixin:
     _participant: ParticipantRecord | None
     _pending_calibration: dict | None
     _pending_baseline: dict | None
+    _pending_grid_layout: dict | None
     _pending_supersede_session: str | None
     _session_num: int
     _session_num_at_open: int
@@ -448,9 +449,10 @@ class RecordingMixin:
         # and one baseline_*.<ext> clip land here, never more. Best-effort,
         # same idiom as the calibration flush above: a write failure must not
         # block the 30 trials that matter more.
+        baseline_path: str | None = None
         if self._pending_baseline is not None:
             try:
-                participants.save_baseline(
+                baseline_path = participants.save_baseline(
                     self._participant,
                     dest_dir=session_dir,
                     **self._pending_baseline,
@@ -458,6 +460,23 @@ class RecordingMixin:
             except Exception:
                 _log.exception("baseline write failed during _confirm_start")
                 self._show_toast("Baseline record failed to save — session continues.")
+        # Phase 3 (marker-grid-lookup plan): flushed in its own, independent
+        # try/except right after the baseline flush above -- a grid-layout
+        # write failure must never mask or abort the baseline write that
+        # already succeeded. Only attempted when the baseline write itself
+        # succeeded (baseline_path is not None), since grid_layout.json's
+        # baseline_file field names that exact file.
+        if self._pending_grid_layout is not None and baseline_path is not None:
+            try:
+                participants.save_grid_layout(
+                    self._participant,
+                    dest_dir=session_dir,
+                    baseline_file=os.path.basename(baseline_path),
+                    **self._pending_grid_layout,
+                )
+            except Exception:
+                _log.exception("grid layout write failed during _confirm_start")
+                self._show_toast("Grid layout failed to save — session continues.")
         self._writer = CSVWriter(session_dir)
         self._trial_log = TrialLog(session_dir)
         self._event_log = EventLog(

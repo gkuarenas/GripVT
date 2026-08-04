@@ -5,6 +5,7 @@ import numpy as np
 
 from core.calibration import CameraCalibration
 from core.detector import load_params, preprocess, denoise, detect, detection_labels
+from core.detector_search import AnchorError, geometry_from, grid_positions
 from core.kalman import KalmanManager
 from core.hungarian import assign
 from core.profiling import stage
@@ -104,6 +105,14 @@ class Tracker:
         self.gate_px: float = 100.0
         self.params: dict = load_params()
         self.baseline_set: bool = False
+        # Populated by capture_baseline() from real grid geometry (see
+        # docs/logs/20260804_161615_marker_grid_lookup_plan.md); grid_layout
+        # stays None whenever geometry can't be resolved and marker_id falls
+        # back to the naive (y, x) sort -- check grid_layout_source before
+        # trusting grid_layout.
+        self.grid_layout: dict[int, tuple[int, int]] | None = None
+        self.grid_layout_source: str = "none"
+        self.grid_layout_reason: str | None = None
         self.frame_index: int = 0
         self._last_baseline_gray: np.ndarray | None = None
         self._last_baseline_binary: np.ndarray | None = None
@@ -168,6 +177,12 @@ class Tracker:
         if not raw_frames:
             raise ValueError("capture_baseline() requires at least one frame")
 
+        # A re-capture must not leave a stale layout from a previous attempt
+        # visible if this attempt takes the fallback path.
+        self.grid_layout = None
+        self.grid_layout_source = "none"
+        self.grid_layout_reason = None
+
         per_frame_dets: list[list[tuple[float, float, float]]] = []
         cropped_gray = proc = None
         for raw_frame in raw_frames:
@@ -188,11 +203,32 @@ class Tracker:
             for xs, ys, areas in clusters
             if len(xs) >= min_presence
         ]
-        locked.sort(key=lambda d: (d[1], d[0]))  # deterministic: top→bottom, left→right
+        # Fallback ordering only -- used when geometry can't be resolved
+        # below. In practice this sorts by y alone: the x tiebreak never
+        # fires for real float centroids, so it is not actually
+        # top-to-bottom-then-left-to-right (see plan §1 Mode A).
+        locked.sort(key=lambda d: (d[1], d[0]))
+
+        try:
+            geom = geometry_from(locked)
+            positions = grid_positions(locked, geom)
+            ids = [r * geom.x_lines + c for r, c in positions]
+            self.grid_layout = {mid: (row, col) for mid, (row, col) in zip(ids, positions)}
+            self.grid_layout_source = "geometry"
+        except AnchorError as exc:
+            ids = list(range(len(locked)))
+            self.grid_layout = None
+            self.grid_layout_source = "fallback_sort"
+            self.grid_layout_reason = str(exc)
+            print(
+                f"Warning: baseline grid geometry unresolved ({exc}) -- marker_id "
+                "fell back to the flat (y, x) sort; no geometric row/col available "
+                "for this session."
+            )
 
         self.kalman.states.clear()
-        for i, (x, y, area) in enumerate(locked):
-            self.kalman.init_state(i, x, y, area)
+        for mid, (x, y, area) in sorted(zip(ids, locked), key=lambda pair: pair[0]):
+            self.kalman.init_state(mid, x, y, area)
 
         self.baseline_set = True
         count = len(locked)

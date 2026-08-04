@@ -91,6 +91,33 @@ def _finish_burst_with_video(win: SessionWindow, count: int) -> None:
         win._capture_baseline_frame(frame)
 
 
+def _finish_burst_with_grid(
+    win: SessionWindow, count: int, *,
+    layout: dict[int, tuple[int, int]] | None = None,
+    source: str = "geometry",
+    reason: str | None = None,
+) -> None:
+    """Like _finish_burst_with_video, but also sets the tracker's
+    grid_layout* attributes the way the real Tracker.capture_baseline() does
+    (see core/tracker.py) -- so the Phase 3 grid-layout buffering path has
+    real data to read instead of the Tracker.__init__ defaults. Real numpy
+    frames (not _finish_burst's bare object()) because these tests drive all
+    the way through _confirm_start(), which flushes save_baseline() and
+    therefore needs frames with a real .shape for the video clip write."""
+    def fake_capture_baseline(frames):
+        win._tracker.grid_layout = layout
+        win._tracker.grid_layout_source = source
+        win._tracker.grid_layout_reason = reason
+        return count
+
+    win._tracker.capture_baseline = fake_capture_baseline
+    win._on_capture_baseline_click()
+    assert win._baseline["status"] == "capturing"
+    for _ in range(baseline_module.BASELINE_FRAMES):
+        frame = np.random.randint(0, 256, _CLIP_FRAME_SIZE, dtype=np.uint8)
+        win._capture_baseline_frame(frame)
+
+
 def _count_video_frames(path: Path) -> int:
     cap = _REAL_VIDEO_CAPTURE(str(path))
     n = 0
@@ -249,6 +276,97 @@ def test_fail_recapture_pass_writes_exactly_one_clip(window, tmp_path):
     payload = json.loads(jsons[0].read_text())
     assert payload["locked_count"] == 97  # the winning attempt, not 50 or 55
     assert _count_video_frames(clips[0]) == baseline_module.BASELINE_FRAMES
+    window._confirm_stop()
+
+
+def test_grid_layout_not_written_before_start(window, tmp_path):
+    """Phase 3 (marker-grid-lookup plan): grid_layout.json follows the same
+    F6b buffer-then-flush pattern as baseline_*.json -- nothing lands on disk
+    from the gate alone."""
+    window._participant = _make_participant(tmp_path)
+    layout = {0: (0, 0), 1: (0, 1), 8: (0, 8), 98: (10, 8)}
+    _finish_burst_with_grid(window, 99, layout=layout, source="geometry")
+    assert window._pending_grid_layout is not None
+
+    root_before = Path(window._participant.folder)
+    assert list(root_before.glob("grid_layout.json")) == []
+
+    window._confirm_start()
+    session_dir = Path(window._writer.session_dir)
+    files = list(session_dir.glob("grid_layout.json"))
+    assert len(files) == 1
+    window._confirm_stop()
+
+
+def test_fail_recapture_pass_writes_one_grid_layout_matching_winner(window, tmp_path):
+    """Mirrors test_fail_recapture_pass_writes_exactly_one_clip: a
+    fail -> recapture -> pass sequence must flush exactly one grid_layout.json,
+    and its content must be the WINNING attempt's, not the discarded one."""
+    window._participant = _make_participant(tmp_path)
+
+    _finish_burst_with_grid(window, 50, layout=None, source="fallback_sort", reason="too few markers")
+    assert window._baseline["status"] == "fail"
+    assert window._pending_grid_layout is None  # a bare fail is never buffered
+    window._on_recapture_baseline_click()
+
+    winning_layout = {0: (0, 0), 1: (0, 1), 9: (1, 0)}
+    _finish_burst_with_grid(window, 97, layout=winning_layout, source="geometry")
+    assert window._pending_grid_layout["locked_count"] == 97
+
+    window._confirm_start()
+    session_dir = Path(window._writer.session_dir)
+    files = list(session_dir.glob("grid_layout.json"))
+    assert len(files) == 1
+
+    payload = json.loads(files[0].read_text())
+    assert payload["locked_count"] == 97  # the winning attempt, not 50
+    assert payload["source"] == "geometry"
+    window._confirm_stop()
+
+
+def test_fallback_capture_writes_grid_layout_with_null_layout(window, tmp_path):
+    """D6: a capture whose geometry never resolves still writes the file --
+    a missing file is ambiguous, an explicit fallback_sort record is not."""
+    window._participant = _make_participant(tmp_path)
+    _finish_burst_with_grid(
+        window, 99, layout=None, source="fallback_sort", reason="mount rotated 90deg",
+    )
+    assert window._baseline["status"] == "pass"
+
+    window._confirm_start()
+    session_dir = Path(window._writer.session_dir)
+    payload = json.loads((session_dir / "grid_layout.json").read_text())
+    assert payload["source"] == "fallback_sort"
+    assert payload["layout"] is None
+    assert payload["reason"] == "mount rotated 90deg"
+    window._confirm_stop()
+
+
+def test_grid_layout_round_trip_matches_tracker_dict(window, tmp_path):
+    """Reading `layout` back and int()-ing its (necessarily string) keys must
+    reproduce the tracker's in-memory grid_layout dict exactly."""
+    window._participant = _make_participant(tmp_path)
+    layout = {0: (0, 0), 1: (0, 1), 9: (1, 0), 98: (10, 8)}
+    _finish_burst_with_grid(window, 99, layout=layout, source="geometry")
+
+    window._confirm_start()
+    session_dir = Path(window._writer.session_dir)
+    payload = json.loads((session_dir / "grid_layout.json").read_text())
+
+    round_tripped = {
+        int(k): (v["row"], v["col"]) for k, v in payload["layout"].items()
+    }
+    assert round_tripped == layout
+    window._confirm_stop()
+
+
+def test_grid_layout_never_written_to_participant_root(window, tmp_path):
+    window._participant = _make_participant(tmp_path)
+    layout = {0: (0, 0)}
+    _finish_burst_with_grid(window, 99, layout=layout, source="geometry")
+
+    window._confirm_start()
+    assert list(Path(window._participant.folder).glob("grid_layout.json")) == []
     window._confirm_stop()
 
 

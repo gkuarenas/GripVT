@@ -27,6 +27,7 @@ SCHEMA_VERSION = 1
 CALIBRATION_SCHEMA_VERSION = 1
 BASELINE_SCHEMA_VERSION = 1
 ABORTED_SCHEMA_VERSION = 1
+GRID_LAYOUT_SCHEMA_VERSION = 1
 
 _FOLDER_RE = re.compile(r"participant(\d+)_")
 _SESSION_RE = re.compile(r"session(\d+)_")
@@ -229,6 +230,63 @@ def save_baseline(
             writer.write(frame)
         writer.close()
 
+    return path
+
+
+def save_grid_layout(
+    record: ParticipantRecord,
+    *,
+    dest_dir: str,
+    layout: dict[int, tuple[int, int]] | None,
+    source: str,
+    reason: str | None,
+    grid_shape: dict[str, int],
+    locked_count: int,
+    baseline_file: str,
+) -> str:
+    """Persist one session's marker_id -> (row, col) lookup into `dest_dir`.
+
+    `dest_dir` is keyword-only with no default -- same rule
+    `save_baseline`/`save_calibration` already establish (per
+    docs/logs/20260803_per_wear_session_folder_plan.md Phase 1): every caller
+    must state where it writes, so a future caller cannot silently re-litter
+    the participant root.
+
+    Filename is the literal, untimestamped `grid_layout.json` (D3 of
+    docs/logs/20260804_161615_marker_grid_lookup_plan.md) -- only the winning
+    baseline attempt is ever flushed into a session dir (F6b buffering, see
+    ui/session/baseline.py), so there is exactly one per session and a
+    timestamp suffix buys nothing. `baseline_file` pairs this record with its
+    `baseline_<ts>.json` unambiguously.
+
+    `layout` is `None` whenever `source == "fallback_sort"` (D6): geometry
+    could not be resolved for this capture, so no row/col mapping exists for
+    it -- callers must check `source` before trusting `layout`. When present,
+    keys are written as strings (JSON object keys are always strings), so
+    readers must do `int(k)` on `layout`'s keys to recover marker_id ints.
+
+    De-identified per URERB Form 6A, same as `save_baseline`: coded
+    participant_id only, no name, no free text beyond the geometry error
+    message carried in `reason`.
+    """
+    payload = {
+        "schema_version": GRID_LAYOUT_SCHEMA_VERSION,
+        "participant_id": record.participant_id,
+        "captured_at": datetime.now().isoformat(timespec="seconds"),
+        "baseline_file": baseline_file,
+        "source": source,
+        "reason": reason,
+        "locked_count": locked_count,
+        "grid_shape": grid_shape,
+        "id_formula": "marker_id = row * n_cols + col",
+        "layout": (
+            None if layout is None
+            else {str(mid): {"row": row, "col": col} for mid, (row, col) in layout.items()}
+        ),
+    }
+    path = os.path.join(dest_dir, "grid_layout.json")
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
     return path
 
 
