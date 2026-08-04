@@ -14,6 +14,7 @@ from core.detector_search import (
     _group_by_lines,
     geometry_from,
     grid_lines,
+    grid_positions,
     pose_cost,
     region_counts,
     search,
@@ -167,6 +168,88 @@ def test_losing_the_bottom_right_marker_shows_in_that_cell():
 def test_geometry_from_rejects_too_few_lines():
     with pytest.raises(AnchorError):
         geometry_from(grid_points(cols=2, rows=2))
+
+
+# ── grid_positions: row/col resolution for marker_id ───────────────────────
+def test_grid_positions_flat_bijection_and_corners():
+    points = grid_points()
+    geom = geometry_from(points)
+    positions = grid_positions(points, geom)
+
+    assert len(positions) == TARGET_MARKERS
+    assert set(positions) == {(r, c) for r in range(ROWS) for c in range(COLS)}
+
+    top_left = min(range(len(points)), key=lambda i: (points[i][0], points[i][1]))
+    bottom_right = max(range(len(points)), key=lambda i: (points[i][0], points[i][1]))
+    assert positions[top_left] == (0, 0)
+    assert positions[bottom_right] == (ROWS - 1, COLS - 1)
+
+
+def test_grid_positions_axis_1_branch():
+    """Force geom.axis == 1 (lines run along y, i.e. a line IS a row) by
+    breaking x's global clusterability while leaving y (the row grouping)
+    untouched. Neither fixture reaches this branch unperturbed -- axis 0
+    always validates first for them (see geometry_from's try-both-axes loop)
+    -- so this merges two rows' x-offsets to push the x-line count to 10
+    (outside GRID_SHAPE), forcing the fallback to axis 1. The per-row x order
+    is preserved (the offset is constant within a row), so the resolved
+    positions must match the unperturbed grid exactly.
+    """
+    points = grid_points()
+    perturbed = [
+        (x + min(i // COLS, ROWS - 2) * 10_000.0, y, s)
+        for i, (x, y, s) in enumerate(points)
+    ]
+    geom = geometry_from(perturbed)
+    assert geom.axis == 1
+
+    positions = grid_positions(perturbed, geom)
+    assert positions == grid_positions(points, geometry_from(points))
+
+
+@pytest.mark.parametrize("bow", [20.0, 30.0])
+def test_grid_positions_survives_a_bowed_grid_and_beats_the_naive_sort(bow):
+    """Regression for the on-rig Mode A bug (core/tracker.py's old (y, x)
+    sort): on a curved grid, per-row y bow means a flat sort scrambles
+    within-row order. grid_positions must recover the true left-to-right
+    order that the naive sort gets wrong."""
+    points = curved_grid_points(bow_px=bow)
+    geom = geometry_from(points)
+    positions = grid_positions(points, geom)
+
+    assert len(set(positions)) == TARGET_MARKERS
+    assert set(positions) == {(r, c) for r in range(ROWS) for c in range(COLS)}
+
+    naive_order = sorted(range(len(points)), key=lambda i: (points[i][1], points[i][0]))
+    grid_order = sorted(range(len(points)), key=lambda i: positions[i])
+    assert naive_order != grid_order
+
+    true_top_left = min(range(COLS), key=lambda i: points[i][0])
+    assert positions[true_top_left] == (0, 0)
+    assert naive_order.index(true_top_left) != 0
+
+
+def test_grid_positions_raises_on_dropped_marker():
+    points = grid_points()[:-1]
+    geom = geometry_from(points)
+    with pytest.raises(AnchorError):
+        grid_positions(points, geom)
+
+
+def test_grid_positions_raises_on_duplicate_marker():
+    points = grid_points() + [grid_points()[0]]
+    geom = geometry_from(points)
+    with pytest.raises(AnchorError):
+        grid_positions(points, geom)
+
+
+def test_grid_positions_raises_on_wrong_grid_shape():
+    """An 11x9 mount (rotated ~90 degrees from the expected 9x11) must not be
+    silently transposed into a plausible-looking layout (D8)."""
+    points = grid_points(cols=11, rows=9)
+    geom = geometry_from(points)
+    with pytest.raises(AnchorError):
+        grid_positions(points, geom)
 
 
 # ── cost function ──────────────────────────────────────────────────────────

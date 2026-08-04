@@ -233,6 +233,59 @@ def region_counts(detections: list[Detection], geom: Geometry) -> dict[str, dict
     return {"bands": bands, "corners": corners}
 
 
+def grid_positions(detections: list[Detection], geom: Geometry) -> list[tuple[int, int]]:
+    """Resolve each detection's grid position, aligned 1:1 with `detections`.
+
+    Returns a list of `(row, col)` -- not `(col, row)` -- one entry per input
+    detection, in the same order. Raises `AnchorError` unless the result is a
+    clean bijection onto the full `GRID_SHAPE` grid: this is strict, rather
+    than inferring a gap, because a missing marker would silently shift every
+    later rank in its line by one, and the row pitch is too variable across
+    the curved grid to distinguish a genuine multi-step gap from a plain
+    single-step one by pitch alone.
+    """
+    centres = np.array(geom.lines)
+    groups: list[list[tuple[float, int]]] = [[] for _ in range(geom.n_lines)]
+    for idx, det in enumerate(detections):
+        line_idx = int(np.argmin(np.abs(centres - det[geom.axis])))
+        groups[line_idx].append((det[1 - geom.axis], idx))
+
+    positions: list[tuple[int, int] | None] = [None] * len(detections)
+    for line_idx, group in enumerate(groups):
+        for rank, (_value, orig_idx) in enumerate(sorted(group)):
+            if geom.axis == 0:
+                positions[orig_idx] = (rank, line_idx)
+            else:
+                positions[orig_idx] = (line_idx, rank)
+
+    n_cols, n_rows = geom.x_lines, geom.y_lines
+    if (n_cols, n_rows) != GRID_SHAPE:
+        raise AnchorError(
+            f"Grid geometry resolved to {n_cols}x{n_rows} (cols x rows), not the "
+            f"expected {GRID_SHAPE[0]}x{GRID_SHAPE[1]} -- mount may be rotated "
+            "~90 degrees; recapture the baseline."
+        )
+    if len(detections) != n_rows * n_cols:
+        raise AnchorError(
+            f"{len(detections)} markers cannot fill a {n_cols}x{n_rows} grid "
+            f"({n_rows * n_cols} cells) -- check for a dropped or duplicate "
+            "marker, then recapture."
+        )
+    if any(len(g) != geom.n_per_line for g in groups):
+        raise AnchorError(
+            "Grid lines are not evenly populated -- a marker may be missing or "
+            "mis-clustered; recapture the baseline."
+        )
+    resolved = [p for p in positions if p is not None]
+    full_grid = {(r, c) for r in range(n_rows) for c in range(n_cols)}
+    if len(resolved) != len(detections) or set(resolved) != full_grid:
+        raise AnchorError(
+            "Resolved grid positions are not a clean bijection onto the full "
+            "grid -- check for a dropped or duplicate marker, then recapture."
+        )
+    return positions  # type: ignore[return-value]
+
+
 def pose_cost(
     n_detected: int, oversized: int, corners: dict[str, int], reference: dict[str, int]
 ) -> float:

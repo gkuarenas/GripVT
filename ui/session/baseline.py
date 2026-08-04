@@ -22,7 +22,9 @@ from typing import Callable
 
 import numpy as np
 
-from core.detector_search import MIN_ACCEPTABLE, TARGET_MARKERS, SearchResult, region_counts
+from core.detector_search import (
+    GRID_SHAPE, MIN_ACCEPTABLE, TARGET_MARKERS, SearchResult, region_counts,
+)
 from core.roi import ROICrop
 from core.tracker import BASELINE_FRAMES, Tracker
 from output.participants import ParticipantRecord
@@ -46,6 +48,7 @@ class BaselineMixin:
     _baseline_frames: list[np.ndarray]
     _baseline_clip_frames: list[np.ndarray]
     _pending_baseline: dict | None
+    _pending_grid_layout: dict | None
     _phase1_frame: tk.Frame
     _phase2_frame: tk.Frame
     _recording: bool
@@ -436,4 +439,18 @@ class BaselineMixin:
             "bands": b["bands"],
             "params": self._tracker.params,
             "frames": self._baseline_clip_frames,
+        }
+        # Phase 3 (marker-grid-lookup plan): buffered from the tracker's
+        # already-computed grid_layout* attributes (set by capture_baseline())
+        # -- same overwrite-on-recapture guarantee as _pending_baseline above,
+        # since both are (re)built from the same winning attempt in this one
+        # method call. grid_shape is a fixed config constant (GRID_SHAPE),
+        # not something capture_baseline() derives per attempt, so it's
+        # correct to include even on the fallback_sort path.
+        self._pending_grid_layout = {
+            "layout": self._tracker.grid_layout,
+            "source": self._tracker.grid_layout_source,
+            "reason": self._tracker.grid_layout_reason,
+            "locked_count": b["count"],
+            "grid_shape": {"n_rows": GRID_SHAPE[1], "n_cols": GRID_SHAPE[0]},
         }

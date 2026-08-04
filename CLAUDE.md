@@ -58,7 +58,7 @@ GripVT/
   recordings/             # Per-participant data tree (gitignored)
     participantNNN_<ts>/
       participant.json    # De-identified: coded ID + anthropometrics + metadata (NO name)
-      sessionN_<ts>/      # Session CSV + overlay PNG (wired in the session pass)
+      sessionN_<ts>/      # Session CSV, overlay PNG, baseline artifacts, grid_layout.json
 ```
 Participant names live only in an external key file outside the repo:
 `C:\Users\Guillaume\Documents\DLSU\THESIS\GripVT_keys\participant_key.json`
@@ -80,6 +80,7 @@ pip install -r requirements.txt
   (Changed 2026-08-03, see `docs/logs/20260731_152249_framerate_spike_plan.md` — this de-duplicated a redundant per-frame undistort, and detection has run on the rectified frame since. This note replaces an earlier points-for-math/remap-for-display split that no longer reflects the code.)
 - **All participant/session output goes to `recordings/participantNNN_<ts>/sessionN_<ts>/`.** Never write to the project root. (`output/sessions/` is retired; `output/writer.make_session_dir` still points there and is retargeted in the session recording pass.)
 - **De-identify at the source.** Never write a participant's name into `recordings/`; it belongs only in the external key file. See `output/participants.py`.
+- **`marker_id` is derived from real grid geometry**, not sort order: `marker_id = row * n_cols + col`, row-major, origin top-left, 9 columns × 11 rows. `grid_layout.json` (per session) is authoritative for each marker's `(row, col)` — but `source == "fallback_sort"` means the ids are a bare `(y, x)` sort with no geometric meaning, so check `source` before trusting `layout`.
 
 ## Do
 - State "Guillaume" during the beginning of every response, may be varied but always answer with my name during the start of every response.

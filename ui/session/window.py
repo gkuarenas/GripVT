@@ -178,6 +178,13 @@ class SessionWindow(
         # the winning attempt is ever flushed (same guarantee the .mp4 path
         # already gave). None until a baseline capture locks.
         self._pending_baseline: dict | None = None
+        # Phase 3 (marker-grid-lookup plan): the save_grid_layout() kwargs
+        # bundle built alongside self._pending_baseline -- held in memory,
+        # never written, until _confirm_start (recording.py) flushes it into
+        # the session directory right after the baseline flush. Same
+        # overwrite-on-recapture guarantee: only the winning attempt is ever
+        # buffered. None until a baseline capture locks.
+        self._pending_grid_layout: dict | None = None
         self._recording_started = False
         # _recording (Phase 5, DCLogic) toggles Start<->Stop within a trial
         # block; _recording_started (D2) latches True forever on first Start
