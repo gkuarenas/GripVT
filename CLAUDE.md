@@ -86,6 +86,7 @@ pip install -r requirements.txt
 - State "Guillaume" during the beginning of every response, may be varied but always answer with my name during the start of every response.
 - When asked to commit changes, make sure to follow conventional commits, do not go above 100 characters, do not include "edited by Claude Code" or the likes. Just a simple commit would do. no need to write who wrote.
 - When asked to explain code and write notes, prioritize readability from a human standpoint. Avoid too much technicality, prioritize what would be important to digest, and make sure it could be understood by a junior developer with little experience.
+- Always consult academic-research-skills when asked to write something for Guillaume's thesis/journal.
 
 ## Don't
 | Anti-pattern | Do this instead |
