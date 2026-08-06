@@ -6,7 +6,7 @@ in the chair. This tool exists so that check is one command instead of ten
 manual squints across a two-hour block.
 
 The two real failure modes, from
-docs/discussion/participant001-data-quality-findings.md:
+docs/participants/participant001/data-quality-findings.md:
 
   session 4 -- header written, ",37555 samples," declared, ZERO data rows.
                File is 171 bytes. Obvious once you look; invisible if you

@@ -1,7 +1,7 @@
 """Balanced-multiset trial sequence generator for %MVC grip trials.
 
 Implements the shuffle-and-reject rule in
-docs/testing-protocol-files/mvc-trial-randomization-protocol.md: six reps of
+docs/protocol/mvc-trial-randomization-protocol.md: six reps of
 each of the five %MVC levels per session, rejecting and reshuffling any
 sequence that places a forbidden pair adjacent. Forbidden pairs are the
 80/80 and 80/50 fatigue rule plus 0/0 -- two 0% (rest) reps back to back
