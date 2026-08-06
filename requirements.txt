@@ -1,6 +1,14 @@
+# --- App runtime (main.py and everything under core/, ui/, output/) ---
 opencv-python
 numpy
 scipy
 customtkinter
 Pillow
 openpyxl
+
+# --- Analysis only (notebooks/, offline feature prototyping) ---
+# Not imported by the app or by tools/. Safe to skip on a collection-day machine.
+pandas
+matplotlib
+ipykernel
+nbstripout   # clears notebook outputs on commit; re-run `nbstripout --install` per clone
