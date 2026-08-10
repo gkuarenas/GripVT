@@ -3,6 +3,12 @@
 ## Project
 **GripVT** — Marker displacement tracker for the GripVT visuotactile forearm sensor.
 
+> **Orientation: read `docs/README.md` first.** It is the front door — current project
+> phase, the 6-notebook analysis roadmap, a vocabulary list, the settled decisions, and
+> which docs are live vs archived. `docs/logs/` holds only **live** work; finished plans
+> live in `docs/archive/build-plans/`. `docs/` is gitignored, so when a doc and the code
+> disagree, the code wins.
+
 `main.py` is the sole app entry point for v1, launching the flow
 LandingWindow → NewParticipantWindow → CalibrationWindow → SessionWindow (live feed,
 baseline capture, session recording). Bench characterization (and its planned `test_app.py`
