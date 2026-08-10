@@ -36,6 +36,10 @@ calibration/intrinsics/results/*
 calibration/intrinsics/results/20260701_180005_calibration/*
 !calibration/intrinsics/results/20260701_180005_calibration/calibration.json
 
+# Track the split manifest (nbstripout erases notebook outputs, so this is the only
+# committed record of which mounts and trials each fold held out)
+!notebooks/split_manifest.json
+
 # Track images referenced by README.md
 !docs/
 docs/*
