@@ -10,5 +10,6 @@ openpyxl
 # Not imported by the app or by tools/. Safe to skip on a collection-day machine.
 pandas
 matplotlib
+scikit-learn
 ipykernel
 nbstripout   # clears notebook outputs on commit; re-run `nbstripout --install` per clone
