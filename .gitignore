@@ -45,3 +45,8 @@ calibration/intrinsics/results/20260701_180005_calibration/*
 docs/*
 !docs/images/
 !docs/images/**
+
+# MLflow tracking store and run artifacts (notebook 03 onward). Regenerable; large.
+mlflow.db
+mlruns/
+mlartifacts/
