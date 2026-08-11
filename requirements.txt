@@ -13,3 +13,7 @@ matplotlib
 scikit-learn
 ipykernel
 nbstripout   # clears notebook outputs on commit; re-run `nbstripout --install` per clone
+xgboost
+optuna
+mlflow
+torch        # CUDA build: --index-url https://download.pytorch.org/whl/cu126
