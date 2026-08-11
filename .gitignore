@@ -50,3 +50,7 @@ docs/*
 mlflow.db
 mlruns/
 mlartifacts/
+
+# Per-fold results written live during a long model run, as crash insurance. Derived from
+# the notebook; the durable record is the "7x results" markdown cell.
+notebooks/*_results_live.csv
