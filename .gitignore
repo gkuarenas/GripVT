@@ -40,11 +40,13 @@ calibration/intrinsics/results/20260701_180005_calibration/*
 # committed record of which mounts and trials each fold held out)
 !notebooks/split_manifest.json
 
-# Track images referenced by README.md
+# Track images referenced by README.md, and the agent-skill config the skills read
 !docs/
 docs/*
 !docs/images/
 !docs/images/**
+!docs/agents/
+!docs/agents/**
 
 # MLflow tracking store and run artifacts (notebook 03 onward). Regenerable; large.
 mlflow.db

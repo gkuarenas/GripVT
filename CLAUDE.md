@@ -95,6 +95,7 @@ pip install -r requirements.txt
 - **Write all prose in `docs/` in ASD-STE100 Simplified Technical English.** Active voice. Imperative mood for instructions. Max 20 words per instruction sentence, 25 per descriptive sentence, 6 sentences per paragraph. No contractions. One word, one meaning — "refer to" not "see", "make sure" not "ensure", "before" not "prior to", "must" for a requirement. Code, commands, file paths and table cells stay verbatim; STE applies to prose only. Draft in STE from the start — compressing normal prose afterwards recovers far less.
 - **Every `##` section in a `docs/` file opens with one bold "Bottom line:" sentence, max 20 words.** Guillaume reads only those lines to infer trends.
 - **In `docs/` tables, put the growing dimension on rows.** Participants are rows; sessions and target levels are columns. The study reaches 10 participants and column count is the expensive axis.
+- **Use the `tldr` skill for every reply to Guillaume.** He reads with ADHD: fewer words must carry more meaning. Lead with the concrete next action, number multi-step work, restate state across turns, cut tangents, give specific time estimates, and make wins visible. This applies to casual messages too, not only to long technical answers. (`tldr` is the personal copy at `~/.claude/skills/tldr/`; the `i-have-adhd` plugin is the same idea but does not always load.)
 - Always consult academic-research-skills when asked to write something for Guillaume's thesis/journal.
 - **Whenever Guillaume asks you to ask him something, use the `mattpocock-skills:grilling` skill.** This covers "ask me questions", "clarify with me", "grill me", and any request to check requirements before starting. Map the design tree, ask the whole frontier in one numbered round with a recommendation per question, and find every fact yourself before asking. Never ask scattered ad-hoc questions.
 
@@ -107,3 +108,17 @@ pip install -r requirements.txt
 | Set `GATE_PX` below 80 px | Default 100 px; retune for GripVT footage but keep ≥ 80 |
 | Write output to project root | Write to `recordings/participantNNN_<ts>/…` always |
 | Store a participant's name alongside their data | Name → external key file only; `recordings/` stays de-identified |
+
+## Agent skills
+
+### Issue tracker
+
+Issues live as markdown files under `.scratch/<feature>/` — no remote tracker, `gh` is not installed. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five canonical roles, kept at their default strings, recorded in each issue's `Status:` line. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` at the repo root plus `docs/adr/` (neither exists yet). See `docs/agents/domain.md`.
