@@ -92,7 +92,11 @@ pip install -r requirements.txt
 - State "Guillaume" during the beginning of every response, may be varied but always answer with my name during the start of every response.
 - When asked to commit changes, make sure to follow conventional commits, do not go above 100 characters, do not include "edited by Claude Code" or the likes. Just a simple commit would do. no need to write who wrote.
 - When asked to explain code and write notes, prioritize readability from a human standpoint. Avoid too much technicality, prioritize what would be important to digest, and make sure it could be understood by a junior developer with little experience.
+- **Write all prose in `docs/` in ASD-STE100 Simplified Technical English.** Active voice. Imperative mood for instructions. Max 20 words per instruction sentence, 25 per descriptive sentence, 6 sentences per paragraph. No contractions. One word, one meaning — "refer to" not "see", "make sure" not "ensure", "before" not "prior to", "must" for a requirement. Code, commands, file paths and table cells stay verbatim; STE applies to prose only. Draft in STE from the start — compressing normal prose afterwards recovers far less.
+- **Every `##` section in a `docs/` file opens with one bold "Bottom line:" sentence, max 20 words.** Guillaume reads only those lines to infer trends.
+- **In `docs/` tables, put the growing dimension on rows.** Participants are rows; sessions and target levels are columns. The study reaches 10 participants and column count is the expensive axis.
 - Always consult academic-research-skills when asked to write something for Guillaume's thesis/journal.
+- **Whenever Guillaume asks you to ask him something, use the `mattpocock-skills:grilling` skill.** This covers "ask me questions", "clarify with me", "grill me", and any request to check requirements before starting. Map the design tree, ask the whole frontier in one numbered round with a recommendation per question, and find every fact yourself before asking. Never ask scattered ad-hoc questions.
 
 ## Don't
 | Anti-pattern | Do this instead |
