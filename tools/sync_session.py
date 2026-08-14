@@ -94,10 +94,26 @@ PARTICIPANT_JSON_NAME = "participant.json"
 TRAINING_TABLE_NAME = "training_table.csv"
 SYNC_REPORT_NAME = "sync_report.json"
 
-# Cross-correlation search grid (spec sec 4a): +-2.0s at the Biopac's own
-# 5ms sample period -- searching finer than the source data's resolution
-# would just interpolate noise.
-XCORR_RANGE_MS = 2000
+# Cross-correlation search grid (spec sec 4a): the sweep half-width, at the
+# Biopac's own 5ms sample period -- searching finer than the source data's
+# resolution would just interpolate noise.
+#
+# Widened 2000 -> 8000 on 2026-08-14. The original +-2.0s was set from
+# participants 001-004, whose offsets never exceed 0.905s. Participants
+# 005-007 produced four sessions whose true offset lies outside +-2.0s;
+# each one silently pinned to exactly the sweep edge, which reads as a
+# plausible number rather than as a failure. Widening recovers all four and
+# moves no previously-good session. Cross-checks, per session:
+#   p005 s6  -1.715 -> +7.300 (r 0.20 -> 0.63); its independent tap
+#            estimate is +7.295, so two methods agree to 5ms
+#   p005 s8  +2.000 -> +2.265 (r 0.64 -> 0.76)
+#   p006 s7  +2.000 -> +2.150 (r 0.85 -> 0.92)
+#   p007 s3  +2.000 -> +2.695 (r 0.46 -> 0.90)
+# In all four, the two drift halves agree to within 0.04s, so the new peak
+# is a real alignment and not an alias of the trial cadence.
+#
+# 8000 stays far inside TZ_GATE_AFTER_MS, so it cannot mask a timezone fault.
+XCORR_RANGE_MS = 8000
 XCORR_STEP_MS = 5
 XCORR_MIN_OVERLAP_FRAMES = 10
 
@@ -113,7 +129,33 @@ TZ_GATE_AFTER_MS = 600_000
 # Triple-tap detection (spec sec 4b).
 TAP_SEARCH_WINDOW_S = 25.0
 TAP_THRESHOLD_FRAC = 0.35
-TAP_GAP_MIN_S = 0.35
+#
+# TAP_GAP_MIN_S lowered 0.35 -> 0.15 on 2026-08-14. Guillaume reported that
+# some participants tap three VERY quick pulses. _find_triple rejects a triple
+# unless BOTH gaps fall inside [TAP_GAP_MIN_S, TAP_GAP_MAX_S], so a fast
+# tapper was being discarded rather than measured.
+#
+# Measured across all 69 sessions: the smallest genuine gap between the first
+# three force peaks is 0.250s, and the 10th percentile is 0.395s. The old
+# 0.35s floor therefore sat on top of the fast tail of a real distribution.
+#
+# Detection rate by floor (sessions with taps found in both signals):
+#   floor   0.35   0.25   0.15   0.10   0.05
+#   p002     8/10   9/10   9/10   9/10   9/10
+#   p006     4/10   9/10   9/10   9/10   9/10
+#   p007     5/10   9/10  10/10  10/10  10/10
+# Nothing further is recovered below 0.15, which is the evidence that no
+# genuine triple sits under it -- so 0.15 admits the real distribution with
+# margin without inventing detections out of a single tap's ringing.
+#
+# 11 sessions gained a tap reading. 7 of the 11 agree with the wholly
+# independent xcorr offset to within AGREEMENT_TOLERANCE_S, including two
+# large-offset sessions (p006 s3: +1.690 xcorr vs +1.696 taps; p007 s3:
+# +2.695 vs +2.671). The other 4 are false positives and are already caught
+# by the agreement gate below. That trade is worth taking, because the taps
+# are only ever a cross-check -- corr_method defaults to xcorr, so a bad tap
+# reading never reaches the training table.
+TAP_GAP_MIN_S = 0.15
 TAP_GAP_MAX_S = 1.6
 
 # xcorr vs taps agreement gate (spec sec 4c) -- ~2.4 camera frames at 16fps.
@@ -160,6 +202,8 @@ class XcorrResult:
     offset_first_half_s: float | None
     offset_second_half_s: float | None
     drift_s: float | None
+    range_ms: int = XCORR_RANGE_MS
+    at_sweep_edge: bool = False  # best offset sits on the edge -> range too narrow
 
 
 @dataclass
@@ -486,9 +530,15 @@ def compute_xcorr(markers: MarkerTrace, force: ForceTrace) -> XcorrResult:
         off_second = second[0] if second else None
     drift_s = (off_second - off_first) if (off_first is not None and off_second is not None) else None
 
+    # A best offset that lands on the first or last grid point is not a
+    # measurement -- the true peak is outside the window and the search was
+    # truncated. Report it, so a too-narrow range can never pass silently again.
+    at_edge = abs(abs(offset_s) - XCORR_RANGE_MS / 1000.0) < 1e-9
+
     return XcorrResult(
         offset_s=offset_s, r_at_best=r_at_best, r_at_zero=r_at_zero,
         offset_first_half_s=off_first, offset_second_half_s=off_second, drift_s=drift_s,
+        range_ms=XCORR_RANGE_MS, at_sweep_edge=at_edge,
     )
 
 
@@ -844,6 +894,11 @@ def print_result(result: SessionSyncResult) -> None:
     print(f"  coverage       : {result.coverage * 100:.1f}%  ({result.n_camera_frames} camera frames)")
     x = result.xcorr
     print(f"  offset xcorr   : {x.offset_s:+.3f}s  (r={x.r_at_best:.3f}, r@0={x.r_at_zero:.3f})")
+    if x.at_sweep_edge:
+        print(
+            f"  WARNING range  : offset sits on the +-{x.range_ms / 1000:.1f}s sweep edge. "
+            f"The true offset is outside the window. Re-run with a larger --xcorr-range-ms."
+        )
     if x.drift_s is not None:
         print(
             f"                   drift check: first-half {x.offset_first_half_s:+.3f}s, "
@@ -877,7 +932,26 @@ def main(argv: list[str]) -> int:
         "--corr-method", choices=["xcorr", "taps"], default="xcorr",
         help="which offset estimate feeds the *_corr columns (default: xcorr)",
     )
+    parser.add_argument(
+        "--xcorr-range-ms", type=int, default=XCORR_RANGE_MS,
+        help=(
+            f"half-width of the cross-correlation offset sweep, in ms "
+            f"(default: {XCORR_RANGE_MS}). Raise it if a session reports "
+            f"WARNING range."
+        ),
+    )
     args = parser.parse_args(argv[1:])
+
+    if args.xcorr_range_ms < XCORR_STEP_MS:
+        print(f"--xcorr-range-ms must be at least {XCORR_STEP_MS}")
+        return 2
+    if args.xcorr_range_ms > TZ_GATE_AFTER_MS:
+        print(f"--xcorr-range-ms must not exceed the timezone gate ({TZ_GATE_AFTER_MS} ms)")
+        return 2
+    # The sweep width is read from the module global by _xcorr_search and by
+    # compute_xcorr's edge test, so set it once here rather than threading it
+    # through five call sites.
+    globals()["XCORR_RANGE_MS"] = args.xcorr_range_ms
 
     if not args.path.exists():
         print(f"path does not exist: {args.path}")
