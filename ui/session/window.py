@@ -268,12 +268,16 @@ class SessionWindow(
         self._f_kicker = theme.make_font(self, "semibold", 11)
         self._f_progress_value = theme.make_font(self, "heading", 16)
         self._f_rec = theme.make_font(self, "heading", 12)
-        self._f_target_num = theme.make_font(self, "heading", 64)
-        self._f_target_unit = theme.make_font(self, "heading", 24)
+        # Both the operator and the participant read this block mid-trial,
+        # often from across the room -- sized up from 64/24/20 on 2026-08-18.
+        self._f_target_num = theme.make_font(self, "heading", 80)
+        self._f_target_unit = theme.make_font(self, "heading", 30)
         self._f_small = theme.make_font(self, "body", 12)
-        # The operator reads the accept range across the room, mid-trial. At
-        # 12px body it was unreadable at that distance (reported 2026-08-14).
-        self._f_band = theme.make_font(self, "semibold", 20)
+        # Own role rather than reusing _f_small -- that font is shared with
+        # the camera-unavailable placeholder and the restart/bookend modal
+        # body text, none of which need to scale with the target sub-label.
+        self._f_target_sub = theme.make_font(self, "body", 20)
+        self._f_band = theme.make_font(self, "semibold", 25)
         self._f_button = theme.make_font(self, "heading", 14)
         self._f_toast = theme.make_font(self, "body", 11)
 
@@ -549,7 +553,7 @@ class SessionWindow(
         self._target_unit_label.pack(side="left", anchor="s", pady=(0, 10))
         self._target_sub_label = tk.Label(
             target, text=self._target_sub_text(), bg=theme.BG, fg=self._target_color(),
-            font=self._f_small,
+            font=self._f_target_sub,
         )
         self._target_sub_label.pack(pady=(4, 0))
         # Advisory accept range (F1) -- display only, never gates or scores.
