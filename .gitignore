@@ -20,6 +20,9 @@ docs/
 *.jpg
 *.png
 
+# Track the ROI/mask config -- painted once per camera mount, not regenerable
+!calibration/roi/roi.json
+
 # IDE / OS
 .vscode/
 .idea/
