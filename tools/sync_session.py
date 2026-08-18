@@ -12,7 +12,7 @@ event happened" and "a timestamp got written". This module measures that
 residual offset two independent ways and writes one wide training table with
 a force label on every camera frame.
 
-Method background: docs/design/methods/biopac-camera-time-sync.md
+Method background: docs/design/sync/biopac-camera-time-sync.md
 Implementation spec: docs/logs/20260806_133000_session_sync_plan.md
 
 Sign convention (spec sec 4, pinned empirically against participant001
@@ -71,6 +71,7 @@ import csv
 import json
 import math
 import sys
+import warnings
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -192,6 +193,19 @@ class MarkerTrace:
     autofilled: np.ndarray  # (n_frames, N_MARKERS) bool
     n_autofilled: np.ndarray
     grip_proxy: np.ndarray  # max(magnitude) over non-autofilled markers
+    # max_reref (docs/logs/20260818_174754_sync_proxy_sweep_plan.md sec 10):
+    # as grip_proxy, but each marker's magnitude is first referenced to that
+    # marker's own resting median before the per-frame max. Sharper xcorr
+    # peak on all 69 sessions (median halfwidth 125ms vs 130ms for plain
+    # max) and removes the effect of a drifting baseline (participant003
+    # sessions 6/7/10). Set by sync_session() after rest frames are known --
+    # None until then (e.g. still None inside read_markers(), and stays
+    # None for a session with no target_pct==0 rest trial). compute_xcorr()
+    # uses this field when set, falling back to grip_proxy otherwise.
+    # compute_taps() always uses grip_proxy -- never this field -- because
+    # TAP_GAP_MIN_S was tuned against plain-max peaks on 2026-08-14 and the
+    # sweep never measured the tap detector against this signal.
+    grip_proxy_reref: np.ndarray | None = None
 
 
 @dataclass
@@ -248,6 +262,10 @@ class SessionSyncResult:
     agreement_ok: bool | None = None
     corr_method: str = "xcorr"
     offset_used_s: float | None = None
+    # True only when grip_proxy_reref could not be computed (no target_pct
+    # == 0 rest trial in trials.csv) and compute_xcorr() fell back to the
+    # plain max grip_proxy for this session.
+    grip_proxy_reref_fallback: bool = False
     mvc_kg: float | None = None
     rest_force_kg: dict | None = None
     rest_offsets: RestOffsets | None = None
@@ -508,7 +526,12 @@ def _best_offset(offsets_ms: np.ndarray, r_values: np.ndarray) -> tuple[float, f
 
 
 def compute_xcorr(markers: MarkerTrace, force: ForceTrace) -> XcorrResult:
-    offsets_ms, r_values = _xcorr_search(markers.timestamp_ms, markers.grip_proxy, force)
+    # max_reref feeds this search when sync_session() has set it (plan
+    # docs/logs/20260818_174754_sync_proxy_sweep_plan.md sec 10); a session
+    # with no rest trial leaves grip_proxy_reref None and this falls back to
+    # the plain max grip_proxy, same as before this change.
+    proxy = markers.grip_proxy_reref if markers.grip_proxy_reref is not None else markers.grip_proxy
+    offsets_ms, r_values = _xcorr_search(markers.timestamp_ms, proxy, force)
     best = _best_offset(offsets_ms, r_values)
     if best is None:
         raise SyncError(
@@ -524,8 +547,8 @@ def compute_xcorr(markers: MarkerTrace, force: ForceTrace) -> XcorrResult:
     half = markers.timestamp_ms.size // 2
     off_first = off_second = None
     if half >= XCORR_MIN_OVERLAP_FRAMES:
-        first = _best_offset(*_xcorr_search(markers.timestamp_ms[:half], markers.grip_proxy[:half], force))
-        second = _best_offset(*_xcorr_search(markers.timestamp_ms[half:], markers.grip_proxy[half:], force))
+        first = _best_offset(*_xcorr_search(markers.timestamp_ms[:half], proxy[:half], force))
+        second = _best_offset(*_xcorr_search(markers.timestamp_ms[half:], proxy[half:], force))
         off_first = first[0] if first else None
         off_second = second[0] if second else None
     drift_s = (off_second - off_first) if (off_first is not None and off_second is not None) else None
@@ -673,6 +696,59 @@ def _pct_mvc(force_kg: np.ndarray, mvc_kg: float) -> np.ndarray:
         return np.where(np.isnan(pct), np.nan, np.maximum(0.0, pct))
 
 
+def compute_marker_rest_median(
+    magnitude: np.ndarray, autofilled: np.ndarray, rest_mask: np.ndarray,
+) -> tuple[np.ndarray, int] | None:
+    """Per-marker median magnitude over the session's 0%-MVC rest frames.
+
+    Camera-only by construction: `rest_mask` must come from trial_id joined
+    to trials.csv's *scheduled* target_pct (this module's own sync_session(),
+    at the `target_pct_by_trial.get(int(tid)) == 0` line), never from the
+    force trace or from any xcorr/tap offset -- otherwise grip_proxy_reref
+    would depend on the very offset it is meant to help find.
+
+    Returns None if there are no rest frames at all (no target_pct==0 trial
+    in trials.csv). A marker that is autofilled on every rest frame has no
+    real rest magnitude to reference against; its median is left at 0.0, so
+    grip_proxy_reref falls back to that marker's raw (unreferenced)
+    magnitude rather than inventing a value -- the second element of the
+    return is how many markers hit this case, for reporting.
+
+    Ported verbatim from tools/sync_proxy_sweep.py's validated
+    max_reref sweep (docs/logs/20260818_174754_sync_proxy_sweep_plan.md sec
+    10); tools/sync_proxy_sweep.py now imports this rather than keeping its
+    own copy, so the two cannot drift apart.
+    """
+    if rest_mask.sum() == 0:
+        return None
+    rest_mag = magnitude[rest_mask]
+    rest_af = autofilled[rest_mask]
+    masked_rest = np.where(rest_af, np.nan, rest_mag)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        marker_median = np.nanmedian(masked_rest, axis=0)
+    always_autofilled_at_rest = np.isnan(marker_median)
+    marker_median = np.where(always_autofilled_at_rest, 0.0, marker_median)
+    return marker_median, int(always_autofilled_at_rest.sum())
+
+
+def compute_grip_proxy_reref(
+    magnitude: np.ndarray, autofilled: np.ndarray, marker_rest_median: np.ndarray,
+) -> np.ndarray:
+    """max magnitude over non-autofilled markers, after each marker's
+    magnitude is first referenced to its own resting median (the
+    `max_reref` candidate of docs/logs/20260818_174754_sync_proxy_sweep_plan.md
+    sec 2, ported verbatim from tools/sync_proxy_sweep.py's `_proxy_max_reref`,
+    the validated implementation that won the pre-registered sweep)."""
+    reref = magnitude - marker_rest_median[np.newaxis, :]
+    masked = np.where(autofilled, -np.inf, reref)
+    proxy = masked.max(axis=1)
+    all_autofilled = autofilled.all(axis=1)
+    if np.any(all_autofilled):
+        proxy = np.where(all_autofilled, reref.max(axis=1), proxy)
+    return proxy
+
+
 def compute_rest_offsets(markers: MarkerTrace, rest_mask: np.ndarray) -> RestOffsets:
     n = int(rest_mask.sum())
     if n == 0:
@@ -777,6 +853,33 @@ def sync_session(session_dir: Path, corr_method: str = "xcorr") -> SessionSyncRe
         )
 
     coverage = compute_coverage(markers, force)
+
+    # grip_proxy_reref (docs/logs/20260818_174754_sync_proxy_sweep_plan.md sec
+    # 10): each marker's magnitude re-referenced to its own resting median
+    # before the per-frame max, feeding compute_xcorr only -- compute_taps
+    # keeps the plain grip_proxy (see MarkerTrace.grip_proxy_reref). The rest
+    # mask is read from trials.csv here, once, and reused below for the
+    # training-table target_pct column and for compute_rest_offsets, so it is
+    # never re-derived from the force trace or from either offset estimate.
+    target_pct_by_trial = read_trials(trials_path)
+    rest_mask = np.asarray(
+        [target_pct_by_trial.get(int(tid)) == 0 for tid in markers.trial_id]
+    )
+    rest_median_result = compute_marker_rest_median(markers.magnitude, markers.autofilled, rest_mask)
+    grip_proxy_reref_fallback = rest_median_result is None
+    if rest_median_result is None:
+        print(
+            f"WARNING: {session_dir.name}: no target_pct == 0 rest trial found in "
+            "trials.csv -- grip_proxy_reref unavailable, xcorr falls back to the "
+            "plain max grip_proxy for this session.",
+            file=sys.stderr,
+        )
+    else:
+        marker_rest_median, _n_always_af_at_rest = rest_median_result
+        markers.grip_proxy_reref = compute_grip_proxy_reref(
+            markers.magnitude, markers.autofilled, marker_rest_median
+        )
+
     xcorr = compute_xcorr(markers, force)
     taps = compute_taps(markers, force)
 
@@ -807,7 +910,6 @@ def sync_session(session_dir: Path, corr_method: str = "xcorr") -> SessionSyncRe
         offset_used = xcorr.offset_s
 
     mvc_kg = read_mvc_kg(session_dir)
-    target_pct_by_trial = read_trials(trials_path)
     target_pct_col = [target_pct_by_trial.get(int(tid)) for tid in markers.trial_id]
 
     force_kg_anchor = np.interp(
@@ -820,7 +922,6 @@ def sync_session(session_dir: Path, corr_method: str = "xcorr") -> SessionSyncRe
     pct_mvc_anchor = _pct_mvc(force_kg_anchor, mvc_kg)
     pct_mvc_corr = _pct_mvc(force_kg_corr, mvc_kg)
 
-    rest_mask = np.asarray([target_pct_by_trial.get(int(tid)) == 0 for tid in markers.trial_id])
     rest_offsets = compute_rest_offsets(markers, rest_mask)
 
     rest_force_kg = None
@@ -847,6 +948,7 @@ def sync_session(session_dir: Path, corr_method: str = "xcorr") -> SessionSyncRe
         coverage=coverage,
         xcorr=xcorr, taps=taps, agreement_ok=agreement_ok,
         corr_method=corr_method, offset_used_s=offset_used,
+        grip_proxy_reref_fallback=grip_proxy_reref_fallback,
         mvc_kg=mvc_kg, rest_force_kg=rest_force_kg, rest_offsets=rest_offsets,
         training_table_path=training_table_path, training_rows=training_rows,
     )
@@ -912,6 +1014,8 @@ def print_result(result: SessionSyncResult) -> None:
         print(f"  offset taps    : not found -- {t.note}")
     if result.agreement_ok is False:
         print(f"  WARNING agreement: xcorr/taps offsets disagree by more than {AGREEMENT_TOLERANCE_S}s")
+    if result.grip_proxy_reref_fallback:
+        print("  WARNING reref     : no 0%-MVC rest trial -- xcorr used plain max grip_proxy")
     print(f"  corr_method    : {result.corr_method}  (offset_used={result.offset_used_s:+.3f}s)")
     ro = result.rest_offsets
     print(
@@ -976,9 +1080,14 @@ def main(argv: list[str]) -> int:
         print_result(result)
 
     failed = [r for r in results if not r.ok]
+    reref_fallback = [r for r in results if r.ok and r.grip_proxy_reref_fallback]
     print(f"\n{'=' * 60}")
     if len(results) > 1:
         print(f"{len(results) - len(failed)}/{len(results)} synced")
+    if reref_fallback:
+        print(f"{len(reref_fallback)} session(s) had no 0%-MVC rest trial -- xcorr used plain max grip_proxy:")
+        for r in reref_fallback:
+            print(f"  {r.session_dir}")
     if failed:
         print("FAILED:")
         for r in failed:

@@ -10,6 +10,11 @@ output/sessions/
 recordings/
 calibration/intrinsics/results/
 
+# Pre-resync snapshot for the 2026-08-18 grip_proxy_reref sync_session.py
+# re-run (docs/logs/20260818_174754_sync_proxy_sweep_plan.md sec 5) --
+# regenerable from recordings/ by .sync_snapshot_20260818/build_snapshot.py
+.sync_snapshot_20260818/
+
 
 # specific folders and files
 docs/
