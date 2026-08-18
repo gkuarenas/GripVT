@@ -23,8 +23,10 @@ from PIL import Image, ImageTk
 from core.calibration import CameraCalibration
 from core.detector import denoise, detect, load_params, preprocess
 from core.detector_search import (
+    MIN_AREA_RANGE,
     POSE_KEYS,
     TARGET_MARKERS,
+    THRESH_RANGE,
     AnchorError,
     SearchResult,
     clamp_manual_params,
@@ -38,7 +40,12 @@ from output.participants import ParticipantRecord
 from ui import theme
 
 WINDOW_W = 880
-WINDOW_H = 740
+# 740 was the pre-Phase-4 height. 800 covered the collapsed override toggle
+# but not the panel itself open and diverged from auto (measured in-rig
+# 2026-08-19: _actions' natural bottom sits ~27px past 800, clipping
+# "Continue anyway"). 850 covers that with real margin -- screen is 1920x1080
+# here, so 850 still leaves ~230px of headroom below the window.
+WINDOW_H = 850
 FEED_W = 450
 FEED_H = 600
 
@@ -54,6 +61,12 @@ DETECT_EVERY = 3
 _TOAST_TIMEOUT_MS = 5000
 _FADE_STEPS = 8
 _FADE_INTERVAL_MS = 50
+
+# Manual-override stepper bounds (Phase 4, D15) -- derived from the sweep's
+# own range so the widget can never drift from clamp_manual_params.
+THRESH_LO, THRESH_HI, _ = THRESH_RANGE
+AREA_LO, AREA_HI, _ = MIN_AREA_RANGE
+_RESCORE_DEBOUNCE_MS = 250
 
 _LETTERBOX_BG = tuple(int(theme.SURFACE.lstrip("#")[i : i + 2], 16) for i in (0, 2, 4))
 _RING_BGR = tuple(int(theme.ACCENT.lstrip("#")[i : i + 2], 16) for i in (4, 2, 0))
@@ -103,9 +116,21 @@ class CalibrationWindow(tk.Toplevel):
 
         self._status = "idle"
         self._result: SearchResult | None = None
+        self._error_message: str | None = None
         self._overridden = False
         self._manual_override = False
         self._auto_params: dict | None = None
+        self._auto_worst_count: int | None = None
+
+        # Manual-override panel (Phase 4 UI). _manual_thresh/_manual_min_area
+        # hold the stepper's live values while the panel is open; they start
+        # at auto_params on open, so the panel shows no divergence until the
+        # operator actually adjusts something.
+        self._override_open = False
+        self._manual_thresh = 0
+        self._manual_min_area = 0.0
+        self._manual_scoring = False
+        self._rescore_after: str | None = None
 
         self._burst: list[np.ndarray] = []
         self._capturing: str | None = None
@@ -159,6 +184,14 @@ class CalibrationWindow(tk.Toplevel):
         self._f_fail = theme.make_font(self, "semibold", 12)
         self._f_button = theme.make_font(self, "heading", 14)
         self._f_toast = theme.make_font(self, "body", 11)
+        self._f_big_override = theme.make_font(self, "heading", 34)
+        self._f_override_toggle = theme.make_font(self, "heading", 11)
+        self._f_override_badge = theme.make_font(self, "heading", 10)
+        self._f_micro = theme.make_font(self, "body", 10)
+        self._f_micro_bold = theme.make_font(self, "heading", 10)
+        self._f_stepper_value = theme.make_font(self, "heading", 14)
+        self._f_stepper_btn = theme.make_font(self, "heading", 15)
+        self._f_score = theme.make_font(self, "heading", 13)
 
     # ── body ────────────────────────────────────────────────────────────────
     def _build_body(self) -> None:
@@ -289,6 +322,9 @@ class CalibrationWindow(tk.Toplevel):
         self._result_box = tk.Frame(panel, bg=theme.BG)
         self._result_box.pack(fill="both", expand=True, pady=12)
 
+        self._override_box = tk.Frame(panel, bg=theme.BG)
+        self._override_box.pack(fill="x")
+
         tk.Frame(panel, bg=theme.DIVIDER, height=2).pack(fill="x", pady=(0, 14))
 
         self._actions = tk.Frame(panel, bg=theme.BG)
@@ -296,6 +332,7 @@ class CalibrationWindow(tk.Toplevel):
 
         self._render_poses()
         self._render_result()
+        self._render_override()
         self._render_actions()
 
     def _build_toast(self, parent: tk.Frame) -> None:
@@ -379,7 +416,24 @@ class CalibrationWindow(tk.Toplevel):
             child.destroy()
 
         wrap = tk.Frame(self._result_box, bg=theme.BG)
-        wrap.place(relx=0.5, rely=0.5, anchor="center")
+        # pack (not place) so wrap's real size counts toward _result_box's
+        # requested size -- a place()-centered child can silently overflow
+        # into the override toggle packed below it if _result_box shrinks
+        # to make room for that toggle (found in-rig 2026-08-18: the fail
+        # message was getting drawn under the toggle row, not "cut off").
+        wrap.pack(expand=True)
+
+        if self._result is not None and self._result.manual_override:
+            badge = tk.Frame(wrap, bg=theme.INK)
+            badge.pack(pady=(0, 10))
+            badge_inner = tk.Frame(badge, bg=theme.INK)
+            badge_inner.pack(padx=10, pady=5)
+            tk.Frame(badge_inner, bg=theme.BG, width=6, height=6).pack(side="left")
+            tk.Label(
+                badge_inner, text="MANUAL OVERRIDE ACTIVE", bg=theme.INK, fg=theme.BG,
+                font=self._f_override_badge,
+            ).pack(side="left", padx=(7, 0))
+
         tk.Label(
             wrap, text="WORST-POSE MARKERS", bg=theme.BG, fg=theme.INK_60, font=self._f_kicker
         ).pack(pady=(0, 10))
@@ -396,6 +450,15 @@ class CalibrationWindow(tk.Toplevel):
 
         result = self._result
         if result is None:
+            if self._status == "error" and self._error_message:
+                tk.Label(
+                    wrap, text="—", bg=theme.BG, fg=theme.ACCENT_700, font=self._f_big_idle
+                ).pack()
+                tk.Label(
+                    wrap, text=self._error_message, bg=theme.BG, fg=theme.ACCENT_700,
+                    font=self._f_fail, wraplength=320, justify="center",
+                ).pack(pady=(8, 0))
+                return
             tk.Label(
                 wrap, text="—", bg=theme.BG, fg=theme.INK_35, font=self._f_big_idle
             ).pack()
@@ -407,19 +470,24 @@ class CalibrationWindow(tk.Toplevel):
 
         worst_n = result.poses[result.worst_pose].n_detected
         colour = theme.INK if result.passed else theme.ACCENT_700
+        # The override panel shares this fixed-height column, so the number
+        # shrinks while it is open to leave the steppers room without
+        # overflowing the window (D18 wiring).
+        big_font = self._f_big_override if self._override_open else self._f_big
         row = tk.Frame(wrap, bg=theme.BG)
         row.pack()
         tk.Label(
-            row, text=str(worst_n), bg=theme.BG, fg=colour, font=self._f_big
+            row, text=str(worst_n), bg=theme.BG, fg=colour, font=big_font
         ).pack(side="left")
         tk.Label(
             row, text=f"/ {TARGET_MARKERS}", bg=theme.BG, fg=colour, font=self._f_unit
         ).pack(side="left", anchor="s", pady=(0, 10))
-        tk.Label(
-            wrap, text=self._subline(result), bg=theme.BG, fg=theme.INK_55,
-            font=self._f_small, wraplength=320,
-        ).pack(pady=(8, 0))
-        if not result.passed:
+        if not self._override_open:
+            tk.Label(
+                wrap, text=self._subline(result), bg=theme.BG, fg=theme.INK_55,
+                font=self._f_small, wraplength=320,
+            ).pack(pady=(8, 0))
+        if not result.passed and not self._override_open:
             if worst_n > TARGET_MARKERS:
                 fail_text = (
                     f"{POSE_NAMES[result.worst_pose]} detected extra blobs "
@@ -450,6 +518,247 @@ class CalibrationWindow(tk.Toplevel):
             extras.append(f"oversized {worst.oversized}")
         return counts + ("  |  " + " · ".join(extras) if extras else "")
 
+    # ── manual override panel (Phase 4 UI) ──────────────────────────────────
+    def _render_override(self) -> None:
+        for child in self._override_box.winfo_children():
+            child.destroy()
+        if self._status != "fail":
+            # D12: never surface the override outside a failed calibration.
+            return
+
+        # No divider of its own -- the existing divider between _override_box
+        # and _actions already separates this from the buttons below, and a
+        # second one here only ate space the result box needed (in-rig
+        # 2026-08-18: caused the fail message to be drawn under this row).
+        toggle = tk.Frame(self._override_box, bg=theme.BG, cursor="hand2")
+        toggle.pack(anchor="w", pady=(6, 0))
+        caret = tk.Canvas(toggle, width=12, height=12, bg=theme.BG, highlightthickness=0)
+        self._draw_caret(caret, self._override_open)
+        caret.pack(side="left", padx=(0, 7))
+        label = tk.Label(
+            toggle, text="MANUAL OVERRIDE", bg=theme.BG, fg=theme.INK,
+            font=self._f_override_toggle,
+        )
+        label.pack(side="left")
+        for w in (toggle, caret, label):
+            w.bind("<Button-1>", lambda _e: self._toggle_override())
+            w.bind("<Enter>", lambda _e: label.configure(fg=theme.ACCENT_700))
+            w.bind("<Leave>", lambda _e: label.configure(fg=theme.INK))
+
+        if not self._override_open:
+            return
+
+        diverged = self._manual_diverged()
+        border, width = (theme.INK, 2) if diverged else (theme.NEUTRAL_200, 1)
+        box = tk.Frame(
+            self._override_box, bg=theme.BG, highlightthickness=width,
+            highlightbackground=border, highlightcolor=border,
+        )
+        box.pack(fill="x", pady=(8, 0))
+        inner = tk.Frame(box, bg=theme.BG)
+        inner.pack(fill="x", padx=11, pady=9)
+        self._render_override_panel(inner)
+
+    def _render_override_panel(self, inner: tk.Frame) -> None:
+        steppers = tk.Frame(inner, bg=theme.BG)
+        steppers.pack(fill="x", pady=(0, 9))
+        steppers.columnconfigure(0, weight=1, uniform="s")
+        steppers.columnconfigure(1, weight=1, uniform="s")
+
+        thresh_col = self._build_stepper(
+            steppers, "THRESHOLD", f"{THRESH_LO}–{THRESH_HI}", str(self._manual_thresh),
+            lambda: self._step_manual("thresh", -1), lambda: self._step_manual("thresh", 1),
+            self._manual_thresh > THRESH_LO, self._manual_thresh < THRESH_HI,
+        )
+        thresh_col.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+
+        area_col = self._build_stepper(
+            steppers, "MIN AREA", f"{AREA_LO}–{AREA_HI}", str(int(self._manual_min_area)),
+            lambda: self._step_manual("min_area", -1), lambda: self._step_manual("min_area", 1),
+            self._manual_min_area > AREA_LO, self._manual_min_area < AREA_HI,
+        )
+        area_col.grid(row=0, column=1, sticky="ew")
+
+        auto = self._auto_params
+        auto_score_text = (
+            f"{self._auto_worst_count} / {TARGET_MARKERS}"
+            if self._auto_worst_count is not None else "—"
+        )
+        auto_params_text = (
+            f"thresh {int(auto['thresh'])} · min area {int(auto['min_area'])}"
+            if auto is not None else "—"
+        )
+        self._build_score_row(
+            inner, "AUTO", auto_params_text, auto_score_text, theme.INK_55,
+        ).pack(fill="x")
+
+        manual_params_text = (
+            f"thresh {self._manual_thresh} · min area {int(self._manual_min_area)}"
+        )
+        if self._manual_scoring:
+            manual_score_text, manual_colour = "scoring…", theme.INK_45
+        elif self._result is not None and self._result.manual_override:
+            n = self._result.poses[self._result.worst_pose].n_detected
+            manual_score_text = f"{n} / {TARGET_MARKERS}"
+            manual_colour = theme.INK if self._result.passed else theme.ACCENT_700
+        else:
+            manual_score_text, manual_colour = auto_score_text, theme.INK_55
+        self._build_score_row(
+            inner, "MANUAL", manual_params_text, manual_score_text, manual_colour,
+        ).pack(fill="x")
+
+    def _build_stepper(
+        self, parent: tk.Frame, label: str, bounds_text: str, value_text: str,
+        on_dec: Callable[[], None], on_inc: Callable[[], None],
+        dec_enabled: bool, inc_enabled: bool,
+    ) -> tk.Frame:
+        col = tk.Frame(parent, bg=theme.BG)
+        head = tk.Frame(col, bg=theme.BG)
+        head.pack(fill="x", pady=(0, 5))
+        tk.Label(
+            head, text=label, bg=theme.BG, fg=theme.INK_60, font=self._f_micro_bold
+        ).pack(side="left")
+        tk.Label(
+            head, text=bounds_text, bg=theme.BG, fg=theme.INK_35, font=self._f_micro
+        ).pack(side="right")
+
+        box = tk.Frame(
+            col, bg=theme.BG, highlightthickness=1,
+            highlightbackground=theme.INK, highlightcolor=theme.INK,
+        )
+        box.pack(fill="x")
+
+        dec = self._build_step_button(box, "−", on_dec, dec_enabled)
+        dec.pack(side="left", ipady=5)
+        tk.Frame(box, bg=theme.INK, width=1).pack(side="left", fill="y")
+        tk.Label(
+            box, text=value_text, bg=theme.BG, fg=theme.INK, font=self._f_stepper_value,
+        ).pack(side="left", expand=True, fill="both", ipady=5)
+        tk.Frame(box, bg=theme.INK, width=1).pack(side="left", fill="y")
+        inc = self._build_step_button(box, "+", on_inc, inc_enabled)
+        inc.pack(side="right", ipady=5)
+        return col
+
+    def _build_step_button(
+        self, parent: tk.Misc, symbol: str, command: Callable[[], None], enabled: bool,
+    ) -> tk.Label:
+        """One press == one step, full stop -- no hold-to-repeat (Guillaume,
+        in-rig 2026-08-18: wants full manual control over each step). Also
+        sidesteps a real bug a repeat timer had: _step_manual rebuilds this
+        very widget on every call, which would destroy the pressed widget
+        mid-hold and drop the ButtonRelease that was supposed to cancel it,
+        so the repeat never stopped."""
+        fg = theme.INK if enabled else theme.INK_35
+        btn = tk.Label(
+            parent, text=symbol, bg=theme.BG, fg=fg, font=self._f_stepper_btn,
+            width=3, cursor="hand2" if enabled else "arrow",
+        )
+        if enabled:
+            def on_release(_e: object) -> None:
+                x, y = btn.winfo_pointerxy()
+                hovered = btn.winfo_containing(x, y)
+                if hovered is btn:
+                    command()
+
+            btn.bind("<Enter>", lambda _e: btn.configure(bg=theme.ACCENT_10))
+            btn.bind("<Leave>", lambda _e: btn.configure(bg=theme.BG))
+            btn.bind("<ButtonPress-1>", lambda _e: btn.configure(bg=theme.ACCENT_18))
+            btn.bind("<ButtonRelease-1>", on_release)
+        return btn
+
+    def _build_score_row(
+        self, parent: tk.Frame, label: str, params_text: str, score_text: str, colour: str,
+    ) -> tk.Frame:
+        row = tk.Frame(parent, bg=theme.BG)
+        tk.Frame(row, bg=theme.NEUTRAL_200, height=1).pack(fill="x")
+        inner = tk.Frame(row, bg=theme.BG)
+        inner.pack(fill="x", pady=4)
+        tk.Label(
+            inner, text=label, bg=theme.BG, fg=theme.INK_55, font=self._f_micro_bold,
+            width=7, anchor="w",
+        ).pack(side="left")
+        tk.Label(
+            inner, text=score_text, bg=theme.BG, fg=colour, font=self._f_score,
+        ).pack(side="right")
+        tk.Label(
+            inner, text=params_text, bg=theme.BG, fg=theme.INK_55, font=self._f_micro,
+            anchor="w",
+        ).pack(side="left", fill="x", expand=True)
+        return row
+
+    def _draw_caret(self, canvas: tk.Canvas, open_: bool) -> None:
+        if open_:
+            canvas.create_line(2, 4, 6, 9, 10, 4, fill=theme.INK, width=2,
+                                capstyle="round", joinstyle="round")
+        else:
+            canvas.create_line(4, 2, 9, 6, 4, 10, fill=theme.INK, width=2,
+                                capstyle="round", joinstyle="round")
+
+    def _manual_diverged(self) -> bool:
+        if self._auto_params is None:
+            return False
+        return (
+            self._manual_thresh != int(self._auto_params["thresh"])
+            or self._manual_min_area != float(self._auto_params["min_area"])
+        )
+
+    def _toggle_override(self) -> None:
+        if self._override_open:
+            self._close_override()
+        else:
+            self._open_override()
+        self._refresh()
+
+    def _open_override(self) -> None:
+        if self._auto_params is not None:
+            # The winning auto params are not guaranteed to sit inside the
+            # sweep's own range (_candidates() always keeps the seed even
+            # when it falls outside THRESH_RANGE/MIN_AREA_RANGE), so clamp
+            # to whatever the stepper can actually represent (D15).
+            self._manual_thresh, self._manual_min_area = clamp_manual_params(
+                self._auto_params["thresh"], self._auto_params["min_area"]
+            )
+        self._manual_scoring = False
+        self._override_open = True
+
+    def _close_override(self) -> None:
+        self._reset_override_state()
+
+    def _reset_override_state(self) -> None:
+        if self._rescore_after is not None:
+            self.after_cancel(self._rescore_after)
+            self._rescore_after = None
+        self._override_open = False
+        self._manual_scoring = False
+        self._manual_thresh = 0
+        self._manual_min_area = 0.0
+
+    def _step_manual(self, key: str, delta: int) -> None:
+        if key == "thresh":
+            new_thresh, _ = clamp_manual_params(self._manual_thresh + delta, self._manual_min_area)
+            if new_thresh == self._manual_thresh:
+                return
+            self._manual_thresh = new_thresh
+        else:
+            _, new_area = clamp_manual_params(self._manual_thresh, self._manual_min_area + delta)
+            if new_area == self._manual_min_area:
+                return
+            self._manual_min_area = new_area
+        self._render_result()
+        self._render_override()
+        self._schedule_rescore()
+
+    def _schedule_rescore(self) -> None:
+        if self._rescore_after is not None:
+            self.after_cancel(self._rescore_after)
+        self._manual_scoring = True
+        self._render_override()
+        self._rescore_after = self.after(_RESCORE_DEBOUNCE_MS, self._trigger_rescore)
+
+    def _trigger_rescore(self) -> None:
+        self._rescore_after = None
+        self._manual_rescore(self._manual_thresh, self._manual_min_area)
+
     def _render_actions(self) -> None:
         for child in self._actions.winfo_children():
             child.destroy()
@@ -475,6 +784,14 @@ class CalibrationWindow(tk.Toplevel):
         elif self._status == "pass":
             self._build_button(
                 self._actions, "Recalibrate", "ghost", None, self._recapture
+            ).pack(fill="x", pady=(0, 10))
+        elif self._status == "error":
+            # No SearchResult exists to retry against -- search() is a pure
+            # function of these exact frames, so "Run Calibration" again
+            # would just reproduce the same error. Recapture is the only
+            # way forward.
+            self._build_button(
+                self._actions, "Recapture", "primary", None, self._recapture
             ).pack(fill="x", pady=(0, 10))
         elif all_captured:
             self._build_button(
@@ -505,6 +822,7 @@ class CalibrationWindow(tk.Toplevel):
     def _refresh(self) -> None:
         self._render_poses()
         self._render_result()
+        self._render_override()
         self._render_actions()
         self._update_instruction()
         self._update_burst()
@@ -584,8 +902,10 @@ class CalibrationWindow(tk.Toplevel):
             return
         if any(self._pose_state[k] != "captured" for k in POSE_KEYS):
             return
+        self._reset_override_state()
         self._status = "running"
         self._result = None
+        self._error_message = None
         self._review = None
         self._refresh()
 
@@ -611,7 +931,20 @@ class CalibrationWindow(tk.Toplevel):
         self._search_after = None
         error = holder.get("error")
         if error is not None:
-            self._status = "idle"
+            # AnchorError/ValueError means search() never produced a
+            # SearchResult at all (no grid geometry to score against) --
+            # distinct from a completed "fail" where every pose was scored
+            # but missed 99. Resetting to "idle" here used to leave all
+            # three poses stuck "captured" with only a "Run Calibration"
+            # action, which just reproduces the same error on the same
+            # frames forever with no way back to Recapture (found in-rig
+            # 2026-08-19).
+            self._status = "error"
+            self._error_message = error
+            self._result = None
+            self._auto_params = None
+            self._auto_worst_count = None
+            self._reset_override_state()
             participants.save_calibration_failure(
                 self._record, self._pose_frames, self._pose_dets, error
             )
@@ -623,6 +956,7 @@ class CalibrationWindow(tk.Toplevel):
         # Held so a later manual re-score can still report what the automatic
         # sweep found, even after self._result is replaced (D17's auto_params).
         self._auto_params = result.params
+        self._auto_worst_count = result.poses[result.worst_pose].n_detected
         self._status = "pass" if result.passed else "fail"
         self._params = result.params
         self._pose_dets = dict(result.detections)
@@ -678,9 +1012,11 @@ class CalibrationWindow(tk.Toplevel):
             )
             return
         self._search_after = None
+        self._manual_scoring = False
         error = holder.get("error")
         if error is not None:
             self._show_toast(error)
+            self._refresh()
             return
         result: SearchResult = replace(
             holder["result"], manual_override=True, auto_params=auto_params
@@ -695,6 +1031,10 @@ class CalibrationWindow(tk.Toplevel):
         if not result.passed:
             self._selected = result.worst_pose
             self._review = result.worst_pose
+        else:
+            # A passing manual override collapses the panel like any other
+            # pass (D12) -- the record itself still carries manual_override.
+            self._reset_override_state()
         self._refresh()
         self._paint_review()
 
@@ -717,8 +1057,12 @@ class CalibrationWindow(tk.Toplevel):
         self._review = None
         self._status = "idle"
         self._result = None
+        self._error_message = None
         self._overridden = False
         self._manual_override = False
+        self._auto_params = None
+        self._auto_worst_count = None
+        self._reset_override_state()
         self._burst = []
         self._capturing = None
         self._params = load_params()
