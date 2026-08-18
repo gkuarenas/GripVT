@@ -439,6 +439,8 @@ class RecordingMixin:
                     overridden=self._pending_calibration["overridden"],
                     roi=self._pending_calibration["roi"],
                     calibration_image_size=self._pending_calibration["calibration_image_size"],
+                    manual_override=self._pending_calibration["manual_override"],
+                    auto_params=self._pending_calibration["auto_params"],
                 )
             except Exception:
                 _log.exception("calibration write failed during _confirm_start")

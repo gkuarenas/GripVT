@@ -3,6 +3,7 @@ import time
 import numpy as np
 import pytest
 
+import core.detector_search as ds
 from core.detector import default_params
 from core.detector_search import (
     CORNER_LINES,
@@ -12,11 +13,13 @@ from core.detector_search import (
     TARGET_MARKERS,
     AnchorError,
     _group_by_lines,
+    clamp_manual_params,
     geometry_from,
     grid_lines,
     grid_positions,
     pose_cost,
     region_counts,
+    rescore,
     search,
 )
 
@@ -302,6 +305,49 @@ def test_seed_params_alone_would_have_dropped_that_marker():
     assert len(dets) == TARGET_MARKERS - 1
 
 
+# ── exactly-99 pass rule (Phase 3, D8/D9) ──────────────────────────────────
+def test_search_fails_when_one_pose_overcounts():
+    """The evidence for D8: the old `worst_count >= MIN_ACCEPTABLE` rule looks
+    at the MINIMUM count across poses, so an over-detecting max_grip (100)
+    alongside two clean poses (99) would still have worst_count == 99 and
+    pass. The new all()-equal-target rule must catch it instead."""
+    points = grid_points()
+    extra = (20.0, 20.0, 30.0)  # margin corner, far from every real marker
+    frames = {
+        "relaxed": render(points),
+        "full_open": render(points),
+        "max_grip": render(points + [extra]),
+    }
+    params = base_params()
+
+    result = search(frames, params)
+
+    assert result.passed is False
+    assert result.worst_count == TARGET_MARKERS
+    assert result.worst_pose == "max_grip"
+
+
+def test_search_passes_once_a_mask_hole_covers_the_extra_blob():
+    """Ties Phase 2 (mask_holes) and Phase 3 (the exactly-99 gate) together:
+    the same over-counting max_grip frame passes once the extra blob is
+    masked out before detection reaches it."""
+    points = grid_points()
+    extra = (20.0, 20.0, 30.0)
+    frames = {
+        "relaxed": render(points),
+        "full_open": render(points),
+        "max_grip": render(points + [extra]),
+    }
+    params = base_params()
+    mask = np.full((FRAME_H, FRAME_W), 255, dtype=np.uint8)
+    mask[0:40, 0:40] = 0  # covers the extra blob only, no real marker sits here
+
+    result = search(frames, params, mask)
+
+    assert result.passed is True
+    assert result.worst_count == TARGET_MARKERS
+
+
 def test_search_never_regresses_from_a_bad_seed():
     corner = bottom_right_index()
     frames, _points = build_pose_frames({corner})
@@ -337,6 +383,84 @@ def test_search_requires_all_three_poses():
     del frames["max_grip"]
     with pytest.raises(ValueError):
         search(frames, base_params())
+
+
+# ── Phase 4: manual thresh/min_area override backend ───────────────────────
+def test_clamp_manual_params_boundaries():
+    assert clamp_manual_params(10, 1.0) == (30, 4.0)      # both below range
+    assert clamp_manual_params(45, 20.0) == (45, 20.0)    # both inside range
+    assert clamp_manual_params(90, 100.0) == (60, 40.0)   # both above range
+    assert clamp_manual_params(45.6, 20.3) == (46, 20.3)  # float thresh becomes an int
+    assert isinstance(clamp_manual_params(45, 20)[0], int)
+    assert isinstance(clamp_manual_params(45, 20)[1], float)
+
+
+def _add_gaussian_blob(
+    frame: np.ndarray, x: float, y: float, amp: float, radius: float, background: int = 30,
+) -> np.ndarray:
+    yy, xx = np.mgrid[0 : frame.shape[0], 0 : frame.shape[1]]
+    bump = amp * np.exp(-(((xx - x) ** 2) / (2 * radius**2) + ((yy - y) ** 2) / (2 * radius**2)))
+    return np.clip(frame.astype(np.float64) + bump, 0, 255).astype(np.uint8)
+
+
+def test_rescore_recovers_from_an_overcount_the_automatic_sweep_cannot_reach(monkeypatch):
+    """D15's own justification, proven end to end rather than argued from
+    principle. Coarsen the sweep's own step so its candidates never include
+    thresh=59 (still inside the real [30, 60] bound `clamp_manual_params`
+    enforces, but only reachable at the manual step of 1), then show a
+    manual rescore at that exact thresh clears an over-count no automatic
+    candidate can reach."""
+    monkeypatch.setattr(ds, "THRESH_RANGE", (30, 60, 7))
+    monkeypatch.setattr(ds, "MIN_AREA_RANGE", (4, 40, 37))
+
+    points = grid_points()
+    relaxed = render(points)
+    full_open = render(points)
+    # amp=55 (peak 85 over background 30) at radius=2.5: empirically present
+    # at every candidate the coarsened sweep tests (30, 37, 44, 51, 58) and
+    # gone by thresh=59 -- verified against the real detect pipeline, not
+    # hand-derived.
+    max_grip = _add_gaussian_blob(render(points), 20.0, 20.0, amp=55.0, radius=2.5)
+    frames = {"relaxed": relaxed, "full_open": full_open, "max_grip": max_grip}
+    params = base_params(thresh=30, min_area=4.0)
+
+    automatic = search(frames, params)
+    assert automatic.passed is False
+    assert automatic.worst_pose == "max_grip"
+    assert automatic.poses["max_grip"].n_detected == TARGET_MARKERS + 1
+
+    manual = rescore(
+        frames, params, None, automatic.geometry, automatic.reference_corners,
+        thresh=59, min_area=4.0, reference_bands=automatic.reference_bands,
+    )
+    assert manual.passed is True
+    assert all(manual.poses[k].n_detected == TARGET_MARKERS for k in POSE_KEYS)
+
+
+def test_rescore_reuses_the_given_geometry_without_rederiving(monkeypatch):
+    """D14: a manual re-score must never re-derive geometry, even when the
+    frames it is scoring differ from the frames the passed-in geometry came
+    from -- proven with a spy rather than by reading the source."""
+    frames_a, _points_a = build_pose_frames(set())
+    frames_b, _points_b = build_pose_frames({bottom_right_index()})
+    params = base_params()
+
+    reference = search(frames_a, params)
+
+    calls: list[int] = []
+    original = ds.geometry_from
+
+    def spy(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ds, "geometry_from", spy)
+
+    rescore(
+        frames_b, params, None, reference.geometry, reference.reference_corners,
+        thresh=44, min_area=20.0,
+    )
+    assert calls == []
 
 
 def test_search_budget(capsys):

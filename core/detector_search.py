@@ -2,7 +2,10 @@
 
 Scores one candidate ``thresh``/``min_area`` pair against the sensor captured at
 three hand poses at once and keeps the set that survives the *worst* pose, so a
-dim oblique edge marker cannot fall under the threshold mid-recording.
+dim oblique edge marker cannot fall under the threshold mid-recording. A search
+only passes when every pose detects exactly ``TARGET_MARKERS`` -- an over-count
+(a reflection scored as a marker) fails the gate just as an under-count does,
+since ``worst_count`` alone (the minimum) never catches an over-detecting pose.
 
 Pure and rig-free: takes already-undistorted/cropped grey frames, returns params
 plus per-pose diagnostics. No tkinter, no cv2 GUI calls -- safe to run on a
@@ -94,6 +97,8 @@ class SearchResult:
     worst_count: int
     passed: bool
     bounds: dict[str, list[int]]
+    manual_override: bool = False
+    auto_params: dict | None = None
 
 
 def grid_lines(coords: np.ndarray) -> list[float]:
@@ -350,6 +355,32 @@ def _anchor_detections(prepared: tuple, base_params: dict) -> list[Detection]:
     return best
 
 
+def score_poses(
+    prepared: dict[str, tuple],
+    params: dict,
+    geom: Geometry,
+    reference_corners: dict[str, int],
+) -> tuple[dict[str, PoseDiagnostics], dict[str, list[Detection]]]:
+    """Score one fixed thresh/min_area pair against every pose's prepared
+    frame. Shared by `search()`'s own sweep-winner pass and `rescore()`'s
+    manual re-score, so the two never drift onto separate code paths."""
+    poses: dict[str, PoseDiagnostics] = {}
+    detections: dict[str, list[Detection]] = {}
+    for key in POSE_KEYS:
+        dets, oversized, fallbacks = _evaluate(prepared[key], params)
+        counts = region_counts(dets, geom)
+        poses[key] = PoseDiagnostics(
+            n_detected=len(dets),
+            bands=counts["bands"],
+            corners=counts["corners"],
+            oversized=oversized,
+            gaussian_fallbacks=fallbacks,
+            cost=pose_cost(len(dets), oversized, counts["corners"], reference_corners),
+        )
+        detections[key] = dets
+    return poses, detections
+
+
 def search(
     pose_frames: dict[str, np.ndarray],
     base_params: dict,
@@ -400,23 +431,11 @@ def search(
         size_method=base_params.get("size_method", "gaussian"),
     )
 
-    poses: dict[str, PoseDiagnostics] = {}
-    detections: dict[str, list[Detection]] = {}
-    for key in POSE_KEYS:
-        dets, oversized, fallbacks = _evaluate(prepared[key], winner)
-        counts = region_counts(dets, geom)
-        poses[key] = PoseDiagnostics(
-            n_detected=len(dets),
-            bands=counts["bands"],
-            corners=counts["corners"],
-            oversized=oversized,
-            gaussian_fallbacks=fallbacks,
-            cost=pose_cost(len(dets), oversized, counts["corners"], ref_corners),
-        )
-        detections[key] = dets
+    poses, detections = score_poses(prepared, winner, geom, ref_corners)
 
     worst_pose = max(POSE_KEYS, key=lambda k: (poses[k].cost, -poses[k].n_detected))
     worst_count = min(poses[k].n_detected for k in POSE_KEYS)
+    passed = all(poses[k].n_detected == TARGET_MARKERS for k in POSE_KEYS)
 
     return SearchResult(
         params=winner,
@@ -428,6 +447,72 @@ def search(
         reference_corners=ref_corners,
         worst_pose=worst_pose,
         worst_count=worst_count,
-        passed=worst_count >= MIN_ACCEPTABLE,
+        passed=passed,
         bounds={"thresh": list(THRESH_RANGE), "min_area": list(MIN_AREA_RANGE)},
     )
+
+
+def rescore(
+    pose_frames: dict[str, np.ndarray],
+    base_params: dict,
+    mask: np.ndarray | None,
+    geom: Geometry,
+    reference_corners: dict[str, int],
+    thresh: int,
+    min_area: float,
+    reference_bands: dict[str, int] | None = None,
+) -> SearchResult:
+    """Re-score one manually chosen thresh/min_area pair against the three
+    pose frames already captured (D13). Reuses the geometry and reference
+    corners the original automatic search already resolved (D14) -- never
+    re-derives them, since a manually adjusted pair has no reason to still
+    resolve a clean grid on its own, and re-deriving would let the manual
+    override silently disagree with the record the operator is looking at.
+
+    `reference_bands` carries no scoring weight -- only `reference_corners`
+    feeds `pose_cost` -- it exists only so the returned `SearchResult` can
+    still carry the figure through to `save_calibration`'s payload; a caller
+    with nothing to carry forward may omit it.
+    """
+    missing = [k for k in POSE_KEYS if k not in pose_frames]
+    if missing:
+        raise ValueError(f"missing pose frames: {', '.join(missing)}")
+
+    prepared = {k: _prepare(pose_frames[k], base_params, mask) for k in POSE_KEYS}
+    params = dict(
+        base_params,
+        thresh=thresh,
+        min_area=min_area,
+        size_method=base_params.get("size_method", "gaussian"),
+    )
+    poses, detections = score_poses(prepared, params, geom, reference_corners)
+
+    worst_pose = max(POSE_KEYS, key=lambda k: (poses[k].cost, -poses[k].n_detected))
+    worst_count = min(poses[k].n_detected for k in POSE_KEYS)
+    passed = all(poses[k].n_detected == TARGET_MARKERS for k in POSE_KEYS)
+
+    return SearchResult(
+        params=params,
+        poses=poses,
+        detections=detections,
+        geometry=geom,
+        grid_shape=(geom.x_lines, geom.y_lines),
+        reference_bands=reference_bands or {},
+        reference_corners=reference_corners,
+        worst_pose=worst_pose,
+        worst_count=worst_count,
+        passed=passed,
+        bounds={"thresh": list(THRESH_RANGE), "min_area": list(MIN_AREA_RANGE)},
+    )
+
+
+def clamp_manual_params(thresh: float, min_area: float) -> tuple[int, float]:
+    """Clamp a manually entered thresh/min_area pair to the sweep's own
+    bounds (derived from THRESH_RANGE/MIN_AREA_RANGE, so they can never drift
+    apart), at step 1 -- finer than the automated sweep's step of 2, since an
+    operator's own judgement resolves better than a coarse grid (D15)."""
+    t_lo, t_hi, _t_step = THRESH_RANGE
+    a_lo, a_hi, _a_step = MIN_AREA_RANGE
+    clamped_thresh = int(min(max(round(thresh), t_lo), t_hi))
+    clamped_min_area = float(min(max(min_area, a_lo), a_hi))
+    return clamped_thresh, clamped_min_area

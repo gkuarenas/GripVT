@@ -6,11 +6,12 @@ verbatim (mechanical move, no logic changes) -- see
 docs/logs/20260729_141951_codebase_reorg_and_session_split_plan.md, D8.
 
 The right panel is a two-phase gate on Tracker.capture_baseline(): phase 1
-(gate box) blocks Start until a real 15-frame burst locks >= MIN_ACCEPTABLE
-of the 99 Kalman states; phase 2 (baseline strip) shows the locked count and
-unlocks Start. A below-threshold capture can be overridden (flags the saved
-record) or recaptured -- but Re-capture is permanently disabled once Start is
-pressed, since Kalman states are locked once per session (see CLAUDE.md).
+(gate box) blocks Start until a real 15-frame burst locks exactly
+TARGET_MARKERS (99) of the 99 Kalman states; phase 2 (baseline strip) shows
+the locked count and unlocks Start. A capture that locks any other count --
+too few or too many -- can be overridden (flags the saved record) or
+recaptured -- but Re-capture is permanently disabled once Start is pressed,
+since Kalman states are locked once per session (see CLAUDE.md).
 
 _refresh_transport reads/writes state owned by the progress, recording, and
 scaffold groups -- left as plain `self.` calls per D1/D2 of the split plan,
@@ -23,7 +24,7 @@ from typing import Callable
 import numpy as np
 
 from core.detector_search import (
-    GRID_SHAPE, MIN_ACCEPTABLE, TARGET_MARKERS, SearchResult, region_counts,
+    GRID_SHAPE, TARGET_MARKERS, SearchResult, region_counts,
 )
 from core.roi import ROICrop
 from core.tracker import BASELINE_FRAMES, Tracker
@@ -224,6 +225,8 @@ class BaselineMixin:
 
     def _render_gate_fail(self) -> None:
         b = self._baseline
+        over = b["count"] is not None and b["count"] > TARGET_MARKERS
+        heading = "Extra Markers Detected" if over else "Below Threshold"
         wrap = tk.Frame(self._gate_box, bg=theme.ACCENT_10)
         wrap.place(relx=0.5, rely=0.5, anchor="center")
 
@@ -231,7 +234,7 @@ class BaselineMixin:
         head.pack(pady=(0, 14))
         self._warning_icon(head, theme.ACCENT_10).pack(side="left", padx=(0, 8))
         tk.Label(
-            head, text="Below Threshold", bg=theme.ACCENT_10, fg=theme.ACCENT_700,
+            head, text=heading, bg=theme.ACCENT_10, fg=theme.ACCENT_700,
             font=self._f_gate_fail_heading,
         ).pack(side="left")
 
@@ -387,7 +390,7 @@ class BaselineMixin:
         count = self._tracker.capture_baseline(self._baseline_frames)
         self._baseline_clip_frames = self._baseline_frames
         self._baseline_frames = []
-        passed = count >= MIN_ACCEPTABLE
+        passed = count == TARGET_MARKERS
 
         corners = bands = None
         subline = ""

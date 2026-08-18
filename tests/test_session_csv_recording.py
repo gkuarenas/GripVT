@@ -143,7 +143,7 @@ def _make_participant(tmp_path) -> ParticipantRecord:
     )
 
 
-def _lock_baseline(win: SessionWindow, count: int = 97) -> None:
+def _lock_baseline(win: SessionWindow, count: int = 99) -> None:
     """Drive status none -> capturing -> pass without a real camera (same
     helper as test_session_baseline_gate.py), then set baseline_set directly
     since the monkeypatched capture_baseline() -- unlike the real one -- does

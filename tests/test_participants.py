@@ -334,6 +334,48 @@ def test_save_calibration_honours_dest_dir(tmp_path):
     assert list(folder.glob("pose_*.png")) == []
 
 
+# ── Phase 4 (2026-08-18 calibration-fallback-mask-gate plan): the manual
+# override record (D17). manual_override is always written; auto_params and
+# final_params are written only when it is true.
+
+def test_save_calibration_with_manual_override_records_both_param_sets(tmp_path):
+    folder = tmp_path / "participant003_x"
+    folder.mkdir()
+    session_dir = folder / "session1_20260803110100"
+    session_dir.mkdir()
+
+    auto_params = {"thresh": 58, "min_area": 4.0}
+    result = _search_result()
+    assert result.params != auto_params  # guards the "they differ" assertion below
+
+    path = participants.save_calibration(
+        _record(folder), result, _pose_frames(), dest_dir=str(session_dir),
+        manual_override=True, auto_params=auto_params,
+    )
+
+    payload = json.loads(open(path).read())
+    assert payload["manual_override"] is True
+    assert payload["auto_params"] == auto_params
+    assert payload["final_params"] == result.params
+    assert payload["auto_params"] != payload["final_params"]
+
+
+def test_save_calibration_default_omits_auto_params(tmp_path):
+    folder = tmp_path / "participant003_x"
+    folder.mkdir()
+    session_dir = folder / "session1_20260803110100"
+    session_dir.mkdir()
+
+    path = participants.save_calibration(
+        _record(folder), _search_result(), _pose_frames(), dest_dir=str(session_dir),
+    )
+
+    payload = json.loads(open(path).read())
+    assert payload["manual_override"] is False
+    assert "auto_params" not in payload
+    assert "final_params" not in payload
+
+
 def test_save_baseline_honours_dest_dir(tmp_path):
     folder = tmp_path / "participant003_x"
     folder.mkdir()

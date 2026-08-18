@@ -133,7 +133,7 @@ def test_transport_unlocked_idle(window):
 
 
 def test_transport_locked_idle(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     assert window._trial < window._trial_max
     assert window._start_btn.enabled is True
     assert window._stop_btn.enabled is False
@@ -141,7 +141,7 @@ def test_transport_locked_idle(window):
 
 
 def test_transport_locked_recording(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     window._confirm_start()
     assert window._start_btn.enabled is False
     assert window._stop_btn.enabled is True
@@ -151,7 +151,7 @@ def test_transport_locked_recording(window):
 
 
 def test_transport_locked_idle_trial_at_max(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     window._trial = window._trial_max
     window._refresh_transport()
     assert window._start_btn.enabled is True
@@ -167,7 +167,7 @@ def test_start_disabled_until_locked(window):
 
 
 def test_start_enabled_after_pass(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     assert window._baseline["status"] == "pass"
     assert window._start_btn.enabled is True
 
@@ -186,7 +186,7 @@ def test_start_enabled_after_fail_and_override(window):
 # forever -- the two must not be conflated (module docstring, line ~153). ──
 
 def test_recapture_disabled_permanently_after_stop(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     assert window._strip_recapture_btn.enabled is True
 
     window._confirm_start()
@@ -542,7 +542,7 @@ def test_restart_entire_testing_confirmation_calls_on_back_with_message(window):
 # ── trial counter + Undo (E7) ────────────────────────────────────────────────
 
 def test_next_trial_advances_and_enables_undo(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     window._confirm_start()  # D9: Next Trial requires an active recording
     trial_before = window._trial
     assert window._undo_available is False
@@ -556,7 +556,7 @@ def test_next_trial_advances_and_enables_undo(window):
 
 
 def test_undo_steps_back_once_and_disables(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     # Not 0 -- Undo's floor is max(1, ...), so stepping back from trial 1
     # lands on 1, not 0 (trial 0 is only ever the pre-first-Start state).
     window._trial = 5
@@ -571,7 +571,7 @@ def test_undo_steps_back_once_and_disables(window):
 
 
 def test_undo_is_noop_when_unavailable(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     trial_before = window._trial
     assert window._undo_available is False
 
@@ -582,7 +582,7 @@ def test_undo_is_noop_when_unavailable(window):
 
 
 def test_next_trial_disabled_and_noop_at_trial_max(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     window._trial = window._trial_max
     window._refresh_transport()
     assert window._next_btn.enabled is False
@@ -607,14 +607,14 @@ def test_undo_clamps_at_one(window):
 # not one trial. It is gated off before Start (2026-07-28, D9-addendum). ──
 
 def test_next_trial_enabled_while_recording(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     window._confirm_start()
     assert window._recording is True
     assert window._next_btn.enabled is True
 
 
 def test_next_trial_advances_while_recording(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     window._confirm_start()
     trial_before = window._trial
 
@@ -625,7 +625,7 @@ def test_next_trial_advances_while_recording(window):
 
 
 def test_next_trial_disabled_while_recording_at_trial_max(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     window._confirm_start()
     window._trial = window._trial_max
     window._refresh_transport()

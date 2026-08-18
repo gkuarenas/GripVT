@@ -19,6 +19,12 @@ stray blobs get falsely detected as markers. sensor_mask() gates
 detection to a polygon traced around the sensor outline, authored by
 calibration/roi/select_roi.py and stored crop-relative so it doesn't need to
 know the rect's origin.
+
+The outline alone still lets through small reflections between marker
+columns. mask_holes carries a list of hole polygons, each punched to 0
+inside the outline after it is filled to 255, in the same crop-relative
+frame as mask_points. A hole with no outline still punches, starting
+from a full 255 mask, so a holes-only run works before an outline exists.
 """
 import json
 from dataclasses import dataclass
@@ -40,6 +46,7 @@ class ROIConfig:
     h: int
     alpha: float = DEFAULT_ALPHA
     mask_points: Optional[list[tuple[int, int]]] = None
+    mask_holes: Optional[list[list[tuple[int, int]]]] = None
 
 
 class ROICrop:
@@ -53,10 +60,16 @@ class ROICrop:
             mask_points = (
                 [(int(p[0]), int(p[1])) for p in raw_points] if raw_points else None
             )
+            raw_holes = raw.get("mask_holes")
+            mask_holes = (
+                [[(int(p[0]), int(p[1])) for p in hole] for hole in raw_holes]
+                if raw_holes else None
+            )
             self._config = ROIConfig(
                 x=int(raw["x"]), y=int(raw["y"]), w=int(raw["w"]), h=int(raw["h"]),
                 alpha=float(raw.get("alpha", DEFAULT_ALPHA)),
                 mask_points=mask_points,
+                mask_holes=mask_holes,
             )
 
     @property
@@ -74,19 +87,31 @@ class ROICrop:
         return frame[c.y : c.y + c.h, c.x : c.x + c.w]
 
     def sensor_mask(self, shape: tuple[int, int]) -> Optional[np.ndarray]:
-        """Binary mask (255 inside the sensor outline polygon, 0 outside),
-        sized to `shape` (h, w) of an already-cropped frame. None if no
-        polygon was authored (rectangle-only roi.json) — callers should
-        skip masking entirely in that case, not treat it as mask-everything.
+        """Binary mask (255 inside the sensor outline polygon, 0 outside,
+        with mask_holes punched back to 0 inside that), sized to `shape`
+        (h, w) of an already-cropped frame. None if neither a polygon nor
+        holes were authored (rectangle-only roi.json) — callers should skip
+        masking entirely in that case, not treat it as mask-everything.
         """
         config = self._config
-        if config is None or not config.mask_points:
+        if config is None or (not config.mask_points and not config.mask_holes):
             return None
         if self._mask_cache is not None and self._mask_cache_shape == shape:
             return self._mask_cache
         mask = np.zeros(shape, dtype=np.uint8)
-        points = np.array(config.mask_points, dtype=np.int32)
-        cv2.fillPoly(mask, [points], 255)
+        if config.mask_points:
+            points = np.array(config.mask_points, dtype=np.int32)
+            cv2.fillPoly(mask, [points], 255)
+        else:
+            mask[:] = 255
+        if config.mask_holes:
+            holes = [
+                np.array(hole, dtype=np.int32)
+                for hole in config.mask_holes
+                if len(hole) >= 3
+            ]
+            if holes:
+                cv2.fillPoly(mask, holes, 0)
         self._mask_cache = mask
         self._mask_cache_shape = shape
         return mask

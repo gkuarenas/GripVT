@@ -146,7 +146,7 @@ def test_start_disabled_in_phase1(window):
 
 
 def test_start_enabled_after_pass(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     assert window._baseline["status"] == "pass"
     assert window._start_btn.enabled is True
 
@@ -160,6 +160,22 @@ def test_start_disabled_on_fail_not_overridden(window):
 
 def test_start_enabled_after_override(window):
     _finish_burst(window, 60)
+    window._on_override_baseline_click()
+    assert window._baseline["overridden"] is True
+    assert window._start_btn.enabled is True
+
+
+def test_overcount_fails_the_gate(window):
+    """The two aborted real baselines both locked 100 -- a count above
+    TARGET_MARKERS must fail the gate exactly like a count below it."""
+    _finish_burst(window, 100)
+    assert window._baseline["status"] == "fail"
+    assert window._baseline["overridden"] is False
+    assert window._start_btn.enabled is False
+
+
+def test_overcount_fail_can_still_be_overridden(window):
+    _finish_burst(window, 100)
     window._on_override_baseline_click()
     assert window._baseline["overridden"] is True
     assert window._start_btn.enabled is True
@@ -183,7 +199,7 @@ def test_override_flag_reaches_saved_payload(window, tmp_path):
 
 
 def test_recapture_disabled_after_start(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     assert window._strip_recapture_btn.enabled is True
     # Phase 5 gates Start behind a bookend-confirm modal -- _on_start() only
     # opens it now. _confirm_start() is the body that used to run directly,
@@ -194,7 +210,7 @@ def test_recapture_disabled_after_start(window):
 
 
 def test_recapture_click_ignored_after_start(window):
-    _finish_burst(window, 97)
+    _finish_burst(window, 99)
     window._confirm_start()
     window._on_recapture_baseline_click()
     assert window._baseline["status"] == "pass"  # unchanged -- no re-lock mid-session
@@ -204,7 +220,7 @@ def test_pass_path_writes_matching_baseline_clip(window, tmp_path):
     """F6b: nothing lands on disk until Start flushes the buffered baseline
     -- so it must appear in the SESSION dir, not the participant root."""
     window._participant = _make_participant(tmp_path)
-    _finish_burst_with_video(window, 97)
+    _finish_burst_with_video(window, 99)
 
     root_before = Path(window._participant.folder)
     assert list(root_before.glob("baseline_*")) == []
@@ -247,7 +263,7 @@ def test_override_path_writes_matching_baseline_clip(window, tmp_path):
 def test_fail_recapture_pass_writes_exactly_one_clip(window, tmp_path):
     """The subtle F6b requirement: a fail -> recapture -> fail -> recapture
     -> pass sequence must flush EXACTLY ONE baseline JSON and ONE clip at
-    Start, and its content must be the WINNING (97-count) attempt's, not
+    Start, and its content must be the WINNING (99-count) attempt's, not
     either discarded one."""
     window._participant = _make_participant(tmp_path)
 
@@ -261,8 +277,8 @@ def test_fail_recapture_pass_writes_exactly_one_clip(window, tmp_path):
     assert window._pending_baseline is None
     window._on_recapture_baseline_click()
 
-    _finish_burst_with_video(window, 97)  # winning attempt
-    assert window._pending_baseline["locked_count"] == 97
+    _finish_burst_with_video(window, 99)  # winning attempt
+    assert window._pending_baseline["locked_count"] == 99
 
     window._confirm_start()
     session_dir = Path(window._writer.session_dir)
@@ -274,7 +290,7 @@ def test_fail_recapture_pass_writes_exactly_one_clip(window, tmp_path):
     assert jsons[0].stem == clips[0].stem
 
     payload = json.loads(jsons[0].read_text())
-    assert payload["locked_count"] == 97  # the winning attempt, not 50 or 55
+    assert payload["locked_count"] == 99  # the winning attempt, not 50 or 55
     assert _count_video_frames(clips[0]) == baseline_module.BASELINE_FRAMES
     window._confirm_stop()
 
@@ -310,8 +326,8 @@ def test_fail_recapture_pass_writes_one_grid_layout_matching_winner(window, tmp_
     window._on_recapture_baseline_click()
 
     winning_layout = {0: (0, 0), 1: (0, 1), 9: (1, 0)}
-    _finish_burst_with_grid(window, 97, layout=winning_layout, source="geometry")
-    assert window._pending_grid_layout["locked_count"] == 97
+    _finish_burst_with_grid(window, 99, layout=winning_layout, source="geometry")
+    assert window._pending_grid_layout["locked_count"] == 99
 
     window._confirm_start()
     session_dir = Path(window._writer.session_dir)
@@ -319,7 +335,7 @@ def test_fail_recapture_pass_writes_one_grid_layout_matching_winner(window, tmp_
     assert len(files) == 1
 
     payload = json.loads(files[0].read_text())
-    assert payload["locked_count"] == 97  # the winning attempt, not 50
+    assert payload["locked_count"] == 99  # the winning attempt, not 50
     assert payload["source"] == "geometry"
     window._confirm_stop()
 

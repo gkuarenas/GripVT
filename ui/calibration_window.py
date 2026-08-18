@@ -11,7 +11,9 @@ Baseline capture stays a Session-window control -- this window only settles
 detector params.
 """
 import threading
+import time
 import tkinter as tk
+from dataclasses import replace
 from typing import Callable
 
 import cv2
@@ -25,6 +27,8 @@ from core.detector_search import (
     TARGET_MARKERS,
     AnchorError,
     SearchResult,
+    clamp_manual_params,
+    rescore,
     search,
 )
 from core.roi import DEFAULT_ALPHA, ROICrop
@@ -40,6 +44,9 @@ FEED_H = 600
 
 CAMERA_INDEX = 1
 POLL_MS = 33
+# A single dropped read at 30fps is normal jitter -- only a sustained streak
+# means the camera actually disconnected. Mirrors ui/session/camera_feed.py:47.
+CAMERA_FAIL_POLLS = 15  # ~0.5s at POLL_MS
 # Live detection is visual feedback only, so it runs at ~10Hz -- illumination
 # flattening (CLAHE + a large top-hat) costs more than the 33ms frame budget.
 DETECT_EVERY = 3
@@ -97,6 +104,8 @@ class CalibrationWindow(tk.Toplevel):
         self._status = "idle"
         self._result: SearchResult | None = None
         self._overridden = False
+        self._manual_override = False
+        self._auto_params: dict | None = None
 
         self._burst: list[np.ndarray] = []
         self._capturing: str | None = None
@@ -110,6 +119,8 @@ class CalibrationWindow(tk.Toplevel):
         self._search_after: str | None = None
         self._toast_after: str | None = None
         self._cap: cv2.VideoCapture | None = None
+        self._read_fail_streak = 0
+        self._disconnect_at: float | None = None
 
         self._init_fonts()
         self._build_body()
@@ -394,11 +405,12 @@ class CalibrationWindow(tk.Toplevel):
             ).pack(pady=(8, 0))
             return
 
+        worst_n = result.poses[result.worst_pose].n_detected
         colour = theme.INK if result.passed else theme.ACCENT_700
         row = tk.Frame(wrap, bg=theme.BG)
         row.pack()
         tk.Label(
-            row, text=str(result.worst_count), bg=theme.BG, fg=colour, font=self._f_big
+            row, text=str(worst_n), bg=theme.BG, fg=colour, font=self._f_big
         ).pack(side="left")
         tk.Label(
             row, text=f"/ {TARGET_MARKERS}", bg=theme.BG, fg=colour, font=self._f_unit
@@ -408,11 +420,19 @@ class CalibrationWindow(tk.Toplevel):
             font=self._f_small, wraplength=320,
         ).pack(pady=(8, 0))
         if not result.passed:
+            if worst_n > TARGET_MARKERS:
+                fail_text = (
+                    f"{POSE_NAMES[result.worst_pose]} detected extra blobs "
+                    f"({worst_n} / {TARGET_MARKERS}), likely reflections. Recapture and try "
+                    "again."
+                )
+            else:
+                fail_text = (
+                    f"{POSE_NAMES[result.worst_pose]} below threshold "
+                    f"({worst_n} / {TARGET_MARKERS}). Reseat the sensor and try again."
+                )
             tk.Label(
-                wrap,
-                text=f"{POSE_NAMES[result.worst_pose]} below threshold "
-                     f"({result.worst_count} / {TARGET_MARKERS}). Recapture and try again.",
-                bg=theme.BG, fg=theme.ACCENT_700, font=self._f_fail,
+                wrap, text=fail_text, bg=theme.BG, fg=theme.ACCENT_700, font=self._f_fail,
                 wraplength=320, justify="center",
             ).pack(pady=(8, 0))
 
@@ -600,6 +620,73 @@ class CalibrationWindow(tk.Toplevel):
             return
         result: SearchResult = holder["result"]
         self._result = result
+        # Held so a later manual re-score can still report what the automatic
+        # sweep found, even after self._result is replaced (D17's auto_params).
+        self._auto_params = result.params
+        self._status = "pass" if result.passed else "fail"
+        self._params = result.params
+        self._pose_dets = dict(result.detections)
+        for key in POSE_KEYS:
+            self._pose_counts[key] = result.poses[key].n_detected
+        if not result.passed:
+            self._selected = result.worst_pose
+            self._review = result.worst_pose
+        self._refresh()
+        self._paint_review()
+
+    def _manual_rescore(self, thresh: int, min_area: float) -> None:
+        """Backend-only entry point for a manual detector override (Phase 4).
+        No widget calls this yet -- Guillaume is designing the layout
+        separately in Claude Design (D18) -- but the method is complete: it
+        refuses outside a failed calibration (D12), re-scores the same three
+        captured frames (D13) against the geometry the automatic search
+        already resolved (D14), and never touches the shared seed file
+        (D16)."""
+        if self._status != "fail" or self._result is None:
+            return
+        thresh, min_area = clamp_manual_params(thresh, min_area)
+        frames = dict(self._pose_frames)
+        base = load_params()
+        mask = self._roi.sensor_mask(frames["relaxed"].shape)
+        geom = self._result.geometry
+        reference_corners = self._result.reference_corners
+        reference_bands = self._result.reference_bands
+        auto_params = self._auto_params
+        holder: dict = {}
+
+        def work() -> None:
+            try:
+                holder["result"] = rescore(
+                    frames, base, mask, geom, reference_corners, thresh, min_area,
+                    reference_bands=reference_bands,
+                )
+            except ValueError as exc:
+                holder["error"] = str(exc)
+
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+        self._search_after = self.after(
+            100, lambda: self._poll_manual_rescore(thread, holder, auto_params)
+        )
+
+    def _poll_manual_rescore(
+        self, thread: threading.Thread, holder: dict, auto_params: dict | None,
+    ) -> None:
+        if thread.is_alive():
+            self._search_after = self.after(
+                100, lambda: self._poll_manual_rescore(thread, holder, auto_params)
+            )
+            return
+        self._search_after = None
+        error = holder.get("error")
+        if error is not None:
+            self._show_toast(error)
+            return
+        result: SearchResult = replace(
+            holder["result"], manual_override=True, auto_params=auto_params
+        )
+        self._result = result
+        self._manual_override = True
         self._status = "pass" if result.passed else "fail"
         self._params = result.params
         self._pose_dets = dict(result.detections)
@@ -631,6 +718,7 @@ class CalibrationWindow(tk.Toplevel):
         self._status = "idle"
         self._result = None
         self._overridden = False
+        self._manual_override = False
         self._burst = []
         self._capturing = None
         self._params = load_params()
@@ -658,6 +746,8 @@ class CalibrationWindow(tk.Toplevel):
                 if roi_config is not None else None
             ),
             "calibration_image_size": list(self._cal.image_size),
+            "manual_override": result.manual_override,
+            "auto_params": result.auto_params,
         }
         self._on_continue(result, pending_calibration)
 
@@ -728,14 +818,40 @@ class CalibrationWindow(tk.Toplevel):
         self._unavailable.lift()
         self._render_actions()
 
+    def _set_camera_disconnected(self) -> None:
+        """Fires only after CAMERA_FAIL_POLLS consecutive failed reads.
+        Never touches self._pose_frames/_pose_dets/_result/_status -- an
+        already-captured pose must survive a disconnect untouched (D3). A
+        burst in progress is discarded instead, since a median across frames
+        from before and after a gap is not trustworthy (D2)."""
+        self._after_id = None
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+        self._disconnect_at = time.monotonic()
+        self._read_fail_streak = 0
+
+        if self._capturing is not None:
+            self._pose_state[self._capturing] = "pending"
+            self._burst = []
+            self._capturing = None
+
+        self._show_unavailable()
+        self._refresh()
+
     def retry_camera(self) -> None:
         if self._cap is not None:
             return
         self._open_camera()
         if self._cap is None:
             self._show_toast("Camera still unavailable — check the USB connection.")
-        else:
-            self._render_actions()
+            return
+        self._render_actions()
+        self._read_fail_streak = 0
+        if self._disconnect_at is not None:
+            gap = round(time.monotonic() - self._disconnect_at)
+            self._show_toast(f"Camera reconnected — {gap}s gap")
+            self._disconnect_at = None
 
     def _processed_gray(self, frame: np.ndarray) -> np.ndarray:
         undistorted = self._tracker.undistort(frame)
@@ -777,6 +893,7 @@ class CalibrationWindow(tk.Toplevel):
             return
         ret, frame = cap.read()
         if ret:
+            self._read_fail_streak = 0
             gray = self._processed_gray(frame)
             self._live_gray = gray
             if self._capturing is not None:
@@ -790,6 +907,11 @@ class CalibrationWindow(tk.Toplevel):
                     self._live_dets = self._detect(gray)
             if self._review is None:
                 self._paint(gray, self._live_dets, "LIVE", len(self._live_dets))
+        else:
+            self._read_fail_streak += 1
+            if self._read_fail_streak >= CAMERA_FAIL_POLLS:
+                self._set_camera_disconnected()
+                return
         self._after_id = self.after(POLL_MS, self._poll)
 
     def release_camera(self) -> None:

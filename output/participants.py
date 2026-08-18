@@ -24,8 +24,8 @@ from output.video import VIDEO_EXT, VideoLogWriter
 RECORDINGS_DIR = "recordings"
 KEY_PATH = Path(r"C:\Users\Guillaume\Documents\DLSU\THESIS\GripVT_keys\participant_key.json")
 SCHEMA_VERSION = 1
-CALIBRATION_SCHEMA_VERSION = 1
-BASELINE_SCHEMA_VERSION = 1
+CALIBRATION_SCHEMA_VERSION = 2
+BASELINE_SCHEMA_VERSION = 2
 ABORTED_SCHEMA_VERSION = 1
 GRID_LAYOUT_SCHEMA_VERSION = 1
 
@@ -129,6 +129,8 @@ def save_calibration(
     overridden: bool = False,
     roi: dict | None = None,
     calibration_image_size: list[int] | None = None,
+    manual_override: bool = False,
+    auto_params: dict | None = None,
 ) -> str:
     """Persist one wear's calibration into `dest_dir`, de-identified.
 
@@ -141,6 +143,13 @@ def save_calibration(
     The three median pose frames go alongside the JSON so the search can be
     re-run offline without the rig -- the per-pose diagnostics are the study's
     calibration-evaluation record, so they have to stay reproducible.
+
+    `manual_override`/`auto_params` record Phase 4's post-hoc detector
+    override (D17): `manual_override` is always written, but `auto_params`
+    and `final_params` are written only when it is true (D17) -- a plain
+    automatic pass has nothing to contrast `params` against, so those two
+    keys would just restate `params` for every ordinary calibration. `params`
+    itself is left alone either way, so old readers keep working.
     """
     now = datetime.now()
     ts = now.strftime("%Y%m%d_%H%M%S")
@@ -149,7 +158,9 @@ def save_calibration(
         "participant_id": record.participant_id,
         "timestamp": now.isoformat(timespec="seconds"),
         "passed": result.passed,
+        "pass_rule": "every_pose_equals_target",
         "overridden": overridden,
+        "manual_override": manual_override,
         "target_markers": TARGET_MARKERS,
         "min_acceptable": MIN_ACCEPTABLE,
         "params": result.params,
@@ -164,6 +175,9 @@ def save_calibration(
         "roi": roi,
         "calibration_image_size": calibration_image_size,
     }
+    if manual_override:
+        payload["auto_params"] = auto_params
+        payload["final_params"] = result.params
 
     path = os.path.join(dest_dir, f"calibration_{ts}.json")
     with open(path, "w") as f:
@@ -212,6 +226,7 @@ def save_baseline(
         "target": TARGET_MARKERS,
         "min_acceptable": MIN_ACCEPTABLE,
         "passed": passed,
+        "pass_rule": "locked_count_equals_target",
         "overridden": overridden,
         "corners": corners,
         "bands": bands,

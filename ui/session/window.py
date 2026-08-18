@@ -28,11 +28,12 @@ Visual design ported from the Modernist design system (Claude Design:
 "GripVT Session Recording").
 
 The right panel is a two-phase gate on Tracker.capture_baseline(): phase 1
-(gate box) blocks Start until a real 15-frame burst locks >= MIN_ACCEPTABLE
-of the 99 Kalman states; phase 2 (baseline strip) shows the locked count and
-unlocks Start. A below-threshold capture can be overridden (flags the saved
-record) or recaptured -- but Re-capture is permanently disabled once Start is
-pressed, since Kalman states are locked once per session (see CLAUDE.md).
+(gate box) blocks Start until a real 15-frame burst locks exactly
+TARGET_MARKERS (99) of the 99 Kalman states; phase 2 (baseline strip) shows
+the locked count and unlocks Start. A capture that locks any other count --
+too few or too many -- can be overridden (flags the saved record) or
+recaptured -- but Re-capture is permanently disabled once Start is pressed,
+since Kalman states are locked once per session (see CLAUDE.md).
 
 The REC timer, camera-loss detection/retry, and the {n} / 99 TRACKED
 indicator are real: the timer is wall-clock elapsed time anchored on the

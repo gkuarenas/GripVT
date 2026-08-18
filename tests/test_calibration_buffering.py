@@ -154,11 +154,14 @@ def test_continue_bundle_carries_everything_save_calibration_needs(cal_window):
     pending = captured["pending"]
     assert set(pending.keys()) == {
         "result", "pose_frames", "overridden", "roi", "calibration_image_size",
+        "manual_override", "auto_params",
     }
     assert pending["result"] is captured["result"]
     assert set(pending["pose_frames"].keys()) == {"relaxed", "full_open", "max_grip"}
     assert pending["overridden"] is False  # result.passed was True
     assert pending["calibration_image_size"] == list(win._cal.image_size)
+    assert pending["manual_override"] is False  # _drive_to_pass never ran a rescore
+    assert pending["auto_params"] is None
 
 
 # ── 2/3: Start flushes into the SESSION dir; participant root stays clean ──
@@ -200,6 +203,8 @@ def _pending_bundle() -> dict:
         "overridden": False,
         "roi": None,
         "calibration_image_size": [1024, 768],
+        "manual_override": False,
+        "auto_params": None,
     }
 
 
@@ -392,6 +397,7 @@ def test_bundle_survives_the_real_main_py_handoff_wiring(tmp_path, monkeypatch):
     pending = {
         "result": result, "pose_frames": _pose_frames(), "overridden": False,
         "roi": None, "calibration_image_size": [1024, 768],
+        "manual_override": False, "auto_params": None,
     }
     cal_win.on_continue(result, pending)  # simulate Continue -> open_session
 
@@ -465,6 +471,7 @@ def test_resume_flow_threads_complete_count_and_pending_supersede(tmp_path, monk
     pending = {
         "result": result, "pose_frames": _pose_frames(), "overridden": False,
         "roi": None, "calibration_image_size": [1024, 768],
+        "manual_override": False, "auto_params": None,
     }
     cal_win.on_continue(result, pending)  # simulate Continue -> open_session
 
