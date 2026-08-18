@@ -31,10 +31,11 @@ Two independent offset estimates are computed and both are reported:
 
   xcorr -- Pearson correlation between the per-frame grip proxy (max
            baseline-relative marker displacement across non-autofilled
-           markers -- MAX, not median, because a tap deforms only a
-           subset of the 99 markers, which a median discards) and the
-           force trace, swept over a +-2.0s grid in 5ms steps. Primary:
-           uses ~3,000 frames per estimate.
+           markers, each referred to its own resting median -- MAX, not
+           median, because a tap deforms only a subset of the 99
+           markers, which a median discards) and the
+           force trace, swept over a +-8.0s grid in 5ms steps. Primary:
+           uses every frame (median 3,850) per estimate.
   taps  -- the operator's triple-tap bookend at the start and end of the
            recording, detected independently in both signals as a
            contiguous-above-threshold run inside a 25s search window.
@@ -60,8 +61,8 @@ partial/corrupt output pair.
 
 Stdlib for parsing/IO (csv, json, pathlib, datetime, dataclasses, argparse,
 statistics), matching tools/check_export.py. numpy for the numerical
-search -- a pure-Python cross-correlation over ~800 offsets x ~3,000 frames
-x 9 sessions would be needlessly slow, and numpy is already a hard
+search -- a pure-Python cross-correlation over ~3,200 offsets x ~3,850 frames
+x 69 sessions would be needlessly slow, and numpy is already a hard
 dependency (requirements.txt).
 """
 from __future__ import annotations
