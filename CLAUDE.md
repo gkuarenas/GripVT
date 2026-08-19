@@ -32,7 +32,7 @@ Undistortion maps are precomputed **once at startup** in `core/calibration.py` f
 ## Marker geometry
 9×11 grid = **99 markers** on a curved cylindrical forearm surface.
 
-**Important:** `GATE_PX` (default 100 px) and the marker blob area bounds (`min_area`/`max_area`) in `detector.py` were tuned for a fisheye phantom camera and **must be retuned** once real GripVT footage is available. Expect the first session to need parameter adjustment.
+**Important:** the assignment gate `gate_px` (default 100.0, set in `core/tracker.py:105` and defaulted in `core/hungarian.py:8`) and the marker blob area bounds (`min_area`/`max_area` in `core/detector.py:18-19`) were tuned for a fisheye phantom camera and **must be retuned** once real GripVT footage is available. Expect the first session to need parameter adjustment. There is no module-level `GATE_PX` constant, and `detector.py` holds no gate — do not look for one there.
 
 ## Structure
 ```
@@ -105,7 +105,7 @@ pip install -r requirements.txt
 | Spawn new Kalman states mid-session | Initialise all states at Capture Baseline only |
 | Recomputing undistortion maps per frame, or a second redundant `remap` call per frame | One full-frame `remap` per frame, precomputed maps from startup, shared by detection and display |
 | Use optical flow for tracking | Threshold + connected-component centroid + Hungarian assignment only |
-| Set `GATE_PX` below 80 px | Default 100 px; retune for GripVT footage but keep ≥ 80 |
+| Set `gate_px` below 80 px | Default 100.0 in `core/tracker.py`; retune for GripVT footage but keep ≥ 80 |
 | Write output to project root | Write to `recordings/participantNNN_<ts>/…` always |
 | Store a participant's name alongside their data | Name → external key file only; `recordings/` stays de-identified |
 
