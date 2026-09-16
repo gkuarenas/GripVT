@@ -15,5 +15,7 @@ ipykernel
 nbstripout   # clears notebook outputs on commit; re-run `nbstripout --install` per clone
 xgboost
 optuna
+plotly       # optuna.visualization backend (plot_optimization_history etc.)
 mlflow
+scikit-posthocs  # significance_analysis.py cross-model post-hoc tests
 torch        # CUDA build: --index-url https://download.pytorch.org/whl/cu126

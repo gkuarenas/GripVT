@@ -57,10 +57,11 @@ docs/*
 !docs/agents/**
 
 # MLflow tracking store and run artifacts (notebook 03 onward). Regenerable; large.
-mlflow.db
+# Also holds per-fold resume state (mlflow_<model>.db), so keep the file, just don't track it.
+mlflow*.db
 mlruns/
 mlartifacts/
 
 # Per-fold results written live during a long model run, as crash insurance. Derived from
 # the notebook; the durable record is the "7x results" markdown cell.
-notebooks/*_results_live.csv
+notebooks/**/*_results_live.csv
