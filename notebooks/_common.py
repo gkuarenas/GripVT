@@ -360,7 +360,7 @@ assert _ring_next(8, 8) == [1, 2, 3]
 assert _ring_next(1, 8) == [2, 3, 4]
 
 N_PARTICIPANTS = MANIFEST['totals']['participants']
-assert N_PARTICIPANTS == 8
+assert N_PARTICIPANTS == 10
 
 INNER_VAL_PARTICIPANTS = {}   # fold number -> [participant nums]
 for fold in SUBJECT_FOLDS:
