@@ -9,7 +9,7 @@
 #           The 98-fold test is printed only as a labelled sensitivity check.
 #   rung 3: one fold per participant already, n = 10.
 #
-# Test: Friedman omnibus (3 models), then paired Wilcoxon signed-rank for each pair,
+# Test: Friedman omnibus (3 models, exact permutation p at n = 10), then paired Wilcoxon signed-rank for each pair,
 # Holm-corrected across the 3 pairs. Paired bootstrap 95% CI on the mean difference.
 # Exact Wilcoxon p-value floor at n = 10 is 2/2^10 = 0.00195.
 #
@@ -18,7 +18,9 @@
 #
 # Run from notebooks/:  python significance_analysis.py
 
+import itertools
 import json
+from collections import defaultdict
 import numpy as np
 import pandas as pd
 from scipy import stats
@@ -52,6 +54,28 @@ def holm(pvalues):
     return adjusted
 
 
+def exact_friedman_p(chi2, n, k=3):
+    # Exact Friedman p-value: under H0 each participant's ranks are one of the k! orders,
+    # all equally likely. Build the full distribution of the rank-sum vector (6^10 = 60M
+    # outcomes at n = 10, folded into a few hundred rank-sum states) and count how often
+    # chi2 is at least as large as the observed one. The chi2 approximation is unreliable
+    # at n = 10, k = 3, so this p is the one the doc reports.
+    orders = list(itertools.permutations(range(1, k + 1)))
+    dist = {(0,) * k: 1}
+    for _ in range(n):
+        new = defaultdict(int)
+        for sums, count in dist.items():
+            for order in orders:
+                new[tuple(s + r for s, r in zip(sums, order))] += count
+        dist = new
+    hits = 0
+    for sums, count in dist.items():
+        stat = 12 / (n * k * (k + 1)) * sum(s * s for s in sums) - 3 * n * (k + 1)
+        if stat >= chi2 - 1e-9:
+            hits += count
+    return hits / len(orders) ** n
+
+
 def report(df, label):
     X = df[MODELS].to_numpy()
     n = len(X)
@@ -65,7 +89,11 @@ def report(df, label):
               f'{ranks[:, j].mean():9.2f} {wins[j]:5d}')
 
     chi2, p_friedman = stats.friedmanchisquare(*X.T)
-    print(f'Friedman chi2(2) = {chi2:.3f}, p = {p_friedman:.4g}')
+    if n <= 12:
+        print(f'Friedman chi2(2) = {chi2:.3f}, exact p = {exact_friedman_p(chi2, n):.4g}  '
+              f'(chi2 approximation p = {p_friedman:.4g})')
+    else:
+        print(f'Friedman chi2(2) = {chi2:.3f}, p = {p_friedman:.4g}  (chi2 approximation, n large)')
 
     raw_p = []
     rows = []
