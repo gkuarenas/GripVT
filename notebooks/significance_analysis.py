@@ -10,7 +10,9 @@
 #   rung 3: one fold per participant already, n = 10.
 #
 # Test: Friedman omnibus (3 models, exact permutation p at n = 10), then paired Wilcoxon signed-rank for each pair,
-# Holm-corrected across the 3 pairs. Paired bootstrap 95% CI on the mean difference.
+# Holm-corrected across the 3 pairs. Effect size = Hodges-Lehmann estimate of the paired
+# difference with its exact 95% CI -- built from the same signed ranks as Wilcoxon, so the CI
+# excludes 0 exactly when the (raw) Wilcoxon test rejects. No resampling, no seed.
 # Exact Wilcoxon p-value floor at n = 10 is 2/2^10 = 0.00195.
 #
 # The 8-participant analysis (journal state, n = 79 folds, Nemenyi) lives in git history,
@@ -28,8 +30,7 @@ from scipy import stats
 MODELS = ['Ridge', 'XGBoost', 'MLP']
 FILES = {'Ridge': 'ridge', 'XGBoost': 'xgboost', 'MLP': 'mlp'}
 PAIRS = [('Ridge', 'XGBoost'), ('Ridge', 'MLP'), ('XGBoost', 'MLP')]
-N_BOOT = 10000
-SEED = 42
+ALPHA = 0.05
 
 
 def load_rmse(suffix, key):
@@ -76,6 +77,21 @@ def exact_friedman_p(chi2, n, k=3):
     return hits / len(orders) ** n
 
 
+def hodges_lehmann(diff, alpha=ALPHA):
+    # HL estimate = median of the n(n+1)/2 Walsh averages (each pair of differences, averaged,
+    # including each difference with itself). The CI cuts c Walsh averages off each end, where c
+    # comes from the exact null distribution of the Wilcoxon signed-rank statistic.
+    n = len(diff)
+    walsh = np.sort([(diff[i] + diff[j]) / 2 for i in range(n) for j in range(i, n)])
+    counts = np.zeros(n * (n + 1) // 2 + 1)
+    counts[0] = 1
+    for r in range(1, n + 1):          # each rank r is either positive or negative
+        counts[r:] = counts[r:] + counts[:-r].copy()
+    cdf = np.cumsum(counts) / 2 ** n
+    c = int(np.searchsorted(cdf, alpha / 2, side='right')) - 1   # largest k with P(T <= k) <= alpha/2
+    return np.median(walsh), walsh[c], walsh[len(walsh) - 1 - c]
+
+
 def report(df, label):
     X = df[MODELS].to_numpy()
     n = len(X)
@@ -97,16 +113,15 @@ def report(df, label):
 
     raw_p = []
     rows = []
-    rng = np.random.default_rng(SEED)
     for a, b in PAIRS:
         diff = (df[a] - df[b]).to_numpy()          # negative = a has lower RMSE
         w = stats.wilcoxon(df[a], df[b])
-        boot = np.array([diff[rng.integers(0, n, n)].mean() for _ in range(N_BOOT)])
+        hl, lo, hi = hodges_lehmann(diff)
         raw_p.append(w.pvalue)
-        rows.append((a, b, diff.mean(), np.percentile(boot, 2.5), np.percentile(boot, 97.5),
+        rows.append((a, b, hl, lo, hi,
                      w.statistic, w.pvalue, int((diff < 0).sum())))
 
-    print(f"{'pair':18s} {'mean diff':>9s} {'95% CI':>18s} {'W':>6s} {'p raw':>8s} {'p Holm':>8s}  a better in")
+    print(f"{'pair':18s} {'HL diff':>9s} {'HL 95% CI':>18s} {'W':>6s} {'p raw':>8s} {'p Holm':>8s}  a better in")
     for (a, b, md, lo, hi, W, p, k), p_adj in zip(rows, holm(raw_p)):
         flag = '*' if p_adj < 0.05 else ' '
         print(f'{a + " - " + b:18s} {md:+9.3f} [{lo:+7.3f}, {hi:+7.3f}] {W:6.1f} {p:8.4f} {p_adj:8.4f}{flag} {k}/{n}')
