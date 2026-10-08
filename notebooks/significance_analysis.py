@@ -321,3 +321,110 @@ for m in MODELS:
         cells.append(f'{kg.mean():.3f} +/- {np.std(kg):.3f}')
     print(f'{m:8s} {cells[0]:>16s} {cells[1]:>16s} {cells[2]:>16s}')
 print('Table 5.13 rung 1 averages 98 session folds; here every rung is a participant mean over sessions 2..K.')
+
+
+# ==== RUNG 4 v2: weighted refit (plan: docs/logs/20261008_140743_rung4_v2_plan.md) ====
+# Pre-registered. Rung-3 model refit on the 9 training participants + session 1 of the held-out
+# participant, session 1 weighted w = N_pool / N_enrol. Control = same refit with w = 1.
+# Scored on sessions 2..K. Participant-level pooled RMSE (n = 10).
+# Primary family: refit vs rung 3 (Holm over 3). Secondary family: refit vs rung 1 and refit vs
+# control (Holm over 6). Gap closed = HL(rung3 - refit) / HL(rung3 - rung1), descriptive only.
+# v1 (straight line) appears only as a descriptive row for the appendix, never as a comparator.
+
+print('\n\n' + '#' * 90)
+print('# RUNG 4 v2 -- weighted refit')
+print('#' * 90)
+
+with open('fold_metrics_rung4_v2.json') as f:
+    v2_records = json.load(f)
+assert len(v2_records) == 60, f'expected 60 rung-4 v2 records, got {len(v2_records)}'
+v2 = {(r['model'], r['participant_id'], r['arm']): r for r in v2_records}
+
+
+def v2_rmse(m, p):
+    # pooled refit, control, rung-3, rung-1 and v1 RMSE over sessions 2..K, on identical frames
+    refit = v2[(m, p, 'refit')]['test']
+    control = v2[(m, p, 'control')]['test']
+    v1_tests = {t['session']: t for t in turn[(m, p, 1)]['test']}
+    sessions = [t['session'] for t in refit]
+    assert [t['session'] for t in control] == sessions == sorted(v1_tests)
+    n = [t['n'] for t in refit]
+    assert n == [t['n'] for t in control] == [v1_tests[s]['n'] for s in sessions] \
+        == [rung1_lookup[(m, p, s)][0] for s in sessions], f'row counts differ: {m} p{p}'
+    return {
+        'refit': pooled(n, [t['rmse'] for t in refit]),
+        'control': pooled(n, [t['rmse'] for t in control]),
+        'rung3': pooled(n, [v1_tests[s]['rmse_rung3'] for s in sessions]),
+        'rung1': pooled(n, [rung1_lookup[(m, p, s)][1] for s in sessions]),
+        'v1': pooled(n, [v1_tests[s]['rmse_rung4'] for s in sessions]),
+    }
+
+
+v2_prim = {m: pd.DataFrame([{'participant_id': p, **v2_rmse(m, p)} for p in PIDS]) for m in MODELS}
+for m in MODELS:   # rung 1 and rung 3 here must equal the v1 primary values exactly
+    assert np.allclose(v2_prim[m]['rung3'], prim[m]['rung3']) and np.allclose(v2_prim[m]['rung1'], prim[m]['rung1'])
+
+print('\n=== RUNG 4 v2 -- enrol on session 1, pooled RMSE over sessions 2..K, per participant ===')
+for m in MODELS:
+    t = v2_prim[m][['participant_id', 'rung1', 'rung3', 'control', 'refit']].copy()
+    t['w'] = [v2[(m, p, 'refit')]['w'] for p in PIDS]
+    print(m)
+    print(t.round(2).to_string(index=False))
+    print('mean', t[['rung1', 'rung3', 'control', 'refit']].mean().round(3).to_dict())
+
+
+def v2_family(tests, label):
+    rows = []
+    for m, a, b in tests:
+        xa, xb = v2_prim[m][a].to_numpy(), v2_prim[m][b].to_numpy()
+        diff = xa - xb                                  # negative = a has lower RMSE
+        w = stats.wilcoxon(xa, xb)
+        hl, lo, hi = hodges_lehmann(diff)
+        rows.append((f'{m} {a} - {b}', np.median(diff), hl, lo, hi, w.statistic, w.pvalue, int((diff < 0).sum())))
+    p_holm = holm([r[6] for r in rows])
+    print(f'\n=== {label} ===')
+    print(f"{'test':26s} {'median diff':>11s} {'HL diff':>8s} {'HL 95% CI':>18s} {'W':>5s} {'p raw':>8s} {'p Holm':>8s}  a lower")
+    for (name, md, hl, lo, hi, W, p, k), p_adj in zip(rows, p_holm):
+        flag = '*' if p_adj < ALPHA else ' '
+        print(f'{name:26s} {md:+11.3f} {hl:+8.3f} [{lo:+7.3f}, {hi:+7.3f}] {W:5.1f} {p:8.4f} {p_adj:8.4f}{flag} {k}/10')
+    return rows, p_holm
+
+
+# ---- 7.1 PRIMARY: refit vs rung 3, Holm over 3 -----------------------------------------
+v2_primary, v2_primary_holm = v2_family([(m, 'refit', 'rung3') for m in MODELS],
+                                        'RUNG 4 v2 PRIMARY family -- refit vs rung 3, exact Wilcoxon, n = 10, Holm over 3')
+
+# ---- 7.2 SECONDARY: refit vs rung 1 and refit vs control, Holm over 6 -------------------
+v2_family([(m, 'refit', other) for m in MODELS for other in ['rung1', 'control']],
+          'RUNG 4 v2 SECONDARY family -- refit vs rung 1 and vs control, exact Wilcoxon, n = 10, Holm over 6')
+print('A non-significant refit - rung1 result means "difference not detected", never "equal".')
+
+# ---- 7.3 descriptive only, no tests ----------------------------------------------------
+# a) gap closed = HL(rung3 - refit) / HL(rung3 - rung1)
+print('\n=== RUNG 4 v2 DESCRIPTIVE (a) -- share of the rung 3 -> rung 1 gap closed (HL estimates, no test) ===')
+for m in MODELS:
+    gain = hodges_lehmann((v2_prim[m]['rung3'] - v2_prim[m]['refit']).to_numpy())[0]
+    gap = hodges_lehmann((v2_prim[m]['rung3'] - v2_prim[m]['rung1']).to_numpy())[0]
+    print(f'{m:8s} HL(r3 - refit) = {gain:+.3f}   HL(r3 - r1) = {gap:+.3f}   gap closed = {gain / gap:.1%}')
+
+# b) kg table: rungs 1, 3 and the refit, mean +/- population SD over participants
+print('\n=== RUNG 4 v2 DESCRIPTIVE (b) -- kg table, sessions 2..K, mean +/- population SD, n = 10 ===')
+print(f"{'model':8s} {'rung 1 (kg)':>16s} {'rung 3 (kg)':>16s} {'refit (kg)':>16s}")
+for m in MODELS:
+    cells = []
+    for rung in ['rung1', 'rung3', 'refit']:
+        kg = v2_prim[m][rung].to_numpy() * np.array([mvc_kg[p] for p in PIDS]) / 100
+        cells.append(f'{kg.mean():.3f} +/- {np.std(kg):.3f}')
+    print(f'{m:8s} {cells[0]:>16s} {cells[1]:>16s} {cells[2]:>16s}')
+
+# c) v1 row for the appendix: the straight-line recalibration on the same sessions
+print('\n=== RUNG 4 v2 DESCRIPTIVE (c) -- v1 (linear recalibration) on the same sessions, appendix only ===')
+for m in MODELS:
+    print(f"{m:8s} mean %MVC RMSE  rung3 {v2_prim[m]['rung3'].mean():.3f}  v1 {v2_prim[m]['v1'].mean():.3f}  "
+          f"refit {v2_prim[m]['refit'].mean():.3f}")
+
+# ---- 7.4 rotation trigger (pre-registered) ---------------------------------------------
+hits = [m for (name, md, hl, lo, hi, W, p, k), p_adj, m in zip(v2_primary, v2_primary_holm, MODELS)
+        if p_adj < ALPHA and hl < 0]
+print(f'\nRotation trigger (primary Holm p < {ALPHA} with refit lower, in >= 1 model): '
+      f'{"TRIGGERED by " + ", ".join(hits) if hits else "NOT triggered"}')
