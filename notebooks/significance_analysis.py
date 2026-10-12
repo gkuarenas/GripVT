@@ -428,3 +428,93 @@ hits = [m for (name, md, hl, lo, hi, W, p, k), p_adj, m in zip(v2_primary, v2_pr
         if p_adj < ALPHA and hl < 0]
 print(f'\nRotation trigger (primary Holm p < {ALPHA} with refit lower, in >= 1 model): '
       f'{"TRIGGERED by " + ", ".join(hits) if hits else "NOT triggered"}')
+
+
+# ==== M3: forward-only subject-dependent ceiling (plan: docs/logs/20261012_145403_forward_only_rung1_plan.md) ====
+# Forward rung 1 = test session j trained on the same participant's sessions before j only (j = 2..K).
+# Family A: forward vs current rung 1.  Family B: rung 4 v2 (weighted refit) vs forward.
+# All scores are participant-level pooled RMSE over sessions 2..K, identical frames (n checked). n = 10.
+# Exact Wilcoxon, Holm within each family over 3 models. Skipped if the forward file is not complete.
+# Path override for testing: environment variable FORWARD_SD_PATH.
+
+import os
+
+print('\n\n' + '#' * 90)
+print('# M3 -- forward-only subject-dependent ceiling')
+print('#' * 90)
+
+FORWARD_PATH = os.environ.get('FORWARD_SD_PATH', 'fold_metrics_forward_sd.json')
+forward_records = []
+if os.path.exists(FORWARD_PATH):
+    with open(FORWARD_PATH) as f:
+        forward_records = json.load(f)
+
+if len(forward_records) < 264:
+    print(f'M3 block skipped: {FORWARD_PATH} has {len(forward_records)} records '
+          f'(missing file counts as 0), 264 needed (3 models x 88 folds).')
+else:
+    assert len(forward_records) == 264, f'expected 264 forward records, got {len(forward_records)}'
+    # forward lookup: (model, participant, test session) -> (n, rmse)
+    fwd_lookup = {}
+    for r in forward_records:
+        key = (r['model'], r['participant_id'], r['test_session'])
+        assert key not in fwd_lookup, f'duplicate forward record {key}'
+        fwd_lookup[key] = (r['metrics']['overall']['n'], r['metrics']['overall']['rmse'])
+
+    m3 = {}
+    for m in MODELS:
+        rows = []
+        for p in PIDS:
+            sessions = sorted(s for (mm, pp, s) in fwd_lookup if mm == m and pp == p)
+            assert sessions, f'no forward folds: {m} p{p}'
+            n = [fwd_lookup[(m, p, s)][0] for s in sessions]
+            # same frames as rung 4 v2 (sessions 2..K) and as the current rung 1
+            assert sessions == [t['session'] for t in v2[(m, p, 'refit')]['test']], f'sessions differ from v2: {m} p{p}'
+            assert n == [t['n'] for t in v2[(m, p, 'refit')]['test']], f'frame counts differ from v2: {m} p{p}'
+            assert n == [rung1_lookup[(m, p, s)][0] for s in sessions], f'frame counts differ from rung 1: {m} p{p}'
+            rows.append({'participant_id': p,
+                         'forward': pooled(n, [fwd_lookup[(m, p, s)][1] for s in sessions]),
+                         'rung1': pooled(n, [rung1_lookup[(m, p, s)][1] for s in sessions]),
+                         'refit': v2_prim[m]['refit'].iloc[PIDS.index(p)],
+                         'rung3': v2_prim[m]['rung3'].iloc[PIDS.index(p)]})
+        m3[m] = pd.DataFrame(rows)
+        assert np.allclose(m3[m]['rung1'], v2_prim[m]['rung1']), f'rung 1 pooled differs from v2 table: {m}'
+
+    print('\n=== M3 -- pooled RMSE over sessions 2..K, per participant (%MVC) ===')
+    table = pd.DataFrame({'participant_id': PIDS})
+    for m in MODELS:
+        for col in ['forward', 'rung1', 'refit']:
+            table[f'{m} {col}'] = m3[m][col].to_numpy()
+    print(table.round(2).to_string(index=False))
+    print('mean', {f'{m} {c}': round(m3[m][c].mean(), 3) for m in MODELS for c in ['forward', 'rung1', 'refit']})
+
+    def m3_family(tests, label):
+        rows = []
+        for m, a, b in tests:
+            xa, xb = m3[m][a].to_numpy(), m3[m][b].to_numpy()
+            diff = xa - xb                                  # negative = a has lower RMSE
+            w = stats.wilcoxon(xa, xb, method='exact')
+            hl, lo, hi = hodges_lehmann(diff)
+            rows.append((f'{m} {a} - {b}', np.median(diff), hl, lo, hi, w.statistic, w.pvalue, int((diff < 0).sum())))
+        p_holm = holm([r[6] for r in rows])
+        print(f'\n=== {label} ===')
+        print(f"{'test':26s} {'median diff':>11s} {'HL diff':>8s} {'HL 95% CI':>18s} {'W':>5s} {'p raw':>8s} {'p Holm':>8s}  a lower")
+        for (name, md, hl, lo, hi, W, p, k), p_adj in zip(rows, p_holm):
+            flag = '*' if p_adj < ALPHA else ' '
+            verdict = 'difference detected' if p_adj < ALPHA else 'difference not detected (n = 10)'
+            print(f'{name:26s} {md:+11.3f} {hl:+8.3f} [{lo:+7.3f}, {hi:+7.3f}] {W:5.1f} {p:8.4f} {p_adj:8.4f}{flag} {k}/10  {verdict}')
+        return rows, p_holm
+
+    m3_family([(m, 'forward', 'rung1') for m in MODELS],
+              'M3 FAMILY A -- forward vs current rung 1, exact Wilcoxon, n = 10, Holm over 3')
+    m3_family([(m, 'refit', 'forward') for m in MODELS],
+              'M3 FAMILY B -- rung 4 v2 (refit) vs forward, exact Wilcoxon, n = 10, Holm over 3')
+
+    # descriptive only, no tests: gap closed, same HL definition as RUNG 4 v2 DESCRIPTIVE (a)
+    print('\n=== M3 DESCRIPTIVE -- share of the rung 3 -> ceiling gap closed by the refit (HL estimates, no test) ===')
+    for m in MODELS:
+        gain = hodges_lehmann((m3[m]['rung3'] - m3[m]['refit']).to_numpy())[0]
+        for ceiling in ['rung1', 'forward']:
+            gap = hodges_lehmann((m3[m]['rung3'] - m3[m][ceiling]).to_numpy())[0]
+            print(f'{m:8s} ceiling = {ceiling:8s} HL(r3 - refit) = {gain:+.3f}   HL(r3 - ceiling) = {gap:+.3f}   '
+                  f'gap closed = {gain / gap:.1%}')
