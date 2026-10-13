@@ -644,3 +644,36 @@ else:
               'M6 RUNG 4 v2 PRIMARY -- refit vs rung 3, MLP = seed mean, exact Wilcoxon, n = 10, Holm over 3')
     m6_family([(m, 'refit', other) for m in MODELS for other in ['rung1', 'control']],
               'M6 RUNG 4 v2 SECONDARY -- refit vs rung 1 and vs control, MLP = seed mean, Holm over 6')
+
+
+# ==== M5: Ridge alpha control (plan: docs/logs/20261012_181201_m5_m6_seed_and_alpha_plan.md, section 5) ====
+# Pre-registered. The Ridge refit runs at about alpha / 1.98 relative to the w = 1 control, because sklearn
+# does not normalize sample_weight. ridge_alpha_control.py refits the control at alpha * N / sum(w_refit).
+# Test: Ridge refit vs scaled control, exact Wilcoxon, n = 10, its own family (Holm over 1).
+# Scaled vs original control is descriptive only. Skipped if the M5 file is missing.
+
+print('\n\n' + '#' * 90)
+print('# M5 -- Ridge alpha control')
+print('#' * 90)
+
+if not os.path.exists('fold_metrics_rung4_v2_m5.json'):
+    print('M5 block skipped: fold_metrics_rung4_v2_m5.json not found (run ridge_alpha_control.py).')
+else:
+    with open('fold_metrics_rung4_v2_m5.json') as f:
+        m5 = {r['participant_id']: r for r in json.load(f)}
+    assert sorted(m5) == list(PIDS)
+    m5_t = v2_prim['Ridge'][['participant_id', 'refit', 'control']].copy()
+    m5_t['control_scaled'] = [pooled([t['n'] for t in m5[p]['test']], [t['rmse'] for t in m5[p]['test']])
+                              for p in m5_t['participant_id']]
+    m5_t['factor'] = [m5[p]['factor'] for p in m5_t['participant_id']]
+    print(m5_t.round(3).to_string(index=False))
+    print('mean', m5_t[['refit', 'control', 'control_scaled']].mean().round(3).to_dict())
+    print(f"\n{'test':32s} {'HL diff':>8s} {'HL 95% CI':>18s} {'p exact':>8s}  a lower")
+    for a, b, note in [('refit', 'control_scaled', 'M5 test, Holm over 1'),
+                       ('control_scaled', 'control', 'descriptive')]:
+        xa, xb = m5_t[a].to_numpy(), m5_t[b].to_numpy()
+        diff = xa - xb
+        w = stats.wilcoxon(xa, xb, method='exact')
+        hl, lo, hi = hodges_lehmann(diff)
+        verdict = ('difference detected' if w.pvalue < ALPHA else 'difference not detected (n = 10)') + f'  [{note}]'
+        print(f'{a + " - " + b:32s} {hl:+8.3f} [{lo:+7.3f}, {hi:+7.3f}] {w.pvalue:8.4f}  {int((diff < 0).sum())}/10  {verdict}')
