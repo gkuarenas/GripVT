@@ -587,10 +587,12 @@ else:
            ('MLP', 'control'): v2_prim['MLP'].set_index('participant_id')['control']}
 
     print(f'\n=== M6 seed summary -- {len(SEEDS)} seeds ({SEEDS[0]}..{SEEDS[-1]}), mean over 10 participants (%MVC) ===')
-    print(f"{'arm':18s} {'seed-42 mean':>12s} {'seed mean':>10s} {'mean seed SD':>13s} {'max seed SD':>12s}  max at")
+    # cohort SD = SD over seeds of the cohort mean (the printed number); mean seed SD = noise of one participant value
+    print(f"{'arm':18s} {'seed-42 mean':>12s} {'seed mean':>10s} {'cohort SD':>10s} {'mean seed SD':>13s} {'max seed SD':>12s}  max at")
     for k, t in seed_tab.items():
         sd = t.std(axis=1, ddof=1)
-        print(f'{k[0] + " " + k[1]:18s} {s42[k].mean():12.3f} {seed_mean[k].mean():10.3f} {sd.mean():13.3f} '
+        cohort_sd = t.mean(axis=0).std(ddof=1)
+        print(f'{k[0] + " " + k[1]:18s} {s42[k].mean():12.3f} {seed_mean[k].mean():10.3f} {cohort_sd:10.3f} {sd.mean():13.3f} '
               f'{sd.max():12.3f}  p{sd.idxmax():03d}')
 
     print('\n=== M6 seed SD per participant (%MVC) ===')
