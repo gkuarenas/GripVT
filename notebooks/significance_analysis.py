@@ -518,3 +518,129 @@ else:
             gap = hodges_lehmann((m3[m]['rung3'] - m3[m][ceiling]).to_numpy())[0]
             print(f'{m:8s} ceiling = {ceiling:8s} HL(r3 - refit) = {gain:+.3f}   HL(r3 - ceiling) = {gap:+.3f}   '
                   f'gap closed = {gain / gap:.1%}')
+
+
+# ==== M6: seed variance (plan: docs/logs/20261012_181201_m5_m6_seed_and_alpha_plan.md, section 4) ====
+# Pre-registered. MLP (rung 1, rung 3, refit, control) and XGBoost (rung 1) retrained with seeds 0..19 and
+# the stored best_params (05e_seed_variance.ipynb). Per seed, build the participant value exactly as above;
+# then average it over the seeds. Ridge is deterministic and XGBoost rung 3 / refit / control were not
+# reseeded (plan section 2, item 5): they keep their seed-42 values. Same tests and families as above.
+# Keep/revert rule (plan section 2, item 7), on the rung-1 test only: keep the MLP unless XGBoost - MLP
+# has Holm p < 0.05 with XGBoost lower. Skipped if the seed files are not complete.
+
+print('\n\n' + '#' * 90)
+print('# M6 -- seed variance (seed-mean values)')
+print('#' * 90)
+
+SEED_FILES = ['fold_metrics_mlp_seeds.json', 'fold_metrics_xgboost_seeds.json']
+seed_records = []
+for path in SEED_FILES:
+    if os.path.exists(path):
+        with open(path) as f:
+            seed_records += json.load(f)
+SEEDS = sorted({r['seed'] for r in seed_records})
+seed_counts = {s: sum(r['seed'] == s for r in seed_records) for s in SEEDS}
+
+if len(SEEDS) < 2 or any(c != 226 for c in seed_counts.values()):
+    print(f'M6 block skipped: need >= 2 complete seeds (226 records each), found {seed_counts}.')
+else:
+    assert 42 not in SEEDS
+    seed_lookup = {}                                     # (model, arm, seed, participant, test session) -> record
+    for r in seed_records:
+        key = (r['model'], r['arm'], r['seed'], r['participant_id'], r.get('test_session'))
+        assert key not in seed_lookup, f'duplicate seed record {key}'
+        seed_lookup[key] = r
+    sessions_of = {p: sorted(s for (m, a, sd, pp, s) in seed_lookup if m == 'MLP' and a == 'rung1' and sd == SEEDS[0] and pp == p)
+                   for p in PIDS}
+
+    def seed_value(m, arm, seed, p):
+        # one participant value for one seed, same definition as the seed-42 tables above
+        if arm == 'rung1':                               # participant mean of the fold RMSE (headline)
+            return np.mean([seed_lookup[(m, 'rung1', seed, p, s)]['metrics']['overall']['rmse'] for s in sessions_of[p]])
+        if arm == 'rung1_2K':                            # pooled over sessions 2..K, frames = v2
+            tests = v2[(m, p, 'refit')]['test']
+            recs = [seed_lookup[(m, 'rung1', seed, p, t['session'])]['metrics']['overall'] for t in tests]
+            assert [r['n'] for r in recs] == [t['n'] for t in tests], f'frame counts differ: {m} p{p} seed {seed}'
+            return pooled([r['n'] for r in recs], [r['rmse'] for r in recs])
+        if arm == 'rung3':                               # all sessions of the held-out participant
+            return seed_lookup[(m, 'rung3', seed, p, None)]['metrics']['overall']['rmse']
+        if arm == 'rung3_2K':                            # rung 3 scored on sessions 2..K
+            tests = [t for t in seed_lookup[(m, 'rung3', seed, p, None)]['test'] if t['session'] != 1]
+        else:                                            # refit / control, the 05c layout
+            tests = seed_lookup[(m, arm, seed, p, None)]['test']
+        assert [t['n'] for t in tests] == [t['n'] for t in v2[(m, p, 'refit')]['test']], f'frame counts differ: {m} {arm} p{p}'
+        return pooled([t['n'] for t in tests], [t['rmse'] for t in tests])
+
+    SEED_ARMS = [('MLP', 'rung1'), ('XGBoost', 'rung1'), ('MLP', 'rung1_2K'), ('MLP', 'rung3'),
+                 ('MLP', 'rung3_2K'), ('MLP', 'refit'), ('MLP', 'control')]
+    seed_tab = {(m, arm): pd.DataFrame({s: [seed_value(m, arm, s, p) for p in PIDS] for s in SEEDS}, index=PIDS)
+                for m, arm in SEED_ARMS}             # rows = participants, columns = seeds
+    seed_mean = {k: t.mean(axis=1) for k, t in seed_tab.items()}
+
+    # seed-42 values with the same definitions, for the side-by-side table
+    s42 = {('MLP', 'rung1'): rung1_pp.set_index('participant_id')['MLP'],
+           ('XGBoost', 'rung1'): rung1_pp.set_index('participant_id')['XGBoost'],
+           ('MLP', 'rung1_2K'): v2_prim['MLP'].set_index('participant_id')['rung1'],
+           ('MLP', 'rung3'): rung3.set_index('participant_id')['MLP'],
+           ('MLP', 'rung3_2K'): v2_prim['MLP'].set_index('participant_id')['rung3'],
+           ('MLP', 'refit'): v2_prim['MLP'].set_index('participant_id')['refit'],
+           ('MLP', 'control'): v2_prim['MLP'].set_index('participant_id')['control']}
+
+    print(f'\n=== M6 seed summary -- {len(SEEDS)} seeds ({SEEDS[0]}..{SEEDS[-1]}), mean over 10 participants (%MVC) ===')
+    print(f"{'arm':18s} {'seed-42 mean':>12s} {'seed mean':>10s} {'mean seed SD':>13s} {'max seed SD':>12s}  max at")
+    for k, t in seed_tab.items():
+        sd = t.std(axis=1, ddof=1)
+        print(f'{k[0] + " " + k[1]:18s} {s42[k].mean():12.3f} {seed_mean[k].mean():10.3f} {sd.mean():13.3f} '
+              f'{sd.max():12.3f}  p{sd.idxmax():03d}')
+
+    print('\n=== M6 seed SD per participant (%MVC) ===')
+    sd_table = pd.DataFrame({f'{m} {a}': seed_tab[(m, a)].std(axis=1, ddof=1) for m, a in SEED_ARMS})
+    sd_table.index = [f'p{p:03d}' for p in PIDS]
+    print(sd_table.round(3).to_string())
+
+    # ---- 4.1 rung 1, seed-mean MLP and XGBoost, Ridge deterministic ----------------------
+    m6_rung1 = rung1_pp.copy()
+    for m in ['MLP', 'XGBoost']:
+        m6_rung1[m] = seed_mean[(m, 'rung1')].reindex(m6_rung1['participant_id']).to_numpy()
+    report(m6_rung1, 'M6 RUNG 1 -- per-participant mean RMSE, MLP and XGBoost = seed mean  [KEEP/REVERT TEST]')
+
+    raw_p = [stats.wilcoxon(m6_rung1[a], m6_rung1[b]).pvalue for a, b in PAIRS]
+    p_xm = holm(raw_p)[PAIRS.index(('XGBoost', 'MLP'))]
+    hl_xm = hodges_lehmann((m6_rung1['XGBoost'] - m6_rung1['MLP']).to_numpy())[0]
+    revert = p_xm < ALPHA and hl_xm < 0
+    print(f'\nKeep/revert rule: XGBoost - MLP HL = {hl_xm:+.3f}, Holm p = {p_xm:.4f} -> '
+          f'{"REVERT to XGBoost (XGBoost significantly better)" if revert else "KEEP the MLP (XGBoost not significantly better)"}')
+
+    # ---- 4.2 rung 3, seed-mean MLP, Ridge and XGBoost at seed 42 --------------------------
+    m6_rung3 = rung3.copy()
+    m6_rung3['MLP'] = seed_mean[('MLP', 'rung3')].reindex(m6_rung3['participant_id']).to_numpy()
+    report(m6_rung3, 'M6 RUNG 3 -- MLP = seed mean, Ridge and XGBoost = seed 42')
+
+    # ---- 4.3 rung 4 v2 families, MLP columns = seed mean ----------------------------------
+    m6_v2 = {m: v2_prim[m].copy() for m in MODELS}
+    for col, arm in [('rung1', 'rung1_2K'), ('rung3', 'rung3_2K'), ('refit', 'refit'), ('control', 'control')]:
+        m6_v2['MLP'][col] = seed_mean[('MLP', arm)].reindex(m6_v2['MLP']['participant_id']).to_numpy()
+
+    def m6_family(tests, label):
+        rows = []
+        for m, a, b in tests:
+            xa, xb = m6_v2[m][a].to_numpy(), m6_v2[m][b].to_numpy()
+            diff = xa - xb                                  # negative = a has lower RMSE
+            w = stats.wilcoxon(xa, xb)
+            hl, lo, hi = hodges_lehmann(diff)
+            rows.append((f'{m} {a} - {b}', np.median(diff), hl, lo, hi, w.statistic, w.pvalue, int((diff < 0).sum())))
+        p_holm = holm([r[6] for r in rows])
+        print(f'\n=== {label} ===')
+        print(f"{'test':26s} {'median diff':>11s} {'HL diff':>8s} {'HL 95% CI':>18s} {'W':>5s} {'p raw':>8s} {'p Holm':>8s}  a lower")
+        for (name, md, hl, lo, hi, W, p, k), p_adj in zip(rows, p_holm):
+            flag = '*' if p_adj < ALPHA else ' '
+            verdict = 'difference detected' if p_adj < ALPHA else 'difference not detected (n = 10)'
+            print(f'{name:26s} {md:+11.3f} {hl:+8.3f} [{lo:+7.3f}, {hi:+7.3f}] {W:5.1f} {p:8.4f} {p_adj:8.4f}{flag} {k}/10  {verdict}')
+        return rows, p_holm
+
+    print('\nMLP sessions 2..K, mean over participants (seed mean):',
+          {c: round(m6_v2['MLP'][c].mean(), 3) for c in ['rung1', 'rung3', 'control', 'refit']})
+    m6_family([(m, 'refit', 'rung3') for m in MODELS],
+              'M6 RUNG 4 v2 PRIMARY -- refit vs rung 3, MLP = seed mean, exact Wilcoxon, n = 10, Holm over 3')
+    m6_family([(m, 'refit', other) for m in MODELS for other in ['rung1', 'control']],
+              'M6 RUNG 4 v2 SECONDARY -- refit vs rung 1 and vs control, MLP = seed mean, Holm over 6')
