@@ -23,8 +23,6 @@ GripVT is a visuotactile sensor for the forearm. It is the Stage 2 device of a t
 - A camera behind the pad sees 99 markers molded into the elastomer. The markers move as the pad deforms.
 - This repository holds the tracking software and the grip-force analysis. The software follows each marker against a rest baseline. A model then estimates grip force as a percent of maximum voluntary contraction (%MVC).
 
-**Status.** Data collection is complete. The analysis is frozen.
-
 <br clear="right">
 
 ## Sensor hardware
