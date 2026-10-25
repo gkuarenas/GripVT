@@ -25,6 +25,10 @@ docs/
 *.jpg
 *.png
 
+# Track README images and the pipeline figure (placed after the *.png/*.jpg rules)
+!assets/
+!assets/**
+
 # Track the ROI/mask config -- painted once per camera mount, not regenerable
 !calibration/roi/roi.json
 
