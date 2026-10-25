@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the thesis below."
+type: software
+title: "GripVT: marker displacement tracker for a visuotactile forearm sensor"
+authors:
+  - family-names: Arenas
+    given-names: Guillaume Keifer U.
+    orcid: "https://orcid.org/0009-0003-3680-4924"
+    affiliation: "De La Salle University"
+repository-code: "https://github.com/gkuarenas/GripVT"
+license: MIT
+preferred-citation:
+  type: thesis
+  title: "Non-Invasive Grip Force Estimation via Visuotactile Sensing of Volar Forearm Surface Deformation"
+  authors:
+    - family-names: Arenas
+      given-names: Guillaume Keifer U.
+      orcid: "https://orcid.org/0009-0003-3680-4924"
+  institution:
+    name: "De La Salle University"
+  year: 2026
+  thesis-type: "BS and MS thesis in Manufacturing Engineering and Management"
